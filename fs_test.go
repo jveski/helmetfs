@@ -165,7 +165,7 @@ func TestDeleteLocalBlobs(t *testing.T) {
 	blobPath = blobFilePath(blobsDir, blobID)
 	require.NoError(t, os.WriteFile(blobPath, []byte("test content"), 0644))
 
-	reader, err := openDirect(blobPath, os.O_RDONLY, 0)
+	reader, err := open(blobPath, os.O_RDONLY, 0)
 	require.NoError(t, err)
 
 	_, err = deleteLocalBlobs(db, blobsDir)

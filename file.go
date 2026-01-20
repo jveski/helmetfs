@@ -14,6 +14,7 @@ import (
 	"os"
 	"path"
 	"path/filepath"
+	"syscall"
 	"time"
 )
 
@@ -27,8 +28,8 @@ type file struct {
 	isDir     bool
 	size      int64
 	modTime   int64
-	readFile  directFile
-	writeFile directFile
+	readFile  *os.File
+	writeFile *os.File
 	blobID    int64
 	dirOffset int
 	created   bool
@@ -80,7 +81,7 @@ func openFile(ctx context.Context, db *sql.DB, blobsDir, name string, flag int, 
 				return nil, fmt.Errorf("blob not available locally")
 			}
 			blobPath := blobFilePath(blobsDir, blobID.Int64)
-			f.readFile, err = openDirect(blobPath, os.O_RDONLY, 0)
+			f.readFile, err = open(blobPath, os.O_RDONLY, 0)
 			if err != nil {
 				return nil, err
 			}
@@ -165,7 +166,7 @@ func (f *file) Write(p []byte) (int, error) {
 	}
 
 	blobPath := blobFilePath(f.blobsDir, f.blobID)
-	f.writeFile, err = openDirect(blobPath, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0644)
+	f.writeFile, err = open(blobPath, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0644)
 	if err != nil {
 		return 0, err
 	}
@@ -236,7 +237,7 @@ func (f *file) Close() error {
 	streamChecksum := hex.EncodeToString(f.writeHash.Sum(nil))
 
 	blobPath := blobFilePath(f.blobsDir, f.blobID)
-	verifyFile, err := openDirect(blobPath, os.O_RDONLY, 0)
+	verifyFile, err := open(blobPath, os.O_RDONLY, 0)
 	if err != nil {
 		return err
 	}
@@ -348,6 +349,18 @@ func (f *file) Stat() (os.FileInfo, error) {
 		modTime: f.modTime,
 		isDir:   f.isDir,
 	}, nil
+}
+
+func open(path string, flag int, perm os.FileMode) (*os.File, error) {
+	f, err := os.OpenFile(path, flag, perm)
+	if err != nil {
+		return nil, err
+	}
+	if err := syscall.Flock(int(f.Fd()), syscall.LOCK_SH); err != nil {
+		f.Close()
+		return nil, err
+	}
+	return f, nil
 }
 
 // fileInfo implements os.FileInfo
