@@ -15,6 +15,14 @@ on:
         description: 'Random seed (0 = use current time)'
         required: false
         default: '0'
+      corrupt_rate:
+        description: 'Probability of corrupting a blob (0-1, e.g., 0.01)'
+        required: false
+        default: '0'
+      rclone_failure_rate:
+        description: 'Probability of simulating rclone failure (0-1, e.g., 0.005)'
+        required: false
+        default: '0'
   schedule:
     - cron: '0 3 * * *'
 
@@ -42,4 +50,8 @@ jobs:
             -url http://localhost:8080 \
             -duration ${{ github.event.inputs.duration || '10m' }} \
             -concurrency ${{ github.event.inputs.concurrency || '4' }} \
-            -seed ${{ github.event.inputs.seed || '0' }}
+            -seed ${{ github.event.inputs.seed || '0' }} \
+            -db ../meta.db \
+            -blobs ../blobs \
+            -corrupt-rate ${{ github.event.inputs.corrupt_rate || '0' }} \
+            -rclone-failure-rate ${{ github.event.inputs.rclone_failure_rate || '0' }}
