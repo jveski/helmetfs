@@ -1,7 +1,9 @@
 package main
 
 import (
+	"crypto/sha256"
 	"database/sql"
+	"encoding/hex"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -270,5 +272,438 @@ func TestStatusPage(t *testing.T) {
 		assert.Contains(t, body, `type="datetime-local"`)
 		assert.Contains(t, body, `name="timestamp"`)
 		assert.Contains(t, body, `<button type="submit">Restore</button>`)
+	})
+}
+
+func TestGarbageCollection(t *testing.T) {
+	db, _ := initTestState(t)
+
+	// Save original TTLs and restore after test
+	origTTL := *ttl
+	origUploadTTL := *uploadTTL
+	t.Cleanup(func() {
+		*ttl = origTTL
+		*uploadTTL = origUploadTTL
+	})
+
+	// Use short TTLs for testing
+	*ttl = 100 * time.Millisecond
+	*uploadTTL = 100 * time.Millisecond
+
+	t.Run("marks orphaned blobs for deletion", func(t *testing.T) {
+		// Create a blob that was never written to (simulates interrupted upload)
+		oldTime := time.Now().Add(-time.Hour).Unix()
+		_, err := db.Exec(`INSERT INTO blobs (creation_time, modified_time, local_written, local_deleting) VALUES (?, ?, 0, 0)`, oldTime, oldTime)
+		require.NoError(t, err)
+
+		var orphanedBlobID int64
+		require.NoError(t, db.QueryRow(`SELECT last_insert_rowid()`).Scan(&orphanedBlobID))
+
+		// Run garbage collection
+		_, err = takeOutTheTrash(db)
+		require.NoError(t, err)
+
+		// Check that the orphaned blob is marked for deletion
+		var localDeleting int
+		err = db.QueryRow(`SELECT local_deleting FROM blobs WHERE id = ?`, orphanedBlobID).Scan(&localDeleting)
+		require.NoError(t, err)
+		assert.Equal(t, 1, localDeleting, "orphaned blob should be marked for deletion")
+	})
+
+	t.Run("does not mark recent orphaned blobs", func(t *testing.T) {
+		// Create a recent blob that was never written to
+		recentTime := time.Now().Unix()
+		_, err := db.Exec(`INSERT INTO blobs (creation_time, modified_time, local_written, local_deleting) VALUES (?, ?, 0, 0)`, recentTime, recentTime)
+		require.NoError(t, err)
+
+		var recentBlobID int64
+		require.NoError(t, db.QueryRow(`SELECT last_insert_rowid()`).Scan(&recentBlobID))
+
+		// Run garbage collection
+		_, err = takeOutTheTrash(db)
+		require.NoError(t, err)
+
+		// Check that the recent blob is NOT marked for deletion
+		var localDeleting int
+		err = db.QueryRow(`SELECT local_deleting FROM blobs WHERE id = ?`, recentBlobID).Scan(&localDeleting)
+		require.NoError(t, err)
+		assert.Equal(t, 0, localDeleting, "recent orphaned blob should not be marked for deletion yet")
+	})
+
+	t.Run("compacts old deleted file versions", func(t *testing.T) {
+		// Create an old deleted file version
+		oldTime := time.Now().Add(-time.Hour).Unix()
+		_, err := db.Exec(`INSERT INTO files (created_at, version, path, mode, mod_time, is_dir, deleted) VALUES (?, 1, '/gc-deleted.txt', 0644, ?, 0, 1)`, oldTime, oldTime)
+		require.NoError(t, err)
+
+		var deletedFileID int64
+		require.NoError(t, db.QueryRow(`SELECT last_insert_rowid()`).Scan(&deletedFileID))
+
+		// Run garbage collection
+		_, err = takeOutTheTrash(db)
+		require.NoError(t, err)
+
+		// Check that the old deleted file version was compacted
+		var count int
+		err = db.QueryRow(`SELECT COUNT(*) FROM files WHERE id = ?`, deletedFileID).Scan(&count)
+		require.NoError(t, err)
+		assert.Equal(t, 0, count, "old deleted file version should be compacted")
+	})
+
+	t.Run("compacts old superseded file versions", func(t *testing.T) {
+		// Create two versions of a file, with the old one being past TTL
+		oldTime := time.Now().Add(-time.Hour).Unix()
+		newTime := time.Now().Unix()
+
+		_, err := db.Exec(`INSERT INTO files (created_at, version, path, mode, mod_time, is_dir, deleted) VALUES (?, 1, '/gc-superseded.txt', 0644, ?, 0, 0)`, oldTime, oldTime)
+		require.NoError(t, err)
+
+		var oldFileID int64
+		require.NoError(t, db.QueryRow(`SELECT last_insert_rowid()`).Scan(&oldFileID))
+
+		_, err = db.Exec(`INSERT INTO files (created_at, version, path, mode, mod_time, is_dir, deleted) VALUES (?, 2, '/gc-superseded.txt', 0644, ?, 0, 0)`, newTime, newTime)
+		require.NoError(t, err)
+
+		// Run garbage collection
+		_, err = takeOutTheTrash(db)
+		require.NoError(t, err)
+
+		// Check that the old version was compacted
+		var count int
+		err = db.QueryRow(`SELECT COUNT(*) FROM files WHERE id = ?`, oldFileID).Scan(&count)
+		require.NoError(t, err)
+		assert.Equal(t, 0, count, "old superseded file version should be compacted")
+
+		// Check that the new version still exists
+		var exists int
+		err = db.QueryRow(`SELECT COUNT(*) FROM files WHERE path = '/gc-superseded.txt' AND version = 2`).Scan(&exists)
+		require.NoError(t, err)
+		assert.Equal(t, 1, exists, "current file version should still exist")
+	})
+
+	t.Run("does not compact recent file versions", func(t *testing.T) {
+		// Create two versions of a file, both recent
+		recentTime := time.Now().Unix()
+
+		_, err := db.Exec(`INSERT INTO files (created_at, version, path, mode, mod_time, is_dir, deleted) VALUES (?, 1, '/gc-recent.txt', 0644, ?, 0, 0)`, recentTime, recentTime)
+		require.NoError(t, err)
+
+		var recentFileID int64
+		require.NoError(t, db.QueryRow(`SELECT last_insert_rowid()`).Scan(&recentFileID))
+
+		_, err = db.Exec(`INSERT INTO files (created_at, version, path, mode, mod_time, is_dir, deleted) VALUES (?, 2, '/gc-recent.txt', 0644, ?, 0, 0)`, recentTime, recentTime)
+		require.NoError(t, err)
+
+		// Run garbage collection
+		_, err = takeOutTheTrash(db)
+		require.NoError(t, err)
+
+		// Check that the old version still exists (within TTL)
+		var count int
+		err = db.QueryRow(`SELECT COUNT(*) FROM files WHERE id = ?`, recentFileID).Scan(&count)
+		require.NoError(t, err)
+		assert.Equal(t, 1, count, "recent superseded file version should not be compacted yet")
+	})
+}
+
+func TestDeleteLocalBlobsExtended(t *testing.T) {
+	db, blobsDir := initTestState(t)
+
+	t.Run("deletes blob files marked for deletion", func(t *testing.T) {
+		// Create a blob and its file
+		now := time.Now().Unix()
+		_, err := db.Exec(`INSERT INTO blobs (creation_time, modified_time, local_written, local_deleting, checksum) VALUES (?, ?, 1, 1, 'delete-test-1')`, now, now)
+		require.NoError(t, err)
+
+		var blobID int64
+		require.NoError(t, db.QueryRow(`SELECT last_insert_rowid()`).Scan(&blobID))
+
+		blobPath := blobFilePath(blobsDir, blobID)
+		require.NoError(t, os.WriteFile(blobPath, []byte("test content"), 0644))
+
+		// Verify blob file exists
+		_, err = os.Stat(blobPath)
+		require.NoError(t, err)
+
+		// Run local blob deletion
+		_, err = deleteLocalBlobs(db, blobsDir)
+		require.NoError(t, err)
+
+		// Verify blob file is deleted
+		_, err = os.Stat(blobPath)
+		assert.True(t, os.IsNotExist(err), "blob file should be deleted")
+
+		// Verify database is updated
+		var localDeleted int
+		err = db.QueryRow(`SELECT local_deleted FROM blobs WHERE id = ?`, blobID).Scan(&localDeleted)
+		require.NoError(t, err)
+		assert.Equal(t, 1, localDeleted, "blob should be marked as locally deleted")
+	})
+
+	t.Run("handles already deleted blob files", func(t *testing.T) {
+		// Create a blob marked for deletion but file doesn't exist
+		now := time.Now().Unix()
+		_, err := db.Exec(`INSERT INTO blobs (creation_time, modified_time, local_written, local_deleting, checksum) VALUES (?, ?, 1, 1, 'delete-test-2')`, now, now)
+		require.NoError(t, err)
+
+		var blobID int64
+		require.NoError(t, db.QueryRow(`SELECT last_insert_rowid()`).Scan(&blobID))
+
+		// Don't create the file - simulates already deleted
+
+		// Run local blob deletion - should not error
+		_, err = deleteLocalBlobs(db, blobsDir)
+		require.NoError(t, err)
+
+		// Verify database is updated
+		var localDeleted int
+		err = db.QueryRow(`SELECT local_deleted FROM blobs WHERE id = ?`, blobID).Scan(&localDeleted)
+		require.NoError(t, err)
+		assert.Equal(t, 1, localDeleted, "blob should be marked as locally deleted even if file was already gone")
+	})
+
+	t.Run("does not delete blobs not marked for deletion", func(t *testing.T) {
+		// Create a blob NOT marked for deletion
+		now := time.Now().Unix()
+		_, err := db.Exec(`INSERT INTO blobs (creation_time, modified_time, local_written, local_deleting, checksum) VALUES (?, ?, 1, 0, 'nodelete-test')`, now, now)
+		require.NoError(t, err)
+
+		var blobID int64
+		require.NoError(t, db.QueryRow(`SELECT last_insert_rowid()`).Scan(&blobID))
+
+		blobPath := blobFilePath(blobsDir, blobID)
+		require.NoError(t, os.WriteFile(blobPath, []byte("keep this content"), 0644))
+
+		// Run local blob deletion
+		_, err = deleteLocalBlobs(db, blobsDir)
+		require.NoError(t, err)
+
+		// Verify blob file still exists
+		_, err = os.Stat(blobPath)
+		require.NoError(t, err, "blob file should not be deleted")
+	})
+}
+
+func TestIntegrityCheck(t *testing.T) {
+	db, blobsDir := initTestState(t)
+
+	// Save original interval and restore after test
+	origInterval := *integrityCheckInterval
+	t.Cleanup(func() {
+		*integrityCheckInterval = origInterval
+	})
+
+	// Use short interval for testing
+	*integrityCheckInterval = 100 * time.Millisecond
+
+	t.Run("verifies blob integrity and updates timestamp", func(t *testing.T) {
+		// Create a blob with known content and checksum
+		content := []byte("integrity test content")
+		checksum := sha256.Sum256(content)
+		checksumHex := hex.EncodeToString(checksum[:])
+
+		oldCheck := time.Now().Add(-time.Hour).Unix()
+		now := time.Now().Unix()
+		_, err := db.Exec(`INSERT INTO blobs (creation_time, modified_time, local_written, remote_written, checksum, last_integrity_check) VALUES (?, ?, 1, 1, ?, ?)`, now, now, checksumHex, oldCheck)
+		require.NoError(t, err)
+
+		var blobID int64
+		require.NoError(t, db.QueryRow(`SELECT last_insert_rowid()`).Scan(&blobID))
+
+		blobPath := blobFilePath(blobsDir, blobID)
+		require.NoError(t, os.WriteFile(blobPath, content, 0644))
+
+		// Run integrity check
+		more, err := checkFileIntegrity(db, blobsDir, *integrityCheckInterval)
+		require.NoError(t, err)
+		assert.True(t, more, "should indicate more work was done")
+
+		// Verify timestamp was updated
+		var lastCheck int64
+		err = db.QueryRow(`SELECT last_integrity_check FROM blobs WHERE id = ?`, blobID).Scan(&lastCheck)
+		require.NoError(t, err)
+		assert.Greater(t, lastCheck, oldCheck, "last_integrity_check should be updated")
+	})
+
+	t.Run("detects corrupted blob and marks for re-download", func(t *testing.T) {
+		// Create a blob with a checksum that won't match the content
+		correctChecksum := sha256.Sum256([]byte("original content"))
+		checksumHex := hex.EncodeToString(correctChecksum[:])
+
+		oldCheck := time.Now().Add(-time.Hour).Unix()
+		now := time.Now().Unix()
+		_, err := db.Exec(`INSERT INTO blobs (creation_time, modified_time, local_written, remote_written, checksum, last_integrity_check) VALUES (?, ?, 1, 1, ?, ?)`, now, now, checksumHex, oldCheck)
+		require.NoError(t, err)
+
+		var blobID int64
+		require.NoError(t, db.QueryRow(`SELECT last_insert_rowid()`).Scan(&blobID))
+
+		// Write corrupted content
+		blobPath := blobFilePath(blobsDir, blobID)
+		require.NoError(t, os.WriteFile(blobPath, []byte("corrupted content!!!"), 0644))
+
+		// Run integrity check
+		more, err := checkFileIntegrity(db, blobsDir, *integrityCheckInterval)
+		require.NoError(t, err)
+		assert.True(t, more, "should indicate work was done")
+
+		// Verify blob is marked for re-download (local_written = 0)
+		var localWritten int
+		var lastCheck sql.NullInt64
+		err = db.QueryRow(`SELECT local_written, last_integrity_check FROM blobs WHERE id = ?`, blobID).Scan(&localWritten, &lastCheck)
+		require.NoError(t, err)
+		assert.Equal(t, 0, localWritten, "corrupted blob should be marked for re-download")
+		assert.False(t, lastCheck.Valid, "last_integrity_check should be cleared")
+	})
+
+	t.Run("detects missing blob and marks for re-download", func(t *testing.T) {
+		checksum := sha256.Sum256([]byte("missing blob content"))
+		checksumHex := hex.EncodeToString(checksum[:])
+
+		oldCheck := time.Now().Add(-time.Hour).Unix()
+		now := time.Now().Unix()
+		_, err := db.Exec(`INSERT INTO blobs (creation_time, modified_time, local_written, remote_written, checksum, last_integrity_check) VALUES (?, ?, 1, 1, ?, ?)`, now, now, checksumHex, oldCheck)
+		require.NoError(t, err)
+
+		var blobID int64
+		require.NoError(t, db.QueryRow(`SELECT last_insert_rowid()`).Scan(&blobID))
+
+		// Don't create the blob file - simulates missing file
+
+		// Run integrity check
+		more, err := checkFileIntegrity(db, blobsDir, *integrityCheckInterval)
+		require.NoError(t, err)
+		assert.True(t, more, "should indicate work was done")
+
+		// Verify blob is marked for re-download
+		var localWritten int
+		err = db.QueryRow(`SELECT local_written FROM blobs WHERE id = ?`, blobID).Scan(&localWritten)
+		require.NoError(t, err)
+		assert.Equal(t, 0, localWritten, "missing blob should be marked for re-download")
+	})
+
+	t.Run("skips recently checked blobs", func(t *testing.T) {
+		content := []byte("recently checked content")
+		checksum := sha256.Sum256(content)
+		checksumHex := hex.EncodeToString(checksum[:])
+
+		// Set last_integrity_check to now (within interval)
+		now := time.Now().Unix()
+		_, err := db.Exec(`INSERT INTO blobs (creation_time, modified_time, local_written, remote_written, checksum, last_integrity_check) VALUES (?, ?, 1, 1, ?, ?)`, now, now, checksumHex, now)
+		require.NoError(t, err)
+
+		var blobID int64
+		require.NoError(t, db.QueryRow(`SELECT last_insert_rowid()`).Scan(&blobID))
+
+		blobPath := blobFilePath(blobsDir, blobID)
+		require.NoError(t, os.WriteFile(blobPath, content, 0644))
+
+		// Clear out any other blobs that might be selected
+		_, err = db.Exec(`UPDATE blobs SET last_integrity_check = ? WHERE id != ?`, now, blobID)
+		require.NoError(t, err)
+
+		// Run integrity check - should skip this blob
+		more, err := checkFileIntegrity(db, blobsDir, *integrityCheckInterval)
+		require.NoError(t, err)
+		assert.False(t, more, "should indicate no work needed for recently checked blob")
+	})
+
+	t.Run("prioritizes blobs never checked", func(t *testing.T) {
+		content1 := []byte("never checked content")
+		checksum1 := sha256.Sum256(content1)
+		checksumHex1 := hex.EncodeToString(checksum1[:])
+
+		content2 := []byte("checked long ago content")
+		checksum2 := sha256.Sum256(content2)
+		checksumHex2 := hex.EncodeToString(checksum2[:])
+
+		now := time.Now().Unix()
+		oldCheck := now - 3600*48 // 48 hours ago
+
+		// Create blob that was checked long ago
+		_, err := db.Exec(`INSERT INTO blobs (creation_time, modified_time, local_written, remote_written, checksum, last_integrity_check) VALUES (?, ?, 1, 1, ?, ?)`, now, now, checksumHex2, oldCheck)
+		require.NoError(t, err)
+		var blobID2 int64
+		require.NoError(t, db.QueryRow(`SELECT last_insert_rowid()`).Scan(&blobID2))
+		blobPath2 := blobFilePath(blobsDir, blobID2)
+		require.NoError(t, os.WriteFile(blobPath2, content2, 0644))
+
+		// Create blob that was never checked (NULL)
+		_, err = db.Exec(`INSERT INTO blobs (creation_time, modified_time, local_written, remote_written, checksum, last_integrity_check) VALUES (?, ?, 1, 1, ?, NULL)`, now, now, checksumHex1)
+		require.NoError(t, err)
+		var blobID1 int64
+		require.NoError(t, db.QueryRow(`SELECT last_insert_rowid()`).Scan(&blobID1))
+		blobPath1 := blobFilePath(blobsDir, blobID1)
+		require.NoError(t, os.WriteFile(blobPath1, content1, 0644))
+
+		// Run integrity check - should pick the never-checked blob first
+		more, err := checkFileIntegrity(db, blobsDir, *integrityCheckInterval)
+		require.NoError(t, err)
+		assert.True(t, more)
+
+		// Verify the never-checked blob was checked (now has a timestamp)
+		var lastCheck sql.NullInt64
+		err = db.QueryRow(`SELECT last_integrity_check FROM blobs WHERE id = ?`, blobID1).Scan(&lastCheck)
+		require.NoError(t, err)
+		assert.True(t, lastCheck.Valid, "never-checked blob should now have a check timestamp")
+	})
+}
+
+func TestBlobUnreferencedTrigger(t *testing.T) {
+	db, blobsDir := initTestState(t)
+	ctx := t.Context()
+
+	t.Run("marks blob for deletion when file is overwritten", func(t *testing.T) {
+		// Create first file version with blob
+		f1, err := openFile(ctx, db, blobsDir, "/trigger-test.txt", os.O_CREATE|os.O_WRONLY, 0644)
+		require.NoError(t, err)
+		_, err = f1.Write([]byte("first content"))
+		require.NoError(t, err)
+		require.NoError(t, f1.Close())
+		firstBlobID := f1.blobID
+
+		// Mark the first blob as remote_written (simulates upload completion)
+		_, err = db.Exec(`UPDATE blobs SET remote_written = 1 WHERE id = ?`, firstBlobID)
+		require.NoError(t, err)
+
+		// Overwrite with different content
+		f2, err := openFile(ctx, db, blobsDir, "/trigger-test.txt", os.O_WRONLY|os.O_TRUNC, 0644)
+		require.NoError(t, err)
+		_, err = f2.Write([]byte("second content"))
+		require.NoError(t, err)
+		require.NoError(t, f2.Close())
+
+		// The first blob should now be marked for deletion (trigger fires on INSERT into files)
+		var localDeleting int
+		err = db.QueryRow(`SELECT local_deleting FROM blobs WHERE id = ?`, firstBlobID).Scan(&localDeleting)
+		require.NoError(t, err)
+		assert.Equal(t, 1, localDeleting, "unreferenced blob should be marked for local deletion")
+	})
+
+	t.Run("does not mark blob if still referenced", func(t *testing.T) {
+		// Create a file
+		f1, err := openFile(ctx, db, blobsDir, "/still-ref.txt", os.O_CREATE|os.O_WRONLY, 0644)
+		require.NoError(t, err)
+		_, err = f1.Write([]byte("still referenced content"))
+		require.NoError(t, err)
+		require.NoError(t, f1.Close())
+		blobID := f1.blobID
+
+		// Mark as remote_written
+		_, err = db.Exec(`UPDATE blobs SET remote_written = 1 WHERE id = ?`, blobID)
+		require.NoError(t, err)
+
+		// Create a different file (should not affect our blob)
+		f2, err := openFile(ctx, db, blobsDir, "/other.txt", os.O_CREATE|os.O_WRONLY, 0644)
+		require.NoError(t, err)
+		_, err = f2.Write([]byte("other content"))
+		require.NoError(t, err)
+		require.NoError(t, f2.Close())
+
+		// Our blob should NOT be marked for deletion
+		var localDeleting int
+		err = db.QueryRow(`SELECT local_deleting FROM blobs WHERE id = ?`, blobID).Scan(&localDeleting)
+		require.NoError(t, err)
+		assert.Equal(t, 0, localDeleting, "referenced blob should not be marked for deletion")
 	})
 }
