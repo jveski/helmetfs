@@ -13,10 +13,11 @@ FROM ubuntu:24.04
 ARG TARGETARCH=amd64
 
 RUN apt-get update && \
-    apt-get install -y --no-install-recommends ca-certificates curl && \
-    curl -fsSL -o /tmp/rclone.deb "https://github.com/rclone/rclone/releases/latest/download/rclone-current-linux-${TARGETARCH}.deb" && \
-    dpkg -i /tmp/rclone.deb && \
-    rm /tmp/rclone.deb && \
+    apt-get install -y --no-install-recommends ca-certificates curl unzip && \
+    curl -fsSL -o /tmp/rclone.zip "https://downloads.rclone.org/rclone-current-linux-${TARGETARCH}.zip" && \
+    unzip -j /tmp/rclone.zip -d /tmp/rclone && \
+    install /tmp/rclone/rclone /usr/local/bin/rclone && \
+    rm -rf /tmp/rclone.zip /tmp/rclone && \
     rm -rf /var/lib/apt/lists/*
 
 COPY --from=builder /app/helmetfs /usr/local/bin/helmetfs
