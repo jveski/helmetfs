@@ -18,6 +18,7 @@ type FS struct {
 }
 
 func (fs *FS) Mkdir(ctx context.Context, name string, perm os.FileMode) error {
+	name = path.Clean(name)
 	tx, err := fs.db.BeginTx(ctx, nil)
 	if err != nil {
 		return err
@@ -63,6 +64,7 @@ func (fs *FS) Mkdir(ctx context.Context, name string, perm os.FileMode) error {
 }
 
 func (fs *FS) RemoveAll(ctx context.Context, name string) error {
+	name = path.Clean(name)
 	tx, err := fs.db.BeginTx(ctx, nil)
 	if err != nil {
 		return err
@@ -111,6 +113,8 @@ func (fs *FS) RemoveAll(ctx context.Context, name string) error {
 }
 
 func (fs *FS) Rename(ctx context.Context, oldName, newName string) error {
+	oldName = path.Clean(oldName)
+	newName = path.Clean(newName)
 	tx, err := fs.db.BeginTx(ctx, nil)
 	if err != nil {
 		return err
@@ -148,6 +152,7 @@ func (fs *FS) Rename(ctx context.Context, oldName, newName string) error {
 }
 
 func (fs *FS) Stat(ctx context.Context, name string) (os.FileInfo, error) {
+	name = path.Clean(name)
 	if name == "/" {
 		return &fileInfo{name: "/", isDir: true, mode: 0755}, nil
 	}
@@ -168,6 +173,7 @@ func (fs *FS) Stat(ctx context.Context, name string) (os.FileInfo, error) {
 }
 
 func (fs *FS) OpenFile(ctx context.Context, name string, flag int, perm os.FileMode) (webdav.File, error) {
+	name = path.Clean(name)
 	if name == "/" {
 		return &file{db: fs.db, path: name, isDir: true}, nil
 	}
