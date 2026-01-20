@@ -30,29 +30,9 @@ jobs:
       - name: Build HelmetFS
         run: go build -o helmetfs .
 
-      - name: Set up tmpfs for local and remote storage
-        run: |
-          # Create tmpfs mount for local storage (blobs + metadata)
-          sudo mkdir -p /mnt/tmpfs-local
-          sudo mount -t tmpfs -o size=2G tmpfs /mnt/tmpfs-local
-
-          # Create tmpfs mount for remote storage (rclone destination)
-          sudo mkdir -p /mnt/tmpfs-remote
-          sudo mount -t tmpfs -o size=2G tmpfs /mnt/tmpfs-remote
-
-          # Configure rclone to use local backend pointing to tmpfs
-          mkdir -p ~/.config/rclone
-          cat > ~/.config/rclone/rclone.conf << 'EOF'
-          [tmpfs-remote]
-          type = local
-          EOF
-
       - name: Start HelmetFS
         run: |
-          # Copy binary to tmpfs working directory
-          cp ./helmetfs /mnt/tmpfs-local/
-          cd /mnt/tmpfs-local
-          ./helmetfs -addr :8080 -rclone-remote tmpfs-remote:/mnt/tmpfs-remote &
+          ./helmetfs -addr :8080 &
           sleep 2
 
       - name: Run throughput benchmark
