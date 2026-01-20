@@ -222,8 +222,34 @@ func (f *file) Close() error {
 	if f.writeFile == nil {
 		if f.created {
 			now := time.Now().Unix()
-			_, err := f.db.Exec(`INSERT INTO files (created_at, version, path, mode, mod_time, is_dir) VALUES (?, 1, ?, ?, ?, 0)`, now, f.path, f.perm, now)
-			return err
+			tx, err := f.db.Begin()
+			if err != nil {
+				return err
+			}
+			defer tx.Rollback()
+
+			// Re-check that no non-deleted directory exists at this path (TOCTOU protection)
+			var existingIsDir bool
+			var existingVersion int
+			var existingDeleted bool
+			err = tx.QueryRow(`SELECT is_dir, version, deleted FROM files WHERE path = ? ORDER BY version DESC LIMIT 1`, f.path).Scan(&existingIsDir, &existingVersion, &existingDeleted)
+			if err == nil && !existingDeleted && existingIsDir {
+				return os.ErrExist // Directory exists at this path
+			}
+			if err != nil && err != sql.ErrNoRows {
+				return err
+			}
+
+			version := 1
+			if err == nil {
+				version = existingVersion + 1
+			}
+
+			_, err = tx.Exec(`INSERT INTO files (created_at, version, path, mode, mod_time, is_dir) VALUES (?, ?, ?, ?, ?, 0)`, now, version, f.path, f.perm, now)
+			if err != nil {
+				return err
+			}
+			return tx.Commit()
 		}
 		return nil
 	}
@@ -283,7 +309,25 @@ func (f *file) Close() error {
 		return err
 	}
 
-	_, err = tx.Exec(`INSERT INTO files (created_at, version, path, mode, mod_time, is_dir, blob_id) VALUES (?, ?, ?, ?, ?, 0, ?)`, now, f.version+1, f.path, f.perm, now, useBlobID)
+	// Re-check that no non-deleted directory exists at this path (TOCTOU protection)
+	var existingIsDir bool
+	var existingVersion int
+	var existingDeleted bool
+	err = tx.QueryRow(`SELECT is_dir, version, deleted FROM files WHERE path = ? ORDER BY version DESC LIMIT 1`, f.path).Scan(&existingIsDir, &existingVersion, &existingDeleted)
+	if err == nil && !existingDeleted && existingIsDir {
+		os.Remove(blobPath)
+		return os.ErrExist // Directory exists at this path
+	}
+	if err != nil && err != sql.ErrNoRows {
+		return err
+	}
+
+	version := 1
+	if err == nil {
+		version = existingVersion + 1
+	}
+
+	_, err = tx.Exec(`INSERT INTO files (created_at, version, path, mode, mod_time, is_dir, blob_id) VALUES (?, ?, ?, ?, ?, 0, ?)`, now, version, f.path, f.perm, now, useBlobID)
 	if err != nil {
 		return err
 	}
