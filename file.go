@@ -27,8 +27,8 @@ type file struct {
 	isDir     bool
 	size      int64
 	modTime   int64
-	readFile  *os.File
-	writeFile *os.File
+	readFile  directFile
+	writeFile directFile
 	blobID    int64
 	dirOffset int
 	created   bool
