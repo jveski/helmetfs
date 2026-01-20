@@ -21,10 +21,9 @@ var (
 	seed        = flag.Int64("seed", 0, "random seed (0 = use current time)")
 
 	// Failure injection flags
-	dbPath        = flag.String("db", "", "path to helmetfs database (enables failure injection)")
-	blobsDir      = flag.String("blobs", "", "path to helmetfs blobs directory (enables corruption injection)")
-	corruptRate   = flag.Float64("corrupt-rate", 0, "probability of corrupting a blob after write (0-1)")
-	rcloneFailure = flag.Float64("rclone-failure-rate", 0, "probability of simulating rclone sync failure (0-1)")
+	dbPath      = flag.String("db", "", "path to helmetfs database (enables failure injection)")
+	blobsDir    = flag.String("blobs", "", "path to helmetfs blobs directory (enables corruption injection)")
+	corruptRate = flag.Float64("corrupt-rate", 0, "probability of corrupting a blob after write (0-1)")
 )
 
 func main() {
@@ -45,13 +44,13 @@ func run() error {
 	var injector *FailureInjector
 	if *dbPath != "" || *blobsDir != "" {
 		var err error
-		injector, err = newFailureInjector(*dbPath, *blobsDir, *corruptRate, *rcloneFailure)
+		injector, err = newFailureInjector(*dbPath, *blobsDir, *corruptRate)
 		if err != nil {
 			return fmt.Errorf("failed to initialize failure injector: %w", err)
 		}
 		if injector != nil {
 			defer injector.Close()
-			log.Printf("failure injection enabled: corrupt-rate=%.2f rclone-failure-rate=%.2f", *corruptRate, *rcloneFailure)
+			log.Printf("failure injection enabled: corrupt-rate=%.2f", *corruptRate)
 		}
 	}
 

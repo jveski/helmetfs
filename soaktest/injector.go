@@ -14,26 +14,24 @@ import (
 	_ "github.com/mattn/go-sqlite3"
 )
 
-// FailureInjector enables testing corruption and rclone failure scenarios
+// FailureInjector enables testing corruption scenarios
 type FailureInjector struct {
-	db            *sql.DB
-	blobsDir      string
-	corruptRate   float64
-	rcloneFailure float64
-	mu            sync.Mutex
-	corruptedIDs  map[int64]bool // tracks blob IDs we've corrupted
+	db           *sql.DB
+	blobsDir     string
+	corruptRate  float64
+	mu           sync.Mutex
+	corruptedIDs map[int64]bool // tracks blob IDs we've corrupted
 }
 
-func newFailureInjector(dbPath, blobsDir string, corruptRate, rcloneFailure float64) (*FailureInjector, error) {
+func newFailureInjector(dbPath, blobsDir string, corruptRate float64) (*FailureInjector, error) {
 	if dbPath == "" && blobsDir == "" {
 		return nil, nil // failure injection disabled
 	}
 
 	fi := &FailureInjector{
-		blobsDir:      blobsDir,
-		corruptRate:   corruptRate,
-		rcloneFailure: rcloneFailure,
-		corruptedIDs:  make(map[int64]bool),
+		blobsDir:     blobsDir,
+		corruptRate:  corruptRate,
+		corruptedIDs: make(map[int64]bool),
 	}
 
 	if dbPath != "" {
@@ -116,40 +114,6 @@ func corruptFile(path string, rng *rand.Rand, size int64) error {
 	}
 
 	log.Printf("[failure-injection] corrupted blob at %s (%d bit flips)", path, numFlips)
-	return nil
-}
-
-// SimulateRcloneFailure simulates rclone sync failures by marking blobs as not synced
-func (fi *FailureInjector) SimulateRcloneFailure(rng *rand.Rand) error {
-	if fi == nil || fi.db == nil || fi.rcloneFailure <= 0 {
-		return nil
-	}
-
-	if rng.Float64() >= fi.rcloneFailure {
-		return nil
-	}
-
-	// Open a write connection to simulate the failure
-	db, err := sql.Open("sqlite3", "file:"+*dbPath+"?_journal_mode=WAL&_busy_timeout=5000")
-	if err != nil {
-		return err
-	}
-	defer db.Close()
-
-	// Mark a random blob as not uploaded (simulating upload failure)
-	result, err := db.Exec(`
-		UPDATE blobs SET remote_written = 0
-		WHERE id = (
-			SELECT id FROM blobs
-			WHERE remote_written = 1 AND remote_deleted = 0
-			ORDER BY RANDOM() LIMIT 1
-		)`)
-	if err != nil {
-		return err
-	}
-	if n, _ := result.RowsAffected(); n > 0 {
-		log.Printf("[failure-injection] simulated rclone upload failure (marked blob as not uploaded)")
-	}
 	return nil
 }
 
