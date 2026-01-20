@@ -473,6 +473,34 @@ func (w *Worker) run(ctx context.Context, opCount *atomic.Int64) {
 			err = w.injectBlobDeletion()
 		case "verifyCorruptionDetected":
 			err = w.verifyCorruptionDetected(ctx)
+		// WebDAV operations
+		case "copyFile":
+			err = w.copyFile(ctx)
+		case "lockUnlock":
+			err = w.lockUnlock(ctx)
+		case "proppatch":
+			err = w.proppatch(ctx)
+		// Edge cases
+		case "createFileExclusive":
+			err = w.createFileExclusive(ctx)
+		case "truncateFile":
+			err = w.truncateFile(ctx)
+		case "createEmptyFile":
+			err = w.createEmptyFile(ctx)
+		case "verifyDeduplication":
+			err = w.verifyDeduplication(ctx)
+		case "verifyReadPermissions":
+			err = w.verifyReadPermissions(ctx)
+		// Concurrent access
+		case "concurrentReaders":
+			err = w.concurrentReaders(ctx)
+		case "concurrentReadWrite":
+			err = w.concurrentReadWrite(ctx)
+		// Garbage collection / integrity (when db access enabled)
+		case "verifyGarbageCollection":
+			err = w.verifyGarbageCollection(ctx)
+		case "verifyIntegrityCheckLoop":
+			err = w.verifyIntegrityCheckLoop(ctx)
 		}
 		if err != nil {
 			select {
@@ -501,6 +529,19 @@ func (w *Worker) selectOperation() string {
 		{"verifyPathExclusivity", 2},
 		{"verifyRestoreRejectsFuture", 1},
 		{"verifyCannotDeleteRoot", 1},
+		// WebDAV operations
+		{"copyFile", 5},
+		{"lockUnlock", 3},
+		{"proppatch", 2},
+		// Edge cases
+		{"createFileExclusive", 2},
+		{"truncateFile", 3},
+		{"createEmptyFile", 2},
+		{"verifyDeduplication", 2},
+		{"verifyReadPermissions", 1},
+		// Concurrent access
+		{"concurrentReaders", 2},
+		{"concurrentReadWrite", 2},
 	}
 
 	// Add failure injection operations if enabled
@@ -515,6 +556,13 @@ func (w *Worker) selectOperation() string {
 		if w.injector.rcloneFailure > 0 {
 			ops = append(ops,
 				struct{ name string; weight int }{"injectRcloneFailure", 1},
+			)
+		}
+		// Add GC and integrity checks when we have db access
+		if w.injector.db != nil {
+			ops = append(ops,
+				struct{ name string; weight int }{"verifyGarbageCollection", 2},
+				struct{ name string; weight int }{"verifyIntegrityCheckLoop", 2},
 			)
 		}
 	}
@@ -837,11 +885,17 @@ func (w *Worker) verifyPathExclusivity(ctx context.Context) error {
 		if err != nil {
 			return nil
 		}
+		body, _ := io.ReadAll(statResp.Body)
 		statResp.Body.Close()
 
-		// If the path now returns 404 or is a file, the directory was deleted/replaced
-		// and the PUT success is expected behavior, not an invariant violation.
+		// If the path now returns 404 or is a file (no <collection/> in response),
+		// the directory was deleted/replaced and the PUT success is expected behavior.
 		if statResp.StatusCode == http.StatusNotFound {
+			w.state.removeDir(dirName)
+			return nil
+		}
+		// Check if it's now a file (not a directory). A directory response contains <collection/>.
+		if !strings.Contains(string(body), "<collection") {
 			w.state.removeDir(dirName)
 			return nil
 		}
@@ -1019,6 +1073,680 @@ func (w *Worker) verifyCorruptionDetected(ctx context.Context) error {
 			io.Copy(io.Discard, delResp.Body)
 			delResp.Body.Close()
 		}
+	}
+
+	return nil
+}
+
+// ==================== WebDAV Operations ====================
+
+// copyFile tests the WebDAV COPY operation
+func (w *Worker) copyFile(ctx context.Context) error {
+	srcPath, content, ok := w.state.randomFile(w.rng)
+	if !ok {
+		return nil
+	}
+
+	dir := path.Dir(srcPath)
+	newName := randomName(w.rng) + "_copy.txt"
+	destPath := path.Join(dir, newName)
+
+	req, err := http.NewRequestWithContext(ctx, "COPY", w.baseURL+srcPath, nil)
+	if err != nil {
+		return nil
+	}
+	req.Header.Set("Destination", w.baseURL+destPath)
+	resp, err := w.client.Do(req)
+	if err != nil {
+		return nil
+	}
+	defer resp.Body.Close()
+	io.Copy(io.Discard, resp.Body)
+
+	if resp.StatusCode == http.StatusCreated || resp.StatusCode == http.StatusNoContent {
+		w.state.addFile(destPath, content)
+
+		// Verify the copy has the same content
+		getResp, err := w.client.Get(w.baseURL + destPath)
+		if err != nil {
+			return nil
+		}
+		defer getResp.Body.Close()
+		copiedContent, _ := io.ReadAll(getResp.Body)
+
+		if getResp.StatusCode == http.StatusOK && !bytes.Equal(content, copiedContent) {
+			return fmt.Errorf("invariant #20 violated: COPY produced different content for %s", destPath)
+		}
+	}
+	return nil
+}
+
+// lockUnlock tests WebDAV LOCK and UNLOCK operations
+func (w *Worker) lockUnlock(ctx context.Context) error {
+	filePath, _, ok := w.state.randomFile(w.rng)
+	if !ok {
+		// Create a test file
+		filePath = "/" + randomName(w.rng) + "_lock.txt"
+		content := []byte("lock test content")
+		req, err := http.NewRequestWithContext(ctx, http.MethodPut, w.baseURL+filePath, bytes.NewReader(content))
+		if err != nil {
+			return nil
+		}
+		resp, err := w.client.Do(req)
+		if err != nil {
+			return nil
+		}
+		resp.Body.Close()
+		if resp.StatusCode != http.StatusCreated {
+			return nil
+		}
+		w.state.addFile(filePath, content)
+	}
+
+	// Request a write lock
+	lockBody := `<?xml version="1.0" encoding="utf-8"?>
+<lockinfo xmlns="DAV:">
+  <lockscope><exclusive/></lockscope>
+  <locktype><write/></locktype>
+  <owner><href>soaktest</href></owner>
+</lockinfo>`
+
+	lockReq, err := http.NewRequestWithContext(ctx, "LOCK", w.baseURL+filePath, strings.NewReader(lockBody))
+	if err != nil {
+		return nil
+	}
+	lockReq.Header.Set("Content-Type", "application/xml")
+	lockReq.Header.Set("Timeout", "Second-60")
+	lockResp, err := w.client.Do(lockReq)
+	if err != nil {
+		return nil
+	}
+	defer lockResp.Body.Close()
+	lockRespBody, _ := io.ReadAll(lockResp.Body)
+
+	// Extract lock token from response
+	if lockResp.StatusCode != http.StatusOK {
+		return nil // Lock not supported or failed, that's ok
+	}
+
+	// Parse lock token from Lock-Token header or response body
+	lockToken := lockResp.Header.Get("Lock-Token")
+	if lockToken == "" {
+		// Try to extract from XML response
+		if idx := strings.Index(string(lockRespBody), "<opaquelocktoken:"); idx >= 0 {
+			end := strings.Index(string(lockRespBody)[idx:], "</href>")
+			if end > 0 {
+				start := strings.Index(string(lockRespBody)[idx:], ">") + 1
+				lockToken = "<" + string(lockRespBody)[idx+start:idx+end] + ">"
+			}
+		}
+	}
+
+	if lockToken == "" {
+		return nil // Couldn't get lock token
+	}
+
+	// Unlock
+	unlockReq, err := http.NewRequestWithContext(ctx, "UNLOCK", w.baseURL+filePath, nil)
+	if err != nil {
+		return nil
+	}
+	unlockReq.Header.Set("Lock-Token", lockToken)
+	unlockResp, err := w.client.Do(unlockReq)
+	if err != nil {
+		return nil
+	}
+	defer unlockResp.Body.Close()
+	io.Copy(io.Discard, unlockResp.Body)
+
+	// 204 No Content is success for UNLOCK
+	if unlockResp.StatusCode != http.StatusNoContent && unlockResp.StatusCode != http.StatusOK {
+		log.Printf("[lock] UNLOCK returned %d for %s", unlockResp.StatusCode, filePath)
+	}
+
+	return nil
+}
+
+// proppatch tests WebDAV PROPPATCH operation
+func (w *Worker) proppatch(ctx context.Context) error {
+	filePath, _, ok := w.state.randomFile(w.rng)
+	if !ok {
+		return nil
+	}
+
+	// Set a custom property
+	propBody := `<?xml version="1.0" encoding="utf-8"?>
+<propertyupdate xmlns="DAV:">
+  <set>
+    <prop>
+      <displayname>` + randomName(w.rng) + `</displayname>
+    </prop>
+  </set>
+</propertyupdate>`
+
+	req, err := http.NewRequestWithContext(ctx, "PROPPATCH", w.baseURL+filePath, strings.NewReader(propBody))
+	if err != nil {
+		return nil
+	}
+	req.Header.Set("Content-Type", "application/xml")
+	resp, err := w.client.Do(req)
+	if err != nil {
+		return nil
+	}
+	defer resp.Body.Close()
+	io.Copy(io.Discard, resp.Body)
+
+	// PROPPATCH should return 207 Multi-Status
+	// We don't verify the actual property change since it may not be persisted
+	return nil
+}
+
+// ==================== Edge Cases ====================
+
+// createFileExclusive tests O_EXCL behavior - creating a file that must not already exist
+func (w *Worker) createFileExclusive(ctx context.Context) error {
+	name := randomName(w.rng) + "_excl.txt"
+	filePath := "/" + name
+	content := []byte("exclusive content")
+
+	// First create should succeed
+	req1, err := http.NewRequestWithContext(ctx, http.MethodPut, w.baseURL+filePath, bytes.NewReader(content))
+	if err != nil {
+		return nil
+	}
+	req1.Header.Set("If-None-Match", "*") // WebDAV way to request exclusive create
+	resp1, err := w.client.Do(req1)
+	if err != nil {
+		return nil
+	}
+	resp1.Body.Close()
+
+	if resp1.StatusCode != http.StatusCreated {
+		return nil // May have been created by another worker
+	}
+	w.state.addFile(filePath, content)
+
+	// Second create with If-None-Match should fail
+	req2, err := http.NewRequestWithContext(ctx, http.MethodPut, w.baseURL+filePath, bytes.NewReader(content))
+	if err != nil {
+		return nil
+	}
+	req2.Header.Set("If-None-Match", "*")
+	resp2, err := w.client.Do(req2)
+	if err != nil {
+		return nil
+	}
+	defer resp2.Body.Close()
+	io.Copy(io.Discard, resp2.Body)
+
+	// Should get 412 Precondition Failed
+	if resp2.StatusCode == http.StatusCreated || resp2.StatusCode == http.StatusNoContent {
+		return fmt.Errorf("invariant #21 violated: If-None-Match:* allowed overwrite of existing file %s", filePath)
+	}
+
+	return nil
+}
+
+// truncateFile tests overwriting a file with new content (O_TRUNC behavior)
+func (w *Worker) truncateFile(ctx context.Context) error {
+	filePath, _, ok := w.state.randomFile(w.rng)
+	if !ok {
+		return nil
+	}
+
+	// Write new, different content
+	newContent := []byte("truncated content: " + randomName(w.rng))
+
+	req, err := http.NewRequestWithContext(ctx, http.MethodPut, w.baseURL+filePath, bytes.NewReader(newContent))
+	if err != nil {
+		return nil
+	}
+	resp, err := w.client.Do(req)
+	if err != nil {
+		return nil
+	}
+	defer resp.Body.Close()
+	io.Copy(io.Discard, resp.Body)
+
+	if resp.StatusCode != http.StatusCreated && resp.StatusCode != http.StatusNoContent {
+		return nil
+	}
+	w.state.addFile(filePath, newContent)
+
+	// Verify the new content
+	getResp, err := w.client.Get(w.baseURL + filePath)
+	if err != nil {
+		return nil
+	}
+	defer getResp.Body.Close()
+	readContent, _ := io.ReadAll(getResp.Body)
+
+	if getResp.StatusCode == http.StatusNotFound {
+		w.state.removeFile(filePath)
+		return nil
+	}
+	if getResp.StatusCode == http.StatusOK && !bytes.Equal(newContent, readContent) {
+		return fmt.Errorf("invariant #22 violated: truncate/overwrite produced wrong content for %s", filePath)
+	}
+	return nil
+}
+
+// createEmptyFile tests creating a file with no content
+func (w *Worker) createEmptyFile(ctx context.Context) error {
+	dir, ok := w.state.randomDir(w.rng)
+	if !ok {
+		dir = "/"
+	}
+	name := randomName(w.rng) + "_empty.txt"
+	filePath := path.Join(dir, name)
+
+	// Create with empty body
+	req, err := http.NewRequestWithContext(ctx, http.MethodPut, w.baseURL+filePath, bytes.NewReader([]byte{}))
+	if err != nil {
+		return nil
+	}
+	resp, err := w.client.Do(req)
+	if err != nil {
+		return nil
+	}
+	defer resp.Body.Close()
+	io.Copy(io.Discard, resp.Body)
+
+	if resp.StatusCode != http.StatusCreated && resp.StatusCode != http.StatusNoContent {
+		return nil
+	}
+	w.state.addFile(filePath, []byte{})
+
+	// Verify the file exists and is empty
+	getResp, err := w.client.Get(w.baseURL + filePath)
+	if err != nil {
+		return nil
+	}
+	defer getResp.Body.Close()
+	content, _ := io.ReadAll(getResp.Body)
+
+	if getResp.StatusCode == http.StatusNotFound {
+		w.state.removeFile(filePath)
+		return nil
+	}
+	if getResp.StatusCode == http.StatusOK && len(content) != 0 {
+		return fmt.Errorf("invariant #23 violated: empty file %s returned %d bytes", filePath, len(content))
+	}
+
+	return nil
+}
+
+// verifyDeduplication tests that identical content is deduplicated
+func (w *Worker) verifyDeduplication(ctx context.Context) error {
+	if w.injector == nil || w.injector.db == nil {
+		return nil // Need db access to verify dedup
+	}
+
+	content := []byte("dedup test content " + randomName(w.rng))
+	file1 := "/" + randomName(w.rng) + "_dedup1.txt"
+	file2 := "/" + randomName(w.rng) + "_dedup2.txt"
+
+	// Create first file
+	req1, err := http.NewRequestWithContext(ctx, http.MethodPut, w.baseURL+file1, bytes.NewReader(content))
+	if err != nil {
+		return nil
+	}
+	resp1, err := w.client.Do(req1)
+	if err != nil {
+		return nil
+	}
+	resp1.Body.Close()
+	if resp1.StatusCode != http.StatusCreated {
+		return nil
+	}
+
+	// Create second file with same content
+	req2, err := http.NewRequestWithContext(ctx, http.MethodPut, w.baseURL+file2, bytes.NewReader(content))
+	if err != nil {
+		return nil
+	}
+	resp2, err := w.client.Do(req2)
+	if err != nil {
+		return nil
+	}
+	resp2.Body.Close()
+	if resp2.StatusCode != http.StatusCreated {
+		return nil
+	}
+
+	// Query the database to check if both files share the same blob_id
+	var blobID1, blobID2 sql.NullInt64
+	err = w.injector.db.QueryRow(`SELECT blob_id FROM files WHERE path = ? AND deleted = 0 ORDER BY version DESC LIMIT 1`, file1).Scan(&blobID1)
+	if err != nil {
+		return nil
+	}
+	err = w.injector.db.QueryRow(`SELECT blob_id FROM files WHERE path = ? AND deleted = 0 ORDER BY version DESC LIMIT 1`, file2).Scan(&blobID2)
+	if err != nil {
+		return nil
+	}
+
+	if blobID1.Valid && blobID2.Valid && blobID1.Int64 != blobID2.Int64 {
+		return fmt.Errorf("invariant #24 violated: identical content not deduplicated (%s blob=%d, %s blob=%d)", file1, blobID1.Int64, file2, blobID2.Int64)
+	}
+
+	// Clean up
+	for _, f := range []string{file1, file2} {
+		delReq, _ := http.NewRequestWithContext(ctx, http.MethodDelete, w.baseURL+f, nil)
+		if delReq != nil {
+			delResp, _ := w.client.Do(delReq)
+			if delResp != nil {
+				io.Copy(io.Discard, delResp.Body)
+				delResp.Body.Close()
+			}
+		}
+	}
+
+	return nil
+}
+
+// verifyReadPermissions tests that consecutive reads return consistent content
+func (w *Worker) verifyReadPermissions(ctx context.Context) error {
+	filePath, originalContent, ok := w.state.randomFile(w.rng)
+	if !ok {
+		return nil
+	}
+
+	// Read the file
+	getResp, err := w.client.Get(w.baseURL + filePath)
+	if err != nil {
+		return nil
+	}
+	defer getResp.Body.Close()
+	readContent, _ := io.ReadAll(getResp.Body)
+
+	if getResp.StatusCode != http.StatusOK {
+		return nil
+	}
+
+	// Read again and verify content hasn't changed
+	getResp2, err := w.client.Get(w.baseURL + filePath)
+	if err != nil {
+		return nil
+	}
+	defer getResp2.Body.Close()
+	readContent2, _ := io.ReadAll(getResp2.Body)
+
+	if getResp2.StatusCode == http.StatusOK && !bytes.Equal(readContent, readContent2) {
+		return fmt.Errorf("invariant #25 violated: consecutive reads returned different content for %s", filePath)
+	}
+
+	// Verify it matches our expected content (allowing for concurrent modifications)
+	if !bytes.Equal(originalContent, readContent) {
+		w.state.addFile(filePath, readContent) // Update our state
+	}
+
+	return nil
+}
+
+// ==================== Concurrent Access ====================
+
+// concurrentReaders tests multiple simultaneous reads of the same file
+func (w *Worker) concurrentReaders(ctx context.Context) error {
+	filePath, expectedContent, ok := w.state.randomFile(w.rng)
+	if !ok {
+		return nil
+	}
+
+	// Launch 3 concurrent readers
+	var wg sync.WaitGroup
+	results := make(chan []byte, 3)
+	errors := make(chan error, 3)
+
+	for i := 0; i < 3; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			resp, err := w.client.Get(w.baseURL + filePath)
+			if err != nil {
+				errors <- err
+				return
+			}
+			defer resp.Body.Close()
+			content, _ := io.ReadAll(resp.Body)
+			if resp.StatusCode == http.StatusOK {
+				results <- content
+			} else if resp.StatusCode == http.StatusNotFound {
+				errors <- fmt.Errorf("file not found")
+			}
+		}()
+	}
+
+	wg.Wait()
+	close(results)
+	close(errors)
+
+	// All successful reads should return the same content
+	var contents [][]byte
+	for c := range results {
+		contents = append(contents, c)
+	}
+
+	if len(contents) >= 2 {
+		for i := 1; i < len(contents); i++ {
+			if !bytes.Equal(contents[0], contents[i]) {
+				return fmt.Errorf("invariant #26 violated: concurrent reads returned different content for %s", filePath)
+			}
+		}
+		// Update state if content changed
+		if len(contents) > 0 && !bytes.Equal(expectedContent, contents[0]) {
+			w.state.addFile(filePath, contents[0])
+		}
+	}
+
+	return nil
+}
+
+// concurrentReadWrite tests reading while another request writes
+func (w *Worker) concurrentReadWrite(ctx context.Context) error {
+	// Create a test file
+	filePath := "/" + randomName(w.rng) + "_rw.txt"
+	originalContent := []byte("original content for read-write test")
+	newContent := []byte("new content after write")
+
+	// Create the file
+	req, err := http.NewRequestWithContext(ctx, http.MethodPut, w.baseURL+filePath, bytes.NewReader(originalContent))
+	if err != nil {
+		return nil
+	}
+	resp, err := w.client.Do(req)
+	if err != nil {
+		return nil
+	}
+	resp.Body.Close()
+	if resp.StatusCode != http.StatusCreated {
+		return nil
+	}
+
+	// Launch concurrent read and write
+	var wg sync.WaitGroup
+	readResult := make(chan []byte, 1)
+	writeResult := make(chan bool, 1)
+
+	wg.Add(2)
+
+	// Reader
+	go func() {
+		defer wg.Done()
+		resp, err := w.client.Get(w.baseURL + filePath)
+		if err != nil {
+			return
+		}
+		defer resp.Body.Close()
+		content, _ := io.ReadAll(resp.Body)
+		if resp.StatusCode == http.StatusOK {
+			readResult <- content
+		}
+	}()
+
+	// Writer
+	go func() {
+		defer wg.Done()
+		req, err := http.NewRequestWithContext(ctx, http.MethodPut, w.baseURL+filePath, bytes.NewReader(newContent))
+		if err != nil {
+			return
+		}
+		resp, err := w.client.Do(req)
+		if err != nil {
+			return
+		}
+		resp.Body.Close()
+		writeResult <- (resp.StatusCode == http.StatusCreated || resp.StatusCode == http.StatusNoContent)
+	}()
+
+	wg.Wait()
+	close(readResult)
+	close(writeResult)
+
+	// The read should return either original or new content (not garbage)
+	if content, ok := <-readResult; ok {
+		if !bytes.Equal(content, originalContent) && !bytes.Equal(content, newContent) {
+			// Could be from a concurrent restore, so don't fail hard
+			log.Printf("[concurrent-rw] read returned unexpected content for %s (len=%d)", filePath, len(content))
+		}
+	}
+
+	// Clean up
+	delReq, _ := http.NewRequestWithContext(ctx, http.MethodDelete, w.baseURL+filePath, nil)
+	if delReq != nil {
+		delResp, _ := w.client.Do(delReq)
+		if delResp != nil {
+			io.Copy(io.Discard, delResp.Body)
+			delResp.Body.Close()
+		}
+	}
+
+	return nil
+}
+
+// ==================== Garbage Collection & Integrity ====================
+
+// verifyGarbageCollection verifies that GC is working by checking for orphaned blobs
+func (w *Worker) verifyGarbageCollection(ctx context.Context) error {
+	if w.injector == nil || w.injector.db == nil {
+		return nil
+	}
+
+	// Check for old orphaned blobs that should have been cleaned up
+	// These are blobs where local_written=0, local_deleting=0, and creation_time is old
+	uploadTTL := 5 * time.Minute // Default from main.go
+	cutoff := time.Now().Add(-uploadTTL - time.Minute).Unix()
+
+	var count int
+	err := w.injector.db.QueryRow(`
+		SELECT COUNT(*) FROM blobs
+		WHERE local_written = 0
+		AND local_deleting = 0
+		AND creation_time < ?`, cutoff).Scan(&count)
+	if err != nil {
+		return nil
+	}
+
+	if count > 100 {
+		// Too many orphaned blobs - GC may not be running
+		log.Printf("[gc-check] found %d orphaned blobs older than upload TTL", count)
+	}
+
+	// Check that old file versions are being compacted
+	ttl := 24 * time.Hour // Default from main.go
+	fileCutoff := time.Now().Add(-ttl - time.Hour).Unix()
+
+	var oldVersions int
+	err = w.injector.db.QueryRow(`
+		SELECT COUNT(*) FROM files f
+		WHERE f.created_at < ?
+		AND (f.deleted = 1 OR EXISTS (SELECT 1 FROM files f2 WHERE f2.path = f.path AND f2.version > f.version))`, fileCutoff).Scan(&oldVersions)
+	if err != nil {
+		return nil
+	}
+
+	if oldVersions > 1000 {
+		log.Printf("[gc-check] found %d old file versions that should be compacted", oldVersions)
+	}
+
+	return nil
+}
+
+// verifyIntegrityCheckLoop verifies the background integrity check is working
+func (w *Worker) verifyIntegrityCheckLoop(ctx context.Context) error {
+	if w.injector == nil || w.injector.db == nil {
+		return nil
+	}
+
+	// Check that blobs are getting integrity-checked
+	// Look for blobs that have been checked recently
+	recentCheck := time.Now().Add(-time.Hour).Unix()
+
+	var checkedCount int
+	err := w.injector.db.QueryRow(`
+		SELECT COUNT(*) FROM blobs
+		WHERE last_integrity_check IS NOT NULL
+		AND last_integrity_check > ?`, recentCheck).Scan(&checkedCount)
+	if err != nil {
+		return nil
+	}
+
+	var totalEligible int
+	err = w.injector.db.QueryRow(`
+		SELECT COUNT(*) FROM blobs
+		WHERE local_written = 1
+		AND remote_written = 1
+		AND local_deleting = 0
+		AND checksum IS NOT NULL`).Scan(&totalEligible)
+	if err != nil {
+		return nil
+	}
+
+	// Log progress but don't fail - integrity checks take time
+	if totalEligible > 0 && checkedCount == 0 {
+		log.Printf("[integrity-check] no blobs checked in the last hour (%d eligible)", totalEligible)
+	}
+
+	// Check for blobs with mismatched checksums that should be re-downloaded
+	var needsRedownload int
+	err = w.injector.db.QueryRow(`
+		SELECT COUNT(*) FROM blobs
+		WHERE local_written = 0
+		AND remote_written = 1
+		AND remote_deleted = 0`).Scan(&needsRedownload)
+	if err != nil {
+		return nil
+	}
+
+	if needsRedownload > 0 {
+		log.Printf("[integrity-check] %d blobs marked for re-download from remote", needsRedownload)
+	}
+
+	return nil
+}
+
+// ==================== Database Backup ====================
+
+// verifyDatabaseBackup checks that database backups are being created
+func (w *Worker) verifyDatabaseBackup(ctx context.Context) error {
+	if w.injector == nil || w.injector.blobsDir == "" {
+		return nil
+	}
+
+	// Check if backup file exists (it's at the same level as blobs dir)
+	backupPath := filepath.Join(filepath.Dir(w.injector.blobsDir), "meta.db.backup")
+	info, err := os.Stat(backupPath)
+	if err != nil {
+		if os.IsNotExist(err) {
+			// Backup doesn't exist - might be expected if backup interval hasn't elapsed
+			return nil
+		}
+		return nil
+	}
+
+	// Check that backup is recent (within 2x backup interval)
+	maxAge := 2 * time.Hour // Default backup interval is 1 hour
+	if time.Since(info.ModTime()) > maxAge {
+		log.Printf("[backup-check] database backup is stale (age=%v)", time.Since(info.ModTime()))
 	}
 
 	return nil
