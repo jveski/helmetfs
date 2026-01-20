@@ -131,6 +131,57 @@ func TestFSBasics(t *testing.T) {
 	require.NoError(t, err)
 	assert.Equal(t, "preserved content", string(content))
 	require.NoError(t, f.Close())
+
+	// Rename directory moves all contents
+	require.NoError(t, fs.Mkdir(ctx, "/srcdir", 0755))
+	require.NoError(t, fs.Mkdir(ctx, "/srcdir/subdir", 0755))
+
+	f, err = fs.OpenFile(ctx, "/srcdir/file1.txt", os.O_CREATE|os.O_WRONLY, 0644)
+	require.NoError(t, err)
+	_, err = f.Write([]byte("file1 content"))
+	require.NoError(t, err)
+	require.NoError(t, f.Close())
+
+	f, err = fs.OpenFile(ctx, "/srcdir/subdir/file2.txt", os.O_CREATE|os.O_WRONLY, 0644)
+	require.NoError(t, err)
+	_, err = f.Write([]byte("file2 content"))
+	require.NoError(t, err)
+	require.NoError(t, f.Close())
+
+	require.NoError(t, fs.Rename(ctx, "/srcdir", "/dstdir"))
+
+	// Old paths should not exist
+	_, err = fs.Stat(ctx, "/srcdir")
+	assert.ErrorIs(t, err, os.ErrNotExist)
+	_, err = fs.Stat(ctx, "/srcdir/file1.txt")
+	assert.ErrorIs(t, err, os.ErrNotExist)
+	_, err = fs.Stat(ctx, "/srcdir/subdir")
+	assert.ErrorIs(t, err, os.ErrNotExist)
+	_, err = fs.Stat(ctx, "/srcdir/subdir/file2.txt")
+	assert.ErrorIs(t, err, os.ErrNotExist)
+
+	// New paths should exist with correct content
+	info, err = fs.Stat(ctx, "/dstdir")
+	require.NoError(t, err)
+	assert.True(t, info.IsDir())
+
+	info, err = fs.Stat(ctx, "/dstdir/subdir")
+	require.NoError(t, err)
+	assert.True(t, info.IsDir())
+
+	f, err = fs.OpenFile(ctx, "/dstdir/file1.txt", os.O_RDONLY, 0)
+	require.NoError(t, err)
+	content, err = io.ReadAll(f)
+	require.NoError(t, err)
+	assert.Equal(t, "file1 content", string(content))
+	require.NoError(t, f.Close())
+
+	f, err = fs.OpenFile(ctx, "/dstdir/subdir/file2.txt", os.O_RDONLY, 0)
+	require.NoError(t, err)
+	content, err = io.ReadAll(f)
+	require.NoError(t, err)
+	assert.Equal(t, "file2 content", string(content))
+	require.NoError(t, f.Close())
 }
 
 func TestDeleteLocalBlobs(t *testing.T) {
