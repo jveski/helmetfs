@@ -1,6 +1,6 @@
-FROM golang:1.24-alpine AS builder
+FROM golang:1.24 AS builder
 
-RUN apk add --no-cache gcc musl-dev
+RUN apt-get update && apt-get install -y --no-install-recommends gcc libc6-dev && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /app
 COPY go.mod go.sum ./
@@ -8,9 +8,9 @@ RUN go mod download
 COPY . .
 RUN CGO_ENABLED=1 go build -o helmetfs .
 
-FROM alpine:3.21
+FROM ubuntu:24.04
 
-RUN apk add --no-cache rclone ca-certificates
+RUN apt-get update && apt-get install -y --no-install-recommends rclone ca-certificates && rm -rf /var/lib/apt/lists/*
 
 COPY --from=builder /app/helmetfs /usr/local/bin/helmetfs
 
