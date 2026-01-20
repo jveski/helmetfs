@@ -337,6 +337,11 @@ func restoreDatabase(dbPath, backupPath, remotePath, bwLimit string) error {
 			return err
 		}
 
+		if _, err := os.Stat(tmpPath); err != nil {
+			slog.Info("database backup is missing - initializing new db")
+			return nil
+		}
+
 		slog.Info("database backup downloaded from remote")
 		return os.Rename(tmpPath, backupPath)
 	}
