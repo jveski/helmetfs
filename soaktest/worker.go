@@ -11,6 +11,7 @@ import (
 	"net/http"
 	"net/url"
 	"path"
+	"regexp"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -248,6 +249,9 @@ func (w *Worker) selectOperation() string {
 }
 
 func (w *Worker) createFile(ctx context.Context) error {
+	w.state.RLock()
+	defer w.state.RUnlock()
+
 	dir, ok := w.state.randomDir(w.rng)
 	if !ok {
 		dir = "/"
@@ -314,6 +318,9 @@ func (w *Worker) createFile(ctx context.Context) error {
 }
 
 func (w *Worker) readFile(ctx context.Context) error {
+	w.state.RLock()
+	defer w.state.RUnlock()
+
 	filePath, expectedContent, ok := w.state.randomFile(w.rng)
 	if !ok {
 		return nil
@@ -332,6 +339,12 @@ func (w *Worker) readFile(ctx context.Context) error {
 		return nil
 	}
 	if resp.StatusCode != http.StatusOK {
+		return nil
+	}
+
+	// If content is nil (file discovered via sync), just update state with actual content
+	if expectedContent == nil {
+		w.state.addFile(filePath, content)
 		return nil
 	}
 
@@ -368,6 +381,9 @@ func (w *Worker) readFile(ctx context.Context) error {
 }
 
 func (w *Worker) deleteFile(ctx context.Context) error {
+	w.state.RLock()
+	defer w.state.RUnlock()
+
 	filePath, _, ok := w.state.randomFile(w.rng)
 	if !ok {
 		return nil
@@ -381,6 +397,9 @@ func (w *Worker) deleteFile(ctx context.Context) error {
 }
 
 func (w *Worker) createDir(ctx context.Context) error {
+	w.state.RLock()
+	defer w.state.RUnlock()
+
 	parentDir, ok := w.state.randomDir(w.rng)
 	if !ok {
 		parentDir = "/"
@@ -395,6 +414,9 @@ func (w *Worker) createDir(ctx context.Context) error {
 }
 
 func (w *Worker) listDir(ctx context.Context) error {
+	w.state.RLock()
+	defer w.state.RUnlock()
+
 	dir, ok := w.state.randomDir(w.rng)
 	if !ok {
 		return nil
@@ -411,6 +433,9 @@ func (w *Worker) listDir(ctx context.Context) error {
 }
 
 func (w *Worker) rename(ctx context.Context) error {
+	w.state.RLock()
+	defer w.state.RUnlock()
+
 	srcPath, content, ok := w.state.randomFile(w.rng)
 	if !ok {
 		return nil
@@ -435,6 +460,9 @@ func (w *Worker) rename(ctx context.Context) error {
 }
 
 func (w *Worker) restore(ctx context.Context) error {
+	w.state.LockForRestore()
+	defer w.state.UnlockRestore()
+
 	timestamp := time.Now().Add(-time.Duration(w.rng.IntN(3600)) * time.Second).Format(time.RFC3339)
 	form := url.Values{}
 	form.Set("timestamp", timestamp)
@@ -444,8 +472,103 @@ func (w *Worker) restore(ctx context.Context) error {
 		return nil
 	}
 	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
-	w.doReqDiscard(req)
+
+	status := w.doReqDiscard(req)
+	if status == http.StatusSeeOther || status == http.StatusOK {
+		// Restore succeeded - re-sync state from server
+		files, dirs, err := w.syncFromServer(ctx)
+		if err != nil {
+			log.Printf("[restore] warning: failed to sync state from server: %v", err)
+			// Fall back to clearing state
+			w.state.ReplaceState(make(map[string][]byte), map[string]bool{"/": true})
+		} else {
+			w.state.ReplaceState(files, dirs)
+		}
+	}
+
 	return nil
+}
+
+// syncFromServer rebuilds in-memory state by listing all files/dirs from the server.
+func (w *Worker) syncFromServer(ctx context.Context) (map[string][]byte, map[string]bool, error) {
+	files := make(map[string][]byte)
+	dirs := make(map[string]bool)
+	dirs["/"] = true
+
+	// Use PROPFIND with Depth: infinity to get all entries
+	propfindBody := `<?xml version="1.0" encoding="utf-8"?><propfind xmlns="DAV:"><prop><resourcetype/><getcontentlength/></prop></propfind>`
+	req := w.newRequest(ctx, "PROPFIND", "/", strings.NewReader(propfindBody))
+	if req == nil {
+		return nil, nil, fmt.Errorf("failed to create PROPFIND request")
+	}
+	req.Header.Set("Depth", "infinity")
+	req.Header.Set("Content-Type", "application/xml")
+
+	resp := w.doReq(req)
+	if resp == nil {
+		return nil, nil, fmt.Errorf("PROPFIND request failed")
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusMultiStatus {
+		return nil, nil, fmt.Errorf("PROPFIND returned %d", resp.StatusCode)
+	}
+
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return nil, nil, fmt.Errorf("failed to read PROPFIND response: %w", err)
+	}
+
+	entries := parsePropfindResponse(string(body))
+	for _, e := range entries {
+		if e.isDir {
+			dirs[e.path] = true
+		} else {
+			// For files, we can't know the content without reading each file.
+			// Store nil content - readFile will update it on first read.
+			files[e.path] = nil
+		}
+	}
+
+	return files, dirs, nil
+}
+
+type propfindEntry struct {
+	path  string
+	isDir bool
+}
+
+// parsePropfindResponse extracts entries from WebDAV multistatus XML.
+func parsePropfindResponse(body string) []propfindEntry {
+	var entries []propfindEntry
+	responseRegex := regexp.MustCompile(`(?s)<(?:D:)?response[^>]*>(.*?)</(?:D:)?response>`)
+	hrefRegex := regexp.MustCompile(`<(?:D:)?href[^>]*>([^<]+)</(?:D:)?href>`)
+
+	for _, match := range responseRegex.FindAllStringSubmatch(body, -1) {
+		responseBody := match[1]
+		hrefMatch := hrefRegex.FindStringSubmatch(responseBody)
+		if hrefMatch == nil {
+			continue
+		}
+		href := hrefMatch[1]
+		decodedPath, err := url.PathUnescape(href)
+		if err != nil {
+			decodedPath = href
+		}
+		if u, err := url.Parse(decodedPath); err == nil {
+			decodedPath = u.Path
+		}
+		decodedPath = path.Clean(decodedPath)
+		if decodedPath == "" || decodedPath == "." {
+			decodedPath = "/"
+		}
+
+		isDir := strings.Contains(responseBody, "<collection") ||
+			strings.Contains(responseBody, "<D:collection")
+
+		entries = append(entries, propfindEntry{path: decodedPath, isDir: isDir})
+	}
+	return entries
 }
 
 func (w *Worker) verifyDeletedReturns404(ctx context.Context) error {
@@ -478,6 +601,9 @@ func (w *Worker) verifyParentMustExist(ctx context.Context) error {
 }
 
 func (w *Worker) verifyPathExclusivity(ctx context.Context) error {
+	w.state.RLock()
+	defer w.state.RUnlock()
+
 	dirName := "/" + randomName(w.rng) + "_excl"
 
 	if w.doRequestDiscard(ctx, "MKCOL", dirName, nil) != http.StatusCreated {
@@ -671,6 +797,9 @@ func (w *Worker) verifyCorruptionDetected(ctx context.Context) error {
 
 // copyFile tests the WebDAV COPY operation
 func (w *Worker) copyFile(ctx context.Context) error {
+	w.state.RLock()
+	defer w.state.RUnlock()
+
 	srcPath, content, ok := w.state.randomFile(w.rng)
 	if !ok {
 		return nil
@@ -810,6 +939,9 @@ func (w *Worker) proppatch(ctx context.Context) error {
 
 // createFileExclusive tests that creating a file twice works correctly (second write overwrites)
 func (w *Worker) createFileExclusive(ctx context.Context) error {
+	w.state.RLock()
+	defer w.state.RUnlock()
+
 	name := randomName(w.rng) + "_excl.txt"
 	filePath := "/" + name
 	content1 := []byte("first content")
@@ -853,6 +985,9 @@ func (w *Worker) createFileExclusive(ctx context.Context) error {
 
 // truncateFile tests overwriting a file with new content (O_TRUNC behavior)
 func (w *Worker) truncateFile(ctx context.Context) error {
+	w.state.RLock()
+	defer w.state.RUnlock()
+
 	filePath, _, ok := w.state.randomFile(w.rng)
 	if !ok {
 		return nil
@@ -887,6 +1022,9 @@ func (w *Worker) truncateFile(ctx context.Context) error {
 
 // createEmptyFile tests creating a file with no content
 func (w *Worker) createEmptyFile(ctx context.Context) error {
+	w.state.RLock()
+	defer w.state.RUnlock()
+
 	dir, ok := w.state.randomDir(w.rng)
 	if !ok {
 		dir = "/"
@@ -1022,6 +1160,9 @@ func (w *Worker) verifyReadPermissions(ctx context.Context) error {
 
 // concurrentReaders tests multiple simultaneous reads of the same file
 func (w *Worker) concurrentReaders(ctx context.Context) error {
+	w.state.RLock()
+	defer w.state.RUnlock()
+
 	filePath, expectedContent, ok := w.state.randomFile(w.rng)
 	if !ok {
 		return nil
@@ -1078,6 +1219,9 @@ func (w *Worker) concurrentReaders(ctx context.Context) error {
 
 // concurrentReadWrite tests reading while another request writes
 func (w *Worker) concurrentReadWrite(ctx context.Context) error {
+	w.state.RLock()
+	defer w.state.RUnlock()
+
 	// Create a test file
 	filePath := "/" + randomName(w.rng) + "_rw.txt"
 	originalContent := []byte("original content for read-write test")
