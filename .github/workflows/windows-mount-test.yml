@@ -13,22 +13,30 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: Build Docker image
-        run: docker build -t helmetfs:test .
-
-      - name: Start HelmetFS container
+      - name: Install Go and build dependencies in WSL
         run: |
-          docker run -d --name helmetfs -p 8080:8080 helmetfs:test
-          Start-Sleep -Seconds 5
+          wsl sudo apt-get update
+          wsl sudo apt-get install -y golang-go gcc
+
+      - name: Build HelmetFS in WSL
+        run: wsl bash -c "cd /mnt/d/a/helmetfs/helmetfs && CGO_ENABLED=1 go build -o helmetfs ."
+
+      - name: Start HelmetFS in WSL
+        run: wsl bash -c "cd /mnt/d/a/helmetfs/helmetfs && nohup ./helmetfs > /tmp/helmetfs.log 2>&1 & echo \$! > /tmp/helmetfs.pid && sleep 5"
 
       - name: Wait for server readiness
         shell: powershell
         run: |
+          # Get the WSL IP address
+          $wslIp = (wsl hostname -I).Trim().Split()[0]
+          Write-Host "WSL IP: $wslIp"
+          echo "WSL_IP=$wslIp" >> $env:GITHUB_ENV
+
           $maxAttempts = 30
           $attempt = 0
           while ($attempt -lt $maxAttempts) {
             try {
-              $response = Invoke-WebRequest -Uri "http://localhost:8080/" -Method GET -UseBasicParsing -TimeoutSec 5
+              $response = Invoke-WebRequest -Uri "http://${wslIp}:8080/" -Method GET -UseBasicParsing -TimeoutSec 5
               if ($response.StatusCode -eq 200) {
                 Write-Host "Server is ready"
                 exit 0
@@ -62,10 +70,11 @@ jobs:
           $driveLetter = "W"
           $testDir = "test-$([guid]::NewGuid().ToString('N').Substring(0,8))"
           $mounted = $false
+          $wslIp = $env:WSL_IP
 
           try {
             Write-Host "=== Mounting WebDAV share ==="
-            net use ${driveLetter}: http://localhost:8080/
+            net use ${driveLetter}: http://${wslIp}:8080/
             if ($LASTEXITCODE -ne 0) {
               throw "Failed to mount WebDAV share"
             }
@@ -153,10 +162,10 @@ jobs:
             }
           }
 
-      - name: Show container logs on failure
+      - name: Show HelmetFS logs on failure
         if: failure()
-        run: docker logs helmetfs
+        run: wsl cat /tmp/helmetfs.log 2>/dev/null || echo "No log file found"
 
       - name: Cleanup
         if: always()
-        run: docker rm -f helmetfs 2>$null
+        run: wsl bash -c "if [ -f /tmp/helmetfs.pid ]; then kill \$(cat /tmp/helmetfs.pid) 2>/dev/null || true; fi"
