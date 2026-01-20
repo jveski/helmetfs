@@ -36,7 +36,7 @@ func syncRemote(db *sql.DB, blobsDir, remotePath, bwLimit string) (bool, error) 
 	n2, err := rcloneBatchOp(db, blobsDir,
 		`SELECT id FROM blobs WHERE local_written = 1 AND remote_written = 0 AND local_deleting = 0 LIMIT 100`,
 		`UPDATE blobs SET remote_written = 1 WHERE id = ?`,
-		[]string{"copy", "--files-from-raw", "-", "/", remotePath},
+		[]string{"copy", "--no-update-dir-modtime", "--files-from-raw", "-", "/", remotePath},
 		bwLimit,
 		"uploaded blobs to remote")
 	if err != nil {
@@ -45,7 +45,7 @@ func syncRemote(db *sql.DB, blobsDir, remotePath, bwLimit string) (bool, error) 
 	n3, err := rcloneBatchOp(db, blobsDir,
 		`SELECT id FROM blobs WHERE local_written = 0 AND remote_written = 1 AND remote_deleted = 0 LIMIT 100`,
 		`UPDATE blobs SET local_written = 1 WHERE id = ?`,
-		[]string{"copy", "--files-from-raw", "-", remotePath, "/"},
+		[]string{"copy", "--no-update-dir-modtime", "--files-from-raw", "-", remotePath, "/"},
 		bwLimit,
 		"downloaded blobs from remote")
 	return n1+n2+n3 > 0, err
