@@ -52,39 +52,16 @@ jobs:
           echo "PASS: Delete test"
 
           # Test 4: Directory operations
-          echo "DEBUG: Root before mkdir:"
-          curl -s -X PROPFIND http://localhost:8080/ -H "Depth: 1" | grep -o '<D:href>[^<]*</D:href>' || true
-
           mkdir "$MOUNT/testdir"
           [ -d "$MOUNT/testdir" ] || { echo "FAIL: Mkdir test"; exit 1; }
           echo "PASS: Mkdir test"
 
-          echo "DEBUG: Root after mkdir:"
-          curl -s -X PROPFIND http://localhost:8080/ -H "Depth: 1" | grep -o '<D:href>[^<]*</D:href>' || true
-          echo "DEBUG: testdir after mkdir:"
-          curl -s -X PROPFIND http://localhost:8080/testdir/ -H "Depth: 1" | grep -o '<D:href>[^<]*</D:href>' || true
-
           echo "file in dir" > "$MOUNT/testdir/nested.txt"
-
-          echo "DEBUG: testdir after nested.txt creation:"
-          curl -s -X PROPFIND http://localhost:8080/testdir/ -H "Depth: 1" | grep -o '<D:href>[^<]*</D:href>' || true
-
           content=$(cat "$MOUNT/testdir/nested.txt")
           [ "$content" = "file in dir" ] || { echo "FAIL: Nested file test"; exit 1; }
           echo "PASS: Nested file test"
 
-          echo "DEBUG: Root before rm -r testdir:"
-          curl -s -X PROPFIND http://localhost:8080/ -H "Depth: 1" | grep -o '<D:href>[^<]*</D:href>' || true
-          echo "DEBUG: testdir before rm -r:"
-          curl -s -X PROPFIND http://localhost:8080/testdir/ -H "Depth: 1" | grep -o '<D:href>[^<]*</D:href>' || true
-          echo "DEBUG: Mount ls before rm -r:"
-          ls -la "$MOUNT/testdir" || true
-
           rm -r "$MOUNT/testdir"
-
-          echo "DEBUG: Root after rm -r testdir:"
-          curl -s -X PROPFIND http://localhost:8080/ -H "Depth: 1" | grep -o '<D:href>[^<]*</D:href>' || true
-
           [ ! -d "$MOUNT/testdir" ] || { echo "FAIL: Rmdir test"; exit 1; }
           echo "PASS: Rmdir test"
 
