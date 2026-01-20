@@ -55,10 +55,23 @@ jobs:
           Write-Error "Server failed to become ready"
           exit 1
 
-      - name: Configure Windows WebClient
+      - name: Install and Configure Windows WebClient
         shell: powershell
         run: |
-          Start-Service WebClient
+          # Install WebClient feature (not installed by default on Windows Server)
+          Write-Host "Installing WebClient feature..."
+          Enable-WindowsOptionalFeature -Online -FeatureName WebDAV-Redirector -NoRestart -ErrorAction SilentlyContinue
+
+          # Alternative: Install via DISM if the above doesn't work
+          dism /online /enable-feature /featurename:WebDAV-Redirector /norestart /quiet
+
+          # Start the service
+          Start-Service WebClient -ErrorAction SilentlyContinue
+          if (-not (Get-Service WebClient -ErrorAction SilentlyContinue)) {
+            Write-Error "WebClient service not available after installation"
+            exit 1
+          }
+
           Set-Service WebClient -StartupType Automatic
 
           $regPath = "HKLM:\SYSTEM\CurrentControlSet\Services\WebClient\Parameters"
