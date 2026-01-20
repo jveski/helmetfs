@@ -1,0 +1,45 @@
+name: Soak Test
+
+on:
+  workflow_dispatch:
+    inputs:
+      duration:
+        description: 'Test duration (e.g., 5m, 1h)'
+        required: false
+        default: '10m'
+      concurrency:
+        description: 'Number of concurrent workers'
+        required: false
+        default: '4'
+      seed:
+        description: 'Random seed (0 = use current time)'
+        required: false
+        default: '0'
+  schedule:
+    - cron: '0 3 * * *'
+
+jobs:
+  soak:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+
+      - name: Build HelmetFS
+        run: go build -o helmetfs .
+
+      - name: Start HelmetFS
+        run: |
+          ./helmetfs -addr :8080 &
+          sleep 2
+
+      - name: Run soak test
+        run: |
+          cd soaktest
+          go run . \
+            -url http://localhost:8080 \
+            -duration ${{ github.event.inputs.duration || '10m' }} \
+            -concurrency ${{ github.event.inputs.concurrency || '4' }} \
+            -seed ${{ github.event.inputs.seed || '0' }}

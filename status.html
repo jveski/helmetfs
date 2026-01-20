@@ -1,0 +1,103 @@
+<!DOCTYPE html>
+<html>
+<head>
+<title>HelmetFS Status</title>
+<style>
+* { box-sizing: border-box; }
+body {
+	font-family: system-ui, -apple-system, sans-serif;
+	max-width: 600px;
+	margin: 0 auto;
+	padding: 2rem;
+	background: #f5f5f5;
+	color: #333;
+}
+h1 {
+	border-bottom: 2px solid #333;
+	padding-bottom: 0.5rem;
+}
+h2 {
+	margin-top: 1.5rem;
+	font-size: 1.1rem;
+	color: #555;
+}
+.card {
+	background: #fff;
+	border-radius: 8px;
+	padding: 1rem;
+	margin-bottom: 1rem;
+	box-shadow: 0 1px 3px rgba(0,0,0,0.1);
+}
+.stat {
+	display: flex;
+	justify-content: space-between;
+	padding: 0.5rem 0;
+	border-bottom: 1px solid #eee;
+}
+.stat:last-child { border-bottom: none; }
+.stat-label { color: #666; }
+.stat-value { font-weight: 600; }
+.stat-value.warning { color: #c00; }
+form {
+	display: flex;
+	gap: 0.5rem;
+	align-items: center;
+	flex-wrap: wrap;
+}
+input[type="datetime-local"] {
+	padding: 0.5rem;
+	border: 1px solid #ccc;
+	border-radius: 4px;
+	font-size: 1rem;
+}
+button {
+	padding: 0.5rem 1rem;
+	background: #333;
+	color: #fff;
+	border: none;
+	border-radius: 4px;
+	cursor: pointer;
+	font-size: 1rem;
+}
+button:hover { background: #555; }
+</style>
+</head>
+<body>
+<h1>HelmetFS Status</h1>
+
+<h2>Rclone Operations</h2>
+<div class="card">
+<div class="stat"><span class="stat-label">Pending Downloads</span><span class="stat-value">{{.PendingDownloads}}</span></div>
+<div class="stat"><span class="stat-label">Pending Uploads</span><span class="stat-value">{{.PendingUploads}}</span></div>
+<div class="stat"><span class="stat-label">Pending Deletes</span><span class="stat-value">{{.PendingDeletes}}</span></div>
+</div>
+
+<h2>Integrity</h2>
+<div class="card">
+<div class="stat"><span class="stat-label">Overdue Integrity Checks</span><span class="stat-value{{if .OverdueIntegrity}} warning{{end}}">{{.OverdueIntegrity}}</span></div>
+</div>
+
+<h2>Storage</h2>
+<div class="card">
+<div class="stat"><span class="stat-label">Active Files</span><span class="stat-value">{{.ActiveFiles}}</span></div>
+<div class="stat"><span class="stat-label">Local Blob Space</span><span class="stat-value">{{.LocalSpace}}</span></div>
+<div class="stat"><span class="stat-label">Remote Blob Space</span><span class="stat-value">{{.RemoteSpace}}</span></div>
+</div>
+
+<h2>Restore</h2>
+<div class="card">
+<form action="/api/restore" method="POST" onsubmit="return confirm('Restore filesystem to this timestamp?')">
+<input type="datetime-local" name="datetime" required>
+<input type="hidden" name="timestamp" id="timestamp">
+<button type="submit">Restore</button>
+</form>
+</div>
+
+<script>
+document.querySelector('form').addEventListener('submit', function(e) {
+	var dt = document.querySelector('input[name="datetime"]').value;
+	if (dt) document.getElementById('timestamp').value = new Date(dt).toISOString();
+});
+</script>
+</body>
+</html>
