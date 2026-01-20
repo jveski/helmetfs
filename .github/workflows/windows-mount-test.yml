@@ -13,10 +13,14 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: Install Go and build dependencies in WSL
-        run: |
-          wsl sudo apt-get update
-          wsl sudo apt-get install -y golang-go gcc
+      - name: Install Ubuntu WSL
+        uses: Vampire/setup-wsl@v6
+        with:
+          distribution: Ubuntu-24.04
+          update: 'true'
+          additional-packages:
+            golang-go
+            gcc
 
       - name: Build HelmetFS in WSL
         run: wsl bash -c "cd /mnt/d/a/helmetfs/helmetfs && CGO_ENABLED=1 go build -o helmetfs ."
