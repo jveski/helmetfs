@@ -21,6 +21,7 @@ jobs:
           additional-packages:
             golang-go
             gcc
+            libc6-dev
 
       - name: Build HelmetFS in WSL
         run: wsl bash -c "cd /mnt/d/a/helmetfs/helmetfs && CGO_ENABLED=1 go build -o helmetfs ."
