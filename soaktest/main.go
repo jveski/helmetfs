@@ -5,12 +5,12 @@ import (
 	"context"
 	"database/sql"
 	"encoding/binary"
-	"encoding/xml"
 	"flag"
 	"fmt"
 	"hash/fnv"
 	"io"
 	"log"
+	"maps"
 	"math/rand/v2"
 	"net/http"
 	"net/url"
@@ -18,6 +18,7 @@ import (
 	"os/signal"
 	"path"
 	"path/filepath"
+	"slices"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -38,6 +39,40 @@ var (
 	corruptRate   = flag.Float64("corrupt-rate", 0, "probability of corrupting a blob after write (0-1)")
 	rcloneFailure = flag.Float64("rclone-failure-rate", 0, "probability of simulating rclone sync failure (0-1)")
 )
+
+type weightedOp struct {
+	name   string
+	weight int
+}
+
+// baseOps are the core operations always available
+var baseOps = []weightedOp{
+	{"createFile", 30},
+	{"readFile", 25},
+	{"deleteFile", 10},
+	{"createDir", 10},
+	{"listDir", 10},
+	{"rename", 5},
+	{"restore", 2},
+	{"verifyDeletedReturns404", 2},
+	{"verifyParentMustExist", 2},
+	{"verifyPathExclusivity", 2},
+	{"verifyRestoreRejectsFuture", 1},
+	{"verifyCannotDeleteRoot", 1},
+	// WebDAV operations
+	{"copyFile", 5},
+	{"lockUnlock", 3},
+	{"proppatch", 2},
+	// Edge cases
+	{"createFileExclusive", 2},
+	{"truncateFile", 3},
+	{"createEmptyFile", 2},
+	{"verifyDeduplication", 2},
+	{"verifyReadPermissions", 1},
+	// Concurrent access
+	{"concurrentReaders", 2},
+	{"concurrentReadWrite", 2},
+}
 
 func main() {
 	flag.Parse()
@@ -360,14 +395,9 @@ func (s *State) randomFile(rng *rand.Rand) (string, []byte, bool) {
 	if len(s.files) == 0 {
 		return "", nil, false
 	}
-	i := rng.IntN(len(s.files))
-	for p, c := range s.files {
-		if i == 0 {
-			return p, c, true
-		}
-		i--
-	}
-	return "", nil, false
+	keys := slices.Collect(maps.Keys(s.files))
+	p := keys[rng.IntN(len(keys))]
+	return p, s.files[p], true
 }
 
 func (s *State) randomDir(rng *rand.Rand) (string, bool) {
@@ -376,14 +406,8 @@ func (s *State) randomDir(rng *rand.Rand) (string, bool) {
 	if len(s.dirs) == 0 {
 		return "", false
 	}
-	i := rng.IntN(len(s.dirs))
-	for p := range s.dirs {
-		if i == 0 {
-			return p, true
-		}
-		i--
-	}
-	return "", false
+	keys := slices.Collect(maps.Keys(s.dirs))
+	return keys[rng.IntN(len(keys))], true
 }
 
 func (s *State) listDir(dir string) []string {
@@ -429,6 +453,73 @@ type Worker struct {
 	baseURL  string
 	failures chan<- Failure
 	injector *FailureInjector
+}
+
+// newRequest creates a new HTTP request with the baseURL prepended to the path.
+// Returns nil if request creation fails.
+func (w *Worker) newRequest(ctx context.Context, method, path string, body io.Reader) *http.Request {
+	req, err := http.NewRequestWithContext(ctx, method, w.baseURL+path, body)
+	if err != nil {
+		return nil
+	}
+	return req
+}
+
+// doRequest is a helper that performs an HTTP request and returns the response.
+// It handles common error cases by returning nil response (caller should check).
+// The caller is responsible for closing resp.Body if resp is non-nil.
+func (w *Worker) doRequest(ctx context.Context, method, path string, body io.Reader) *http.Response {
+	req := w.newRequest(ctx, method, path, body)
+	if req == nil {
+		return nil
+	}
+	resp, err := w.client.Do(req)
+	if err != nil {
+		return nil
+	}
+	return resp
+}
+
+// doRequestDiscard performs an HTTP request and discards the response body.
+// Returns the status code, or 0 if the request failed.
+func (w *Worker) doRequestDiscard(ctx context.Context, method, path string, body io.Reader) int {
+	resp := w.doRequest(ctx, method, path, body)
+	if resp == nil {
+		return 0
+	}
+	defer resp.Body.Close()
+	io.Copy(io.Discard, resp.Body)
+	return resp.StatusCode
+}
+
+// doReq executes a pre-built request and returns the response.
+// Returns nil if the request fails.
+func (w *Worker) doReq(req *http.Request) *http.Response {
+	if req == nil {
+		return nil
+	}
+	resp, err := w.client.Do(req)
+	if err != nil {
+		return nil
+	}
+	return resp
+}
+
+// doReqDiscard executes a pre-built request and discards the response body.
+// Returns the status code, or 0 if the request failed.
+func (w *Worker) doReqDiscard(req *http.Request) int {
+	resp := w.doReq(req)
+	if resp == nil {
+		return 0
+	}
+	defer resp.Body.Close()
+	io.Copy(io.Discard, resp.Body)
+	return resp.StatusCode
+}
+
+// deleteTestFile is a helper for cleaning up test files.
+func (w *Worker) deleteTestFile(ctx context.Context, path string) {
+	w.doRequestDiscard(ctx, http.MethodDelete, path, nil)
 }
 
 func (w *Worker) run(ctx context.Context, opCount *atomic.Int64) {
@@ -513,56 +604,25 @@ func (w *Worker) run(ctx context.Context, opCount *atomic.Int64) {
 }
 
 func (w *Worker) selectOperation() string {
-	ops := []struct {
-		name   string
-		weight int
-	}{
-		{"createFile", 30},
-		{"readFile", 25},
-		{"deleteFile", 10},
-		{"createDir", 10},
-		{"listDir", 10},
-		{"rename", 5},
-		{"restore", 2},
-		{"verifyDeletedReturns404", 2},
-		{"verifyParentMustExist", 2},
-		{"verifyPathExclusivity", 2},
-		{"verifyRestoreRejectsFuture", 1},
-		{"verifyCannotDeleteRoot", 1},
-		// WebDAV operations
-		{"copyFile", 5},
-		{"lockUnlock", 3},
-		{"proppatch", 2},
-		// Edge cases
-		{"createFileExclusive", 2},
-		{"truncateFile", 3},
-		{"createEmptyFile", 2},
-		{"verifyDeduplication", 2},
-		{"verifyReadPermissions", 1},
-		// Concurrent access
-		{"concurrentReaders", 2},
-		{"concurrentReadWrite", 2},
-	}
+	ops := baseOps
 
 	// Add failure injection operations if enabled
 	if w.injector != nil {
 		if w.injector.corruptRate > 0 {
 			ops = append(ops,
-				struct{ name string; weight int }{"injectCorruption", 2},
-				struct{ name string; weight int }{"injectBlobDeletion", 1},
-				struct{ name string; weight int }{"verifyCorruptionDetected", 2},
+				weightedOp{"injectCorruption", 2},
+				weightedOp{"injectBlobDeletion", 1},
+				weightedOp{"verifyCorruptionDetected", 2},
 			)
 		}
 		if w.injector.rcloneFailure > 0 {
-			ops = append(ops,
-				struct{ name string; weight int }{"injectRcloneFailure", 1},
-			)
+			ops = append(ops, weightedOp{"injectRcloneFailure", 1})
 		}
 		// Add GC and integrity checks when we have db access
 		if w.injector.db != nil {
 			ops = append(ops,
-				struct{ name string; weight int }{"verifyGarbageCollection", 2},
-				struct{ name string; weight int }{"verifyIntegrityCheckLoop", 2},
+				weightedOp{"verifyGarbageCollection", 2},
+				weightedOp{"verifyIntegrityCheckLoop", 2},
 			)
 		}
 	}
@@ -590,24 +650,14 @@ func (w *Worker) createFile(ctx context.Context) error {
 	filePath := path.Join(dir, name+".txt")
 	content := randomContent(w.rng)
 
-	req, err := http.NewRequestWithContext(ctx, http.MethodPut, w.baseURL+filePath, bytes.NewReader(content))
-	if err != nil {
-		return nil
-	}
-	resp, err := w.client.Do(req)
-	if err != nil {
-		return nil
-	}
-	defer resp.Body.Close()
-	io.Copy(io.Discard, resp.Body)
-
-	if resp.StatusCode != http.StatusCreated && resp.StatusCode != http.StatusNoContent {
+	status := w.doRequestDiscard(ctx, http.MethodPut, filePath, bytes.NewReader(content))
+	if status != http.StatusCreated && status != http.StatusNoContent {
 		return nil
 	}
 	w.state.addFile(filePath, content)
 
-	readResp, err := w.client.Get(w.baseURL + filePath)
-	if err != nil {
+	readResp := w.doRequest(ctx, http.MethodGet, filePath, nil)
+	if readResp == nil {
 		return nil
 	}
 	defer readResp.Body.Close()
@@ -625,8 +675,8 @@ func (w *Worker) createFile(ctx context.Context) error {
 	// Retry once to distinguish transient failures from persistent issues.
 	if readResp.StatusCode == http.StatusInternalServerError {
 		time.Sleep(50 * time.Millisecond)
-		retryResp, err := w.client.Get(w.baseURL + filePath)
-		if err != nil {
+		retryResp := w.doRequest(ctx, http.MethodGet, filePath, nil)
+		if retryResp == nil {
 			return nil
 		}
 		defer retryResp.Body.Close()
@@ -663,12 +713,8 @@ func (w *Worker) readFile(ctx context.Context) error {
 		return nil
 	}
 
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, w.baseURL+filePath, nil)
-	if err != nil {
-		return nil
-	}
-	resp, err := w.client.Do(req)
-	if err != nil {
+	resp := w.doRequest(ctx, http.MethodGet, filePath, nil)
+	if resp == nil {
 		return nil
 	}
 	defer resp.Body.Close()
@@ -689,8 +735,8 @@ func (w *Worker) readFile(ctx context.Context) error {
 	if !bytes.Equal(expectedContent, content) {
 		// Re-read to check if this is a stable state or transient
 		time.Sleep(10 * time.Millisecond)
-		verifyResp, err := w.client.Get(w.baseURL + filePath)
-		if err != nil {
+		verifyResp := w.doRequest(ctx, http.MethodGet, filePath, nil)
+		if verifyResp == nil {
 			return nil
 		}
 		defer verifyResp.Body.Close()
@@ -721,18 +767,8 @@ func (w *Worker) deleteFile(ctx context.Context) error {
 		return nil
 	}
 
-	req, err := http.NewRequestWithContext(ctx, http.MethodDelete, w.baseURL+filePath, nil)
-	if err != nil {
-		return nil
-	}
-	resp, err := w.client.Do(req)
-	if err != nil {
-		return nil
-	}
-	defer resp.Body.Close()
-	io.Copy(io.Discard, resp.Body)
-
-	if resp.StatusCode == http.StatusNoContent || resp.StatusCode == http.StatusNotFound {
+	status := w.doRequestDiscard(ctx, http.MethodDelete, filePath, nil)
+	if status == http.StatusNoContent || status == http.StatusNotFound {
 		w.state.removeFile(filePath)
 	}
 	return nil
@@ -746,18 +782,7 @@ func (w *Worker) createDir(ctx context.Context) error {
 	name := randomName(w.rng)
 	dirPath := path.Join(parentDir, name)
 
-	req, err := http.NewRequestWithContext(ctx, "MKCOL", w.baseURL+dirPath, nil)
-	if err != nil {
-		return nil
-	}
-	resp, err := w.client.Do(req)
-	if err != nil {
-		return nil
-	}
-	defer resp.Body.Close()
-	io.Copy(io.Discard, resp.Body)
-
-	if resp.StatusCode == http.StatusCreated {
+	if w.doRequestDiscard(ctx, "MKCOL", dirPath, nil) == http.StatusCreated {
 		w.state.addDir(dirPath)
 	}
 	return nil
@@ -769,18 +794,13 @@ func (w *Worker) listDir(ctx context.Context) error {
 		return nil
 	}
 
-	req, err := http.NewRequestWithContext(ctx, "PROPFIND", w.baseURL+dir, strings.NewReader(`<?xml version="1.0" encoding="utf-8"?><propfind xmlns="DAV:"><prop><resourcetype/></prop></propfind>`))
-	if err != nil {
+	req := w.newRequest(ctx, "PROPFIND", dir, strings.NewReader(`<?xml version="1.0" encoding="utf-8"?><propfind xmlns="DAV:"><prop><resourcetype/></prop></propfind>`))
+	if req == nil {
 		return nil
 	}
 	req.Header.Set("Depth", "1")
 	req.Header.Set("Content-Type", "application/xml")
-	resp, err := w.client.Do(req)
-	if err != nil {
-		return nil
-	}
-	defer resp.Body.Close()
-	io.Copy(io.Discard, resp.Body)
+	w.doReqDiscard(req)
 	return nil
 }
 
@@ -794,19 +814,14 @@ func (w *Worker) rename(ctx context.Context) error {
 	newName := randomName(w.rng) + ".txt"
 	destPath := path.Join(dir, newName)
 
-	req, err := http.NewRequestWithContext(ctx, "MOVE", w.baseURL+srcPath, nil)
-	if err != nil {
+	req := w.newRequest(ctx, "MOVE", srcPath, nil)
+	if req == nil {
 		return nil
 	}
 	req.Header.Set("Destination", w.baseURL+destPath)
-	resp, err := w.client.Do(req)
-	if err != nil {
-		return nil
-	}
-	defer resp.Body.Close()
-	io.Copy(io.Discard, resp.Body)
+	status := w.doReqDiscard(req)
 
-	if resp.StatusCode == http.StatusCreated || resp.StatusCode == http.StatusNoContent {
+	if status == http.StatusCreated || status == http.StatusNoContent {
 		w.state.removeFile(srcPath)
 		w.state.addFile(destPath, content)
 	}
@@ -818,17 +833,12 @@ func (w *Worker) restore(ctx context.Context) error {
 	form := url.Values{}
 	form.Set("timestamp", timestamp)
 
-	req, err := http.NewRequestWithContext(ctx, http.MethodPost, w.baseURL+"/api/restore", strings.NewReader(form.Encode()))
-	if err != nil {
+	req := w.newRequest(ctx, http.MethodPost, "/api/restore", strings.NewReader(form.Encode()))
+	if req == nil {
 		return nil
 	}
 	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
-	resp, err := w.client.Do(req)
-	if err != nil {
-		return nil
-	}
-	defer resp.Body.Close()
-	io.Copy(io.Discard, resp.Body)
+	w.doReqDiscard(req)
 	return nil
 }
 
@@ -837,42 +847,15 @@ func (w *Worker) verifyDeletedReturns404(ctx context.Context) error {
 	filePath := "/" + name
 	content := []byte("test content")
 
-	putReq, err := http.NewRequestWithContext(ctx, http.MethodPut, w.baseURL+filePath, bytes.NewReader(content))
-	if err != nil {
-		return nil
-	}
-	putResp, err := w.client.Do(putReq)
-	if err != nil {
-		return nil
-	}
-	putResp.Body.Close()
-	if putResp.StatusCode != http.StatusCreated {
+	if w.doRequestDiscard(ctx, http.MethodPut, filePath, bytes.NewReader(content)) != http.StatusCreated {
 		return nil
 	}
 
-	delReq, err := http.NewRequestWithContext(ctx, http.MethodDelete, w.baseURL+filePath, nil)
-	if err != nil {
-		return nil
-	}
-	delResp, err := w.client.Do(delReq)
-	if err != nil {
-		return nil
-	}
-	delResp.Body.Close()
+	w.doRequestDiscard(ctx, http.MethodDelete, filePath, nil)
 
-	getReq, err := http.NewRequestWithContext(ctx, http.MethodGet, w.baseURL+filePath, nil)
-	if err != nil {
-		return nil
-	}
-	getResp, err := w.client.Do(getReq)
-	if err != nil {
-		return nil
-	}
-	defer getResp.Body.Close()
-	io.Copy(io.Discard, getResp.Body)
-
-	if getResp.StatusCode != http.StatusNotFound {
-		return fmt.Errorf("invariant #12 violated: deleted file %s returned %d instead of 404", filePath, getResp.StatusCode)
+	status := w.doRequestDiscard(ctx, http.MethodGet, filePath, nil)
+	if status != http.StatusNotFound {
+		return fmt.Errorf("invariant #12 violated: deleted file %s returned %d instead of 404", filePath, status)
 	}
 	return nil
 }
@@ -881,18 +864,8 @@ func (w *Worker) verifyParentMustExist(ctx context.Context) error {
 	nonExistent := "/" + randomName(w.rng) + "_noparent/" + randomName(w.rng) + ".txt"
 	content := []byte("test")
 
-	req, err := http.NewRequestWithContext(ctx, http.MethodPut, w.baseURL+nonExistent, bytes.NewReader(content))
-	if err != nil {
-		return nil
-	}
-	resp, err := w.client.Do(req)
-	if err != nil {
-		return nil
-	}
-	defer resp.Body.Close()
-	io.Copy(io.Discard, resp.Body)
-
-	if resp.StatusCode == http.StatusCreated || resp.StatusCode == http.StatusNoContent {
+	status := w.doRequestDiscard(ctx, http.MethodPut, nonExistent, bytes.NewReader(content))
+	if status == http.StatusCreated || status == http.StatusNoContent {
 		return fmt.Errorf("invariant #4 violated: created file %s without parent directory existing", nonExistent)
 	}
 	return nil
@@ -901,43 +874,24 @@ func (w *Worker) verifyParentMustExist(ctx context.Context) error {
 func (w *Worker) verifyPathExclusivity(ctx context.Context) error {
 	dirName := "/" + randomName(w.rng) + "_excl"
 
-	mkcolReq, err := http.NewRequestWithContext(ctx, "MKCOL", w.baseURL+dirName, nil)
-	if err != nil {
-		return nil
-	}
-	mkcolResp, err := w.client.Do(mkcolReq)
-	if err != nil {
-		return nil
-	}
-	mkcolResp.Body.Close()
-	if mkcolResp.StatusCode != http.StatusCreated {
+	if w.doRequestDiscard(ctx, "MKCOL", dirName, nil) != http.StatusCreated {
 		return nil
 	}
 	w.state.addDir(dirName)
 
-	putReq, err := http.NewRequestWithContext(ctx, http.MethodPut, w.baseURL+dirName, bytes.NewReader([]byte("test")))
-	if err != nil {
-		return nil
-	}
-	putResp, err := w.client.Do(putReq)
-	if err != nil {
-		return nil
-	}
-	defer putResp.Body.Close()
-	io.Copy(io.Discard, putResp.Body)
-
-	if putResp.StatusCode == http.StatusCreated || putResp.StatusCode == http.StatusNoContent {
+	putStatus := w.doRequestDiscard(ctx, http.MethodPut, dirName, bytes.NewReader([]byte("test")))
+	if putStatus == http.StatusCreated || putStatus == http.StatusNoContent {
 		// Before reporting an invariant violation, verify the directory still exists.
 		// A concurrent delete or restore operation might have removed the directory
 		// between the MKCOL and PUT, making the PUT success expected behavior.
-		statReq, err := http.NewRequestWithContext(ctx, "PROPFIND", w.baseURL+dirName, strings.NewReader(`<?xml version="1.0" encoding="utf-8"?><propfind xmlns="DAV:"><prop><resourcetype/></prop></propfind>`))
-		if err != nil {
+		statReq := w.newRequest(ctx, "PROPFIND", dirName, strings.NewReader(`<?xml version="1.0" encoding="utf-8"?><propfind xmlns="DAV:"><prop><resourcetype/></prop></propfind>`))
+		if statReq == nil {
 			return nil
 		}
 		statReq.Header.Set("Depth", "0")
 		statReq.Header.Set("Content-Type", "application/xml")
-		statResp, err := w.client.Do(statReq)
-		if err != nil {
+		statResp := w.doReq(statReq)
+		if statResp == nil {
 			return nil
 		}
 		body, _ := io.ReadAll(statResp.Body)
@@ -965,37 +919,21 @@ func (w *Worker) verifyRestoreRejectsFuture(ctx context.Context) error {
 	form := url.Values{}
 	form.Set("timestamp", futureTime)
 
-	req, err := http.NewRequestWithContext(ctx, http.MethodPost, w.baseURL+"/api/restore", strings.NewReader(form.Encode()))
-	if err != nil {
+	req := w.newRequest(ctx, http.MethodPost, "/api/restore", strings.NewReader(form.Encode()))
+	if req == nil {
 		return nil
 	}
 	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
-	resp, err := w.client.Do(req)
-	if err != nil {
-		return nil
-	}
-	defer resp.Body.Close()
-	io.Copy(io.Discard, resp.Body)
+	status := w.doReqDiscard(req)
 
-	if resp.StatusCode != http.StatusBadRequest {
-		return fmt.Errorf("invariant #14 violated: restore accepted future timestamp, got status %d", resp.StatusCode)
+	if status != http.StatusBadRequest {
+		return fmt.Errorf("invariant #14 violated: restore accepted future timestamp, got status %d", status)
 	}
 	return nil
 }
 
 func (w *Worker) verifyCannotDeleteRoot(ctx context.Context) error {
-	req, err := http.NewRequestWithContext(ctx, http.MethodDelete, w.baseURL+"/", nil)
-	if err != nil {
-		return nil
-	}
-	resp, err := w.client.Do(req)
-	if err != nil {
-		return nil
-	}
-	defer resp.Body.Close()
-	io.Copy(io.Discard, resp.Body)
-
-	if resp.StatusCode == http.StatusNoContent {
+	if w.doRequestDiscard(ctx, http.MethodDelete, "/", nil) == http.StatusNoContent {
 		return fmt.Errorf("invariant #34 violated: root directory was deleted")
 	}
 	return nil
@@ -1019,16 +957,6 @@ func randomContent(rng *rand.Rand) []byte {
 	}
 	return b
 }
-
-type MultiStatus struct {
-	Responses []Response `xml:"response"`
-}
-
-type Response struct {
-	Href string `xml:"href"`
-}
-
-var _ = xml.Unmarshal
 
 // Failure injection worker methods
 
@@ -1073,18 +1001,8 @@ func (w *Worker) verifyCorruptionDetected(ctx context.Context) error {
 	}
 
 	// Create the file
-	req, err := http.NewRequestWithContext(ctx, http.MethodPut, w.baseURL+filePath, bytes.NewReader(content))
-	if err != nil {
-		return nil
-	}
-	resp, err := w.client.Do(req)
-	if err != nil {
-		return nil
-	}
-	defer resp.Body.Close()
-	io.Copy(io.Discard, resp.Body)
-
-	if resp.StatusCode != http.StatusCreated && resp.StatusCode != http.StatusNoContent {
+	status := w.doRequestDiscard(ctx, http.MethodPut, filePath, bytes.NewReader(content))
+	if status != http.StatusCreated && status != http.StatusNoContent {
 		return nil // file creation failed, skip test
 	}
 
@@ -1102,8 +1020,8 @@ func (w *Worker) verifyCorruptionDetected(ctx context.Context) error {
 			if err := corruptFile(blobPath, w.rng, size); err == nil {
 				// Now read should fail with checksum error
 				time.Sleep(10 * time.Millisecond) // brief delay for filesystem
-				readResp, err := w.client.Get(w.baseURL + filePath)
-				if err != nil {
+				readResp := w.doRequest(ctx, http.MethodGet, filePath, nil)
+				if readResp == nil {
 					return nil
 				}
 				defer readResp.Body.Close()
@@ -1138,14 +1056,7 @@ func (w *Worker) verifyCorruptionDetected(ctx context.Context) error {
 	}
 
 	// Clean up
-	delReq, _ := http.NewRequestWithContext(ctx, http.MethodDelete, w.baseURL+filePath, nil)
-	if delReq != nil {
-		delResp, _ := w.client.Do(delReq)
-		if delResp != nil {
-			io.Copy(io.Discard, delResp.Body)
-			delResp.Body.Close()
-		}
-	}
+	w.deleteTestFile(ctx, filePath)
 
 	return nil
 }
@@ -1163,24 +1074,19 @@ func (w *Worker) copyFile(ctx context.Context) error {
 	newName := randomName(w.rng) + "_copy.txt"
 	destPath := path.Join(dir, newName)
 
-	req, err := http.NewRequestWithContext(ctx, "COPY", w.baseURL+srcPath, nil)
-	if err != nil {
+	req := w.newRequest(ctx, "COPY", srcPath, nil)
+	if req == nil {
 		return nil
 	}
 	req.Header.Set("Destination", w.baseURL+destPath)
-	resp, err := w.client.Do(req)
-	if err != nil {
-		return nil
-	}
-	defer resp.Body.Close()
-	io.Copy(io.Discard, resp.Body)
+	status := w.doReqDiscard(req)
 
-	if resp.StatusCode == http.StatusCreated || resp.StatusCode == http.StatusNoContent {
+	if status == http.StatusCreated || status == http.StatusNoContent {
 		w.state.addFile(destPath, content)
 
 		// Verify the copy has the same content
-		getResp, err := w.client.Get(w.baseURL + destPath)
-		if err != nil {
+		getResp := w.doRequest(ctx, http.MethodGet, destPath, nil)
+		if getResp == nil {
 			return nil
 		}
 		defer getResp.Body.Close()
@@ -1200,16 +1106,7 @@ func (w *Worker) lockUnlock(ctx context.Context) error {
 		// Create a test file
 		filePath = "/" + randomName(w.rng) + "_lock.txt"
 		content := []byte("lock test content")
-		req, err := http.NewRequestWithContext(ctx, http.MethodPut, w.baseURL+filePath, bytes.NewReader(content))
-		if err != nil {
-			return nil
-		}
-		resp, err := w.client.Do(req)
-		if err != nil {
-			return nil
-		}
-		resp.Body.Close()
-		if resp.StatusCode != http.StatusCreated {
+		if w.doRequestDiscard(ctx, http.MethodPut, filePath, bytes.NewReader(content)) != http.StatusCreated {
 			return nil
 		}
 		w.state.addFile(filePath, content)
@@ -1223,14 +1120,14 @@ func (w *Worker) lockUnlock(ctx context.Context) error {
   <owner><href>soaktest</href></owner>
 </lockinfo>`
 
-	lockReq, err := http.NewRequestWithContext(ctx, "LOCK", w.baseURL+filePath, strings.NewReader(lockBody))
-	if err != nil {
+	lockReq := w.newRequest(ctx, "LOCK", filePath, strings.NewReader(lockBody))
+	if lockReq == nil {
 		return nil
 	}
 	lockReq.Header.Set("Content-Type", "application/xml")
 	lockReq.Header.Set("Timeout", "Second-60")
-	lockResp, err := w.client.Do(lockReq)
-	if err != nil {
+	lockResp := w.doReq(lockReq)
+	if lockResp == nil {
 		return nil
 	}
 	defer lockResp.Body.Close()
@@ -1259,21 +1156,16 @@ func (w *Worker) lockUnlock(ctx context.Context) error {
 	}
 
 	// Unlock
-	unlockReq, err := http.NewRequestWithContext(ctx, "UNLOCK", w.baseURL+filePath, nil)
-	if err != nil {
+	unlockReq := w.newRequest(ctx, "UNLOCK", filePath, nil)
+	if unlockReq == nil {
 		return nil
 	}
 	unlockReq.Header.Set("Lock-Token", lockToken)
-	unlockResp, err := w.client.Do(unlockReq)
-	if err != nil {
-		return nil
-	}
-	defer unlockResp.Body.Close()
-	io.Copy(io.Discard, unlockResp.Body)
+	unlockStatus := w.doReqDiscard(unlockReq)
 
 	// 204 No Content is success for UNLOCK
-	if unlockResp.StatusCode != http.StatusNoContent && unlockResp.StatusCode != http.StatusOK {
-		log.Printf("[lock] UNLOCK returned %d for %s", unlockResp.StatusCode, filePath)
+	if unlockStatus != http.StatusNoContent && unlockStatus != http.StatusOK {
+		log.Printf("[lock] UNLOCK returned %d for %s", unlockStatus, filePath)
 	}
 
 	return nil
@@ -1296,17 +1188,12 @@ func (w *Worker) proppatch(ctx context.Context) error {
   </set>
 </propertyupdate>`
 
-	req, err := http.NewRequestWithContext(ctx, "PROPPATCH", w.baseURL+filePath, strings.NewReader(propBody))
-	if err != nil {
+	req := w.newRequest(ctx, "PROPPATCH", filePath, strings.NewReader(propBody))
+	if req == nil {
 		return nil
 	}
 	req.Header.Set("Content-Type", "application/xml")
-	resp, err := w.client.Do(req)
-	if err != nil {
-		return nil
-	}
-	defer resp.Body.Close()
-	io.Copy(io.Discard, resp.Body)
+	w.doReqDiscard(req)
 
 	// PROPPATCH should return 207 Multi-Status
 	// We don't verify the actual property change since it may not be persisted
@@ -1323,40 +1210,21 @@ func (w *Worker) createFileExclusive(ctx context.Context) error {
 	content2 := []byte("second content")
 
 	// First create
-	req1, err := http.NewRequestWithContext(ctx, http.MethodPut, w.baseURL+filePath, bytes.NewReader(content1))
-	if err != nil {
-		return nil
-	}
-	resp1, err := w.client.Do(req1)
-	if err != nil {
-		return nil
-	}
-	resp1.Body.Close()
-
-	if resp1.StatusCode != http.StatusCreated {
+	if w.doRequestDiscard(ctx, http.MethodPut, filePath, bytes.NewReader(content1)) != http.StatusCreated {
 		return nil // May have been created by another worker
 	}
 	w.state.addFile(filePath, content1)
 
 	// Second create should overwrite
-	req2, err := http.NewRequestWithContext(ctx, http.MethodPut, w.baseURL+filePath, bytes.NewReader(content2))
-	if err != nil {
-		return nil
-	}
-	resp2, err := w.client.Do(req2)
-	if err != nil {
-		return nil
-	}
-	resp2.Body.Close()
-
-	if resp2.StatusCode != http.StatusCreated && resp2.StatusCode != http.StatusNoContent {
+	status2 := w.doRequestDiscard(ctx, http.MethodPut, filePath, bytes.NewReader(content2))
+	if status2 != http.StatusCreated && status2 != http.StatusNoContent {
 		return nil
 	}
 	w.state.addFile(filePath, content2)
 
 	// Verify the second content is what we read back
-	getResp, err := w.client.Get(w.baseURL + filePath)
-	if err != nil {
+	getResp := w.doRequest(ctx, http.MethodGet, filePath, nil)
+	if getResp == nil {
 		return nil
 	}
 	defer getResp.Body.Close()
@@ -1387,25 +1255,15 @@ func (w *Worker) truncateFile(ctx context.Context) error {
 	// Write new, different content
 	newContent := []byte("truncated content: " + randomName(w.rng))
 
-	req, err := http.NewRequestWithContext(ctx, http.MethodPut, w.baseURL+filePath, bytes.NewReader(newContent))
-	if err != nil {
-		return nil
-	}
-	resp, err := w.client.Do(req)
-	if err != nil {
-		return nil
-	}
-	defer resp.Body.Close()
-	io.Copy(io.Discard, resp.Body)
-
-	if resp.StatusCode != http.StatusCreated && resp.StatusCode != http.StatusNoContent {
+	status := w.doRequestDiscard(ctx, http.MethodPut, filePath, bytes.NewReader(newContent))
+	if status != http.StatusCreated && status != http.StatusNoContent {
 		return nil
 	}
 	w.state.addFile(filePath, newContent)
 
 	// Verify the new content
-	getResp, err := w.client.Get(w.baseURL + filePath)
-	if err != nil {
+	getResp := w.doRequest(ctx, http.MethodGet, filePath, nil)
+	if getResp == nil {
 		return nil
 	}
 	defer getResp.Body.Close()
@@ -1431,25 +1289,15 @@ func (w *Worker) createEmptyFile(ctx context.Context) error {
 	filePath := path.Join(dir, name)
 
 	// Create with empty body
-	req, err := http.NewRequestWithContext(ctx, http.MethodPut, w.baseURL+filePath, bytes.NewReader([]byte{}))
-	if err != nil {
-		return nil
-	}
-	resp, err := w.client.Do(req)
-	if err != nil {
-		return nil
-	}
-	defer resp.Body.Close()
-	io.Copy(io.Discard, resp.Body)
-
-	if resp.StatusCode != http.StatusCreated && resp.StatusCode != http.StatusNoContent {
+	status := w.doRequestDiscard(ctx, http.MethodPut, filePath, bytes.NewReader([]byte{}))
+	if status != http.StatusCreated && status != http.StatusNoContent {
 		return nil
 	}
 	w.state.addFile(filePath, []byte{})
 
 	// Verify the file exists and is empty
-	getResp, err := w.client.Get(w.baseURL + filePath)
-	if err != nil {
+	getResp := w.doRequest(ctx, http.MethodGet, filePath, nil)
+	if getResp == nil {
 		return nil
 	}
 	defer getResp.Body.Close()
@@ -1477,36 +1325,18 @@ func (w *Worker) verifyDeduplication(ctx context.Context) error {
 	file2 := "/" + randomName(w.rng) + "_dedup2.txt"
 
 	// Create first file
-	req1, err := http.NewRequestWithContext(ctx, http.MethodPut, w.baseURL+file1, bytes.NewReader(content))
-	if err != nil {
-		return nil
-	}
-	resp1, err := w.client.Do(req1)
-	if err != nil {
-		return nil
-	}
-	resp1.Body.Close()
-	if resp1.StatusCode != http.StatusCreated {
+	if w.doRequestDiscard(ctx, http.MethodPut, file1, bytes.NewReader(content)) != http.StatusCreated {
 		return nil
 	}
 
 	// Create second file with same content
-	req2, err := http.NewRequestWithContext(ctx, http.MethodPut, w.baseURL+file2, bytes.NewReader(content))
-	if err != nil {
-		return nil
-	}
-	resp2, err := w.client.Do(req2)
-	if err != nil {
-		return nil
-	}
-	resp2.Body.Close()
-	if resp2.StatusCode != http.StatusCreated {
+	if w.doRequestDiscard(ctx, http.MethodPut, file2, bytes.NewReader(content)) != http.StatusCreated {
 		return nil
 	}
 
 	// Query the database to check if both files share the same blob_id
 	var blobID1, blobID2 sql.NullInt64
-	err = w.injector.db.QueryRow(`SELECT blob_id FROM files WHERE path = ? AND deleted = 0 ORDER BY version DESC LIMIT 1`, file1).Scan(&blobID1)
+	err := w.injector.db.QueryRow(`SELECT blob_id FROM files WHERE path = ? AND deleted = 0 ORDER BY version DESC LIMIT 1`, file1).Scan(&blobID1)
 	if err != nil {
 		return nil
 	}
@@ -1537,14 +1367,7 @@ func (w *Worker) verifyDeduplication(ctx context.Context) error {
 
 	// Clean up
 	for _, f := range []string{file1, file2} {
-		delReq, _ := http.NewRequestWithContext(ctx, http.MethodDelete, w.baseURL+f, nil)
-		if delReq != nil {
-			delResp, _ := w.client.Do(delReq)
-			if delResp != nil {
-				io.Copy(io.Discard, delResp.Body)
-				delResp.Body.Close()
-			}
-		}
+		w.deleteTestFile(ctx, f)
 	}
 
 	return nil
@@ -1558,8 +1381,8 @@ func (w *Worker) verifyReadPermissions(ctx context.Context) error {
 	}
 
 	// Read the file
-	getResp, err := w.client.Get(w.baseURL + filePath)
-	if err != nil {
+	getResp := w.doRequest(ctx, http.MethodGet, filePath, nil)
+	if getResp == nil {
 		return nil
 	}
 	defer getResp.Body.Close()
@@ -1570,8 +1393,8 @@ func (w *Worker) verifyReadPermissions(ctx context.Context) error {
 	}
 
 	// Read again and verify content hasn't changed
-	getResp2, err := w.client.Get(w.baseURL + filePath)
-	if err != nil {
+	getResp2 := w.doRequest(ctx, http.MethodGet, filePath, nil)
+	if getResp2 == nil {
 		return nil
 	}
 	defer getResp2.Body.Close()
@@ -1655,16 +1478,7 @@ func (w *Worker) concurrentReadWrite(ctx context.Context) error {
 	newContent := []byte("new content after write")
 
 	// Create the file
-	req, err := http.NewRequestWithContext(ctx, http.MethodPut, w.baseURL+filePath, bytes.NewReader(originalContent))
-	if err != nil {
-		return nil
-	}
-	resp, err := w.client.Do(req)
-	if err != nil {
-		return nil
-	}
-	resp.Body.Close()
-	if resp.StatusCode != http.StatusCreated {
+	if w.doRequestDiscard(ctx, http.MethodPut, filePath, bytes.NewReader(originalContent)) != http.StatusCreated {
 		return nil
 	}
 
@@ -1730,8 +1544,8 @@ func (w *Worker) concurrentReadWrite(ctx context.Context) error {
 
 			// Content doesn't match anything expected - could be from restore or corruption
 			// Re-read to check if this is the stable state
-			verifyResp, err := w.client.Get(w.baseURL + filePath)
-			if err == nil {
+			verifyResp := w.doRequest(ctx, http.MethodGet, filePath, nil)
+			if verifyResp != nil {
 				defer verifyResp.Body.Close()
 				verifyContent, _ := io.ReadAll(verifyResp.Body)
 				if verifyResp.StatusCode == http.StatusOK && !bytes.Equal(content, verifyContent) {
@@ -1742,14 +1556,7 @@ func (w *Worker) concurrentReadWrite(ctx context.Context) error {
 	}
 
 	// Clean up
-	delReq, _ := http.NewRequestWithContext(ctx, http.MethodDelete, w.baseURL+filePath, nil)
-	if delReq != nil {
-		delResp, _ := w.client.Do(delReq)
-		if delResp != nil {
-			io.Copy(io.Discard, delResp.Body)
-			delResp.Body.Close()
-		}
-	}
+	w.deleteTestFile(ctx, filePath)
 
 	return nil
 }
@@ -1864,34 +1671,6 @@ func (w *Worker) verifyIntegrityCheckLoop(ctx context.Context) error {
 	// without additional timestamp tracking
 	if needsRedownload > 100 {
 		log.Printf("[integrity-check] %d blobs awaiting re-download from remote", needsRedownload)
-	}
-
-	return nil
-}
-
-// ==================== Database Backup ====================
-
-// verifyDatabaseBackup checks that database backups are being created
-func (w *Worker) verifyDatabaseBackup(ctx context.Context) error {
-	if w.injector == nil || w.injector.blobsDir == "" {
-		return nil
-	}
-
-	// Check if backup file exists (it's at the same level as blobs dir)
-	backupPath := filepath.Join(filepath.Dir(w.injector.blobsDir), "meta.db.backup")
-	info, err := os.Stat(backupPath)
-	if err != nil {
-		if os.IsNotExist(err) {
-			// Backup doesn't exist - might be expected if backup interval hasn't elapsed
-			return nil
-		}
-		return nil
-	}
-
-	// Check that backup is recent (within 2x backup interval)
-	maxAge := 2 * time.Hour // Default backup interval is 1 hour
-	if time.Since(info.ModTime()) > maxAge {
-		log.Printf("[backup-check] database backup is stale (age=%v)", time.Since(info.ModTime()))
 	}
 
 	return nil
