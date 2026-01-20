@@ -134,4 +134,16 @@ jobs:
             -seed ${{ github.event.inputs.seed || '0' }} \
             -db ../meta.db \
             -blobs ../blobs \
-            -corrupt-rate ${{ github.event.inputs.corrupt_rate || '0' }}
+            -corrupt-rate ${{ github.event.inputs.corrupt_rate || '0' }} \
+            -report ${{ runner.temp }}/soak-report.md
+
+      - name: Write test report to summary
+        if: always()
+        run: |
+          if [ -f "${{ runner.temp }}/soak-report.md" ]; then
+            cat "${{ runner.temp }}/soak-report.md" >> $GITHUB_STEP_SUMMARY
+          else
+            echo "# ⚠️ Soak Test Report Not Generated" >> $GITHUB_STEP_SUMMARY
+            echo "" >> $GITHUB_STEP_SUMMARY
+            echo "The soak test did not produce a report. Check the logs above for errors." >> $GITHUB_STEP_SUMMARY
+          fi

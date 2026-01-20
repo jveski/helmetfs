@@ -60,6 +60,7 @@ type Worker struct {
 	baseURL  string
 	failures chan<- Failure
 	injector *FailureInjector
+	opStats  *OpStats
 }
 
 // newRequest creates a new HTTP request with the baseURL prepended to the path.
@@ -137,6 +138,9 @@ func (w *Worker) run(ctx context.Context, opCount *atomic.Int64) {
 		default:
 		}
 		op := w.selectOperation()
+		if w.opStats != nil {
+			w.opStats.Inc(op)
+		}
 		var err error
 		switch op {
 		case "createFile":
@@ -200,7 +204,7 @@ func (w *Worker) run(ctx context.Context, opCount *atomic.Int64) {
 		}
 		if err != nil {
 			select {
-			case w.failures <- Failure{Operation: op, Error: err.Error()}:
+			case w.failures <- Failure{Operation: op, Error: err.Error(), Timestamp: time.Now()}:
 			default:
 			}
 		}
