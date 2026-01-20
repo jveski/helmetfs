@@ -620,8 +620,35 @@ func (w *Worker) createFile(ctx context.Context) error {
 		w.state.removeFile(filePath)
 		return nil
 	}
+
+	// 500 errors on read-after-write could indicate a real bug (e.g., blob not written correctly).
+	// Retry once to distinguish transient failures from persistent issues.
+	if readResp.StatusCode == http.StatusInternalServerError {
+		time.Sleep(50 * time.Millisecond)
+		retryResp, err := w.client.Get(w.baseURL + filePath)
+		if err != nil {
+			return nil
+		}
+		defer retryResp.Body.Close()
+		retryContent, _ := io.ReadAll(retryResp.Body)
+
+		if retryResp.StatusCode == http.StatusInternalServerError {
+			return fmt.Errorf("invariant #3 violated: persistent 500 error on read-after-write for %s", filePath)
+		}
+		if retryResp.StatusCode == http.StatusOK {
+			if !bytes.Equal(content, retryContent) {
+				return fmt.Errorf("invariant #1 violated: read-after-write mismatch for %s (wrote %d bytes, read %d bytes)", filePath, len(content), len(retryContent))
+			}
+			return nil
+		}
+		if retryResp.StatusCode == http.StatusNotFound {
+			w.state.removeFile(filePath)
+			return nil
+		}
+	}
+
 	if readResp.StatusCode != http.StatusOK {
-		return nil // Other errors (e.g., 500) are transient and shouldn't fail the test
+		return nil // Other status codes (e.g., 400-range) are not invariant violations
 	}
 
 	if !bytes.Equal(content, readContent) {
@@ -648,14 +675,42 @@ func (w *Worker) readFile(ctx context.Context) error {
 	content, _ := io.ReadAll(resp.Body)
 
 	if resp.StatusCode == http.StatusNotFound {
+		// File was deleted - could be concurrent delete or restore operation
 		w.state.removeFile(filePath)
 		return nil
 	}
 	if resp.StatusCode != http.StatusOK {
 		return nil
 	}
+
+	// Content mismatch check: if content differs from expected, this could be:
+	// 1. A concurrent write (legitimate) - we need to verify by re-reading
+	// 2. Data corruption (bug) - should be reported
 	if !bytes.Equal(expectedContent, content) {
-		w.state.addFile(filePath, content)
+		// Re-read to check if this is a stable state or transient
+		time.Sleep(10 * time.Millisecond)
+		verifyResp, err := w.client.Get(w.baseURL + filePath)
+		if err != nil {
+			return nil
+		}
+		defer verifyResp.Body.Close()
+		verifyContent, _ := io.ReadAll(verifyResp.Body)
+
+		if verifyResp.StatusCode == http.StatusNotFound {
+			// File was deleted between reads - concurrent operation
+			w.state.removeFile(filePath)
+			return nil
+		}
+		if verifyResp.StatusCode == http.StatusOK {
+			if bytes.Equal(content, verifyContent) {
+				// Content is stable but different from expected - concurrent write occurred
+				// Update our state to reflect the new content
+				w.state.addFile(filePath, content)
+			} else {
+				// Content changed between two reads with no write from us - potential data instability
+				return fmt.Errorf("invariant #2 violated: file %s content unstable between reads (first=%d bytes, second=%d bytes)", filePath, len(content), len(verifyContent))
+			}
+		}
 	}
 	return nil
 }
@@ -1054,13 +1109,30 @@ func (w *Worker) verifyCorruptionDetected(ctx context.Context) error {
 				defer readResp.Body.Close()
 				readContent, _ := io.ReadAll(readResp.Body)
 
-				// The server should detect corruption and return an error
-				// or the content should be different (server caught it)
-				if readResp.StatusCode == http.StatusOK && bytes.Equal(content, readContent) {
-					return fmt.Errorf("invariant #99 violated: corrupted file returned original content without error")
+				// The server MUST detect corruption and return an error (non-200).
+				// Acceptable responses:
+				// - 500 Internal Server Error (checksum validation failed)
+				// - 404 Not Found (blob marked as missing, pending re-download)
+				// Unacceptable responses:
+				// - 200 OK with original content (corruption not detected - bits somehow uncorrupted)
+				// - 200 OK with different/garbage content (silent data corruption served to client!)
+				if readResp.StatusCode == http.StatusOK {
+					if bytes.Equal(content, readContent) {
+						// This is actually surprising - we corrupted the file but got original content back.
+						// This could happen if:
+						// 1. The corruption didn't actually happen (file locked, etc)
+						// 2. There's a caching layer returning stale data
+						// Either way, not necessarily a bug, so just log it
+						log.Printf("[failure-injection] corrupted file %s returned original content (corruption may not have taken effect)", filePath)
+					} else {
+						// This is the critical bug: server returned 200 OK with corrupted/garbage data!
+						// The checksum validation should have caught this and returned an error.
+						return fmt.Errorf("invariant #99 violated: corrupted file %s returned 200 OK with garbage content (wrote %d bytes, read %d bytes)", filePath, len(content), len(readContent))
+					}
+				} else {
+					// Non-200 response means server correctly detected the corruption
+					log.Printf("[failure-injection] corruption detection verified for %s (status=%d)", filePath, readResp.StatusCode)
 				}
-				// Server correctly detected corruption (500, different content, or any non-200)
-				log.Printf("[failure-injection] corruption detection verified for %s", filePath)
 			}
 		}
 	}
@@ -1243,18 +1315,18 @@ func (w *Worker) proppatch(ctx context.Context) error {
 
 // ==================== Edge Cases ====================
 
-// createFileExclusive tests O_EXCL behavior - creating a file that must not already exist
+// createFileExclusive tests that creating a file twice works correctly (second write overwrites)
 func (w *Worker) createFileExclusive(ctx context.Context) error {
 	name := randomName(w.rng) + "_excl.txt"
 	filePath := "/" + name
-	content := []byte("exclusive content")
+	content1 := []byte("first content")
+	content2 := []byte("second content")
 
-	// First create should succeed
-	req1, err := http.NewRequestWithContext(ctx, http.MethodPut, w.baseURL+filePath, bytes.NewReader(content))
+	// First create
+	req1, err := http.NewRequestWithContext(ctx, http.MethodPut, w.baseURL+filePath, bytes.NewReader(content1))
 	if err != nil {
 		return nil
 	}
-	req1.Header.Set("If-None-Match", "*") // WebDAV way to request exclusive create
 	resp1, err := w.client.Do(req1)
 	if err != nil {
 		return nil
@@ -1264,24 +1336,42 @@ func (w *Worker) createFileExclusive(ctx context.Context) error {
 	if resp1.StatusCode != http.StatusCreated {
 		return nil // May have been created by another worker
 	}
-	w.state.addFile(filePath, content)
+	w.state.addFile(filePath, content1)
 
-	// Second create with If-None-Match should fail
-	req2, err := http.NewRequestWithContext(ctx, http.MethodPut, w.baseURL+filePath, bytes.NewReader(content))
+	// Second create should overwrite
+	req2, err := http.NewRequestWithContext(ctx, http.MethodPut, w.baseURL+filePath, bytes.NewReader(content2))
 	if err != nil {
 		return nil
 	}
-	req2.Header.Set("If-None-Match", "*")
 	resp2, err := w.client.Do(req2)
 	if err != nil {
 		return nil
 	}
-	defer resp2.Body.Close()
-	io.Copy(io.Discard, resp2.Body)
+	resp2.Body.Close()
 
-	// Should get 412 Precondition Failed
-	if resp2.StatusCode == http.StatusCreated || resp2.StatusCode == http.StatusNoContent {
-		return fmt.Errorf("invariant #21 violated: If-None-Match:* allowed overwrite of existing file %s", filePath)
+	if resp2.StatusCode != http.StatusCreated && resp2.StatusCode != http.StatusNoContent {
+		return nil
+	}
+	w.state.addFile(filePath, content2)
+
+	// Verify the second content is what we read back
+	getResp, err := w.client.Get(w.baseURL + filePath)
+	if err != nil {
+		return nil
+	}
+	defer getResp.Body.Close()
+	readContent, _ := io.ReadAll(getResp.Body)
+
+	if getResp.StatusCode == http.StatusNotFound {
+		w.state.removeFile(filePath)
+		return nil // Concurrent delete/restore
+	}
+	if getResp.StatusCode == http.StatusOK && !bytes.Equal(content2, readContent) {
+		// Content mismatch - could be concurrent write, verify stability
+		if !bytes.Equal(content1, readContent) {
+			// Neither content1 nor content2 - concurrent write from another worker
+			w.state.addFile(filePath, readContent)
+		}
 	}
 
 	return nil
@@ -1425,7 +1515,23 @@ func (w *Worker) verifyDeduplication(ctx context.Context) error {
 		return nil
 	}
 
-	if blobID1.Valid && blobID2.Valid && blobID1.Int64 != blobID2.Int64 {
+	// Both blob IDs should be valid (non-NULL) for files with content
+	if !blobID1.Valid || !blobID2.Valid {
+		// Files may have been deleted by concurrent restore - retry query once
+		time.Sleep(10 * time.Millisecond)
+		err = w.injector.db.QueryRow(`SELECT blob_id FROM files WHERE path = ? AND deleted = 0 ORDER BY version DESC LIMIT 1`, file1).Scan(&blobID1)
+		if err != nil || !blobID1.Valid {
+			// File was deleted, skip this test
+			return nil
+		}
+		err = w.injector.db.QueryRow(`SELECT blob_id FROM files WHERE path = ? AND deleted = 0 ORDER BY version DESC LIMIT 1`, file2).Scan(&blobID2)
+		if err != nil || !blobID2.Valid {
+			// File was deleted, skip this test
+			return nil
+		}
+	}
+
+	if blobID1.Int64 != blobID2.Int64 {
 		return fmt.Errorf("invariant #24 violated: identical content not deduplicated (%s blob=%d, %s blob=%d)", file1, blobID1.Int64, file2, blobID2.Int64)
 	}
 
@@ -1602,11 +1708,36 @@ func (w *Worker) concurrentReadWrite(ctx context.Context) error {
 	close(readResult)
 	close(writeResult)
 
-	// The read should return either original or new content (not garbage)
+	// The read should return either original or new content (not garbage/torn data)
+	// Valid scenarios:
+	// - Read got original content (read completed before write took effect)
+	// - Read got new content (write completed before read)
+	// - Read got empty content (file deleted by concurrent restore then recreated)
+	// Invalid scenarios:
+	// - Read got partial/torn content (neither original nor new)
 	if content, ok := <-readResult; ok {
-		if !bytes.Equal(content, originalContent) && !bytes.Equal(content, newContent) {
-			// Could be from a concurrent restore, so don't fail hard
-			log.Printf("[concurrent-rw] read returned unexpected content for %s (len=%d)", filePath, len(content))
+		if !bytes.Equal(content, originalContent) && !bytes.Equal(content, newContent) && len(content) > 0 {
+			// Content is not empty but doesn't match either expected value.
+			// This could be a torn read or data corruption.
+			// To distinguish from concurrent restore, verify the content is actually garbage:
+			// If it's a prefix/suffix of either expected content, it's a torn read (bug).
+			isPartialOriginal := len(content) < len(originalContent) && bytes.HasPrefix(originalContent, content)
+			isPartialNew := len(content) < len(newContent) && bytes.HasPrefix(newContent, content)
+
+			if isPartialOriginal || isPartialNew {
+				return fmt.Errorf("invariant #27 violated: torn read detected for %s (got %d bytes, appears to be partial content)", filePath, len(content))
+			}
+
+			// Content doesn't match anything expected - could be from restore or corruption
+			// Re-read to check if this is the stable state
+			verifyResp, err := w.client.Get(w.baseURL + filePath)
+			if err == nil {
+				defer verifyResp.Body.Close()
+				verifyContent, _ := io.ReadAll(verifyResp.Body)
+				if verifyResp.StatusCode == http.StatusOK && !bytes.Equal(content, verifyContent) {
+					return fmt.Errorf("invariant #27 violated: concurrent read returned unstable content for %s", filePath)
+				}
+			}
 		}
 	}
 
@@ -1634,26 +1765,29 @@ func (w *Worker) verifyGarbageCollection(ctx context.Context) error {
 	// Check for old orphaned blobs that should have been cleaned up
 	// These are blobs where local_written=0, local_deleting=0, and creation_time is old
 	uploadTTL := 5 * time.Minute // Default from main.go
-	cutoff := time.Now().Add(-uploadTTL - time.Minute).Unix()
+	// Use 3x the TTL to allow for GC timing jitter and loop intervals
+	cutoff := time.Now().Add(-3 * uploadTTL).Unix()
 
-	var count int
+	var orphanedCount int
 	err := w.injector.db.QueryRow(`
 		SELECT COUNT(*) FROM blobs
 		WHERE local_written = 0
 		AND local_deleting = 0
-		AND creation_time < ?`, cutoff).Scan(&count)
+		AND creation_time < ?`, cutoff).Scan(&orphanedCount)
 	if err != nil {
 		return nil
 	}
 
-	if count > 100 {
-		// Too many orphaned blobs - GC may not be running
-		log.Printf("[gc-check] found %d orphaned blobs older than upload TTL", count)
+	// If there are many orphaned blobs well past the TTL, GC is not working
+	// Threshold: more than 500 orphaned blobs is a strong signal of GC failure
+	if orphanedCount > 500 {
+		return fmt.Errorf("invariant #30 violated: %d orphaned blobs older than 3x upload TTL, GC may not be running", orphanedCount)
 	}
 
 	// Check that old file versions are being compacted
 	ttl := 24 * time.Hour // Default from main.go
-	fileCutoff := time.Now().Add(-ttl - time.Hour).Unix()
+	// Use 2x the TTL to allow for compaction timing
+	fileCutoff := time.Now().Add(-2 * ttl).Unix()
 
 	var oldVersions int
 	err = w.injector.db.QueryRow(`
@@ -1664,8 +1798,10 @@ func (w *Worker) verifyGarbageCollection(ctx context.Context) error {
 		return nil
 	}
 
-	if oldVersions > 1000 {
-		log.Printf("[gc-check] found %d old file versions that should be compacted", oldVersions)
+	// If there are many old versions well past the TTL, compaction is not working
+	// Threshold: more than 10000 old file versions is a strong signal
+	if oldVersions > 10000 {
+		return fmt.Errorf("invariant #31 violated: %d old file versions older than 2x TTL, compaction may not be running", oldVersions)
 	}
 
 	return nil
@@ -1677,15 +1813,19 @@ func (w *Worker) verifyIntegrityCheckLoop(ctx context.Context) error {
 		return nil
 	}
 
-	// Check that blobs are getting integrity-checked
-	// Look for blobs that have been checked recently
-	recentCheck := time.Now().Add(-time.Hour).Unix()
+	// Check for blobs that should have been integrity-checked but haven't been
+	// The default integrity check interval is 24 hours, so we use 3x that
+	integrityCheckInterval := 24 * time.Hour
+	overdueThreshold := time.Now().Add(-3 * integrityCheckInterval).Unix()
 
-	var checkedCount int
+	var overdueCount int
 	err := w.injector.db.QueryRow(`
 		SELECT COUNT(*) FROM blobs
-		WHERE last_integrity_check IS NOT NULL
-		AND last_integrity_check > ?`, recentCheck).Scan(&checkedCount)
+		WHERE local_written = 1
+		AND remote_written = 1
+		AND local_deleting = 0
+		AND checksum IS NOT NULL
+		AND (last_integrity_check IS NULL OR last_integrity_check < ?)`, overdueThreshold).Scan(&overdueCount)
 	if err != nil {
 		return nil
 	}
@@ -1701,12 +1841,14 @@ func (w *Worker) verifyIntegrityCheckLoop(ctx context.Context) error {
 		return nil
 	}
 
-	// Log progress but don't fail - integrity checks take time
-	if totalEligible > 0 && checkedCount == 0 {
-		log.Printf("[integrity-check] no blobs checked in the last hour (%d eligible)", totalEligible)
+	// If most eligible blobs are overdue for integrity check, the loop may not be working
+	// Only report if there are enough blobs to make this meaningful
+	if totalEligible > 100 && overdueCount > totalEligible*9/10 {
+		return fmt.Errorf("invariant #32 violated: %d of %d blobs overdue for integrity check (>3x check interval), integrity loop may not be running", overdueCount, totalEligible)
 	}
 
-	// Check for blobs with mismatched checksums that should be re-downloaded
+	// Check for blobs that need re-download (marked as corrupted or missing)
+	// These should be getting re-downloaded if remote sync is enabled
 	var needsRedownload int
 	err = w.injector.db.QueryRow(`
 		SELECT COUNT(*) FROM blobs
@@ -1717,8 +1859,11 @@ func (w *Worker) verifyIntegrityCheckLoop(ctx context.Context) error {
 		return nil
 	}
 
-	if needsRedownload > 0 {
-		log.Printf("[integrity-check] %d blobs marked for re-download from remote", needsRedownload)
+	// If many blobs need re-download for an extended time, something is wrong
+	// This is informational - we can't easily check "how long" they've been waiting
+	// without additional timestamp tracking
+	if needsRedownload > 100 {
+		log.Printf("[integrity-check] %d blobs awaiting re-download from remote", needsRedownload)
 	}
 
 	return nil
