@@ -148,6 +148,10 @@ func (fs *FS) Rename(ctx context.Context, oldName, newName string) error {
 }
 
 func (fs *FS) Stat(ctx context.Context, name string) (os.FileInfo, error) {
+	if name == "/" {
+		return &fileInfo{name: "/", isDir: true, mode: 0755}, nil
+	}
+
 	row := fs.db.QueryRowContext(ctx, ` SELECT COALESCE(b.size, 0), f.mode, f.mod_time, f.is_dir, f.deleted FROM files f LEFT JOIN blobs b ON f.blob_id = b.id WHERE f.path = ? ORDER BY f.version DESC LIMIT 1`, name)
 	fi := &fileInfo{name: path.Base(name)}
 
