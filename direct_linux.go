@@ -8,7 +8,11 @@ import (
 )
 
 func openDirect(path string, flag int, perm os.FileMode) (*os.File, error) {
-	f, err := os.OpenFile(path, flag|syscall.O_DIRECT, perm)
+	openFlags := flag
+	if flag&(os.O_WRONLY|os.O_RDWR|os.O_CREATE) == 0 {
+		openFlags |= syscall.O_DIRECT
+	}
+	f, err := os.OpenFile(path, openFlags, perm)
 	if err != nil {
 		return nil, err
 	}
