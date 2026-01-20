@@ -1,0 +1,162 @@
+name: Windows Smoke Test
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+jobs:
+  windows-crud-test:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Build Docker image
+        run: docker build -t helmetfs:test .
+
+      - name: Start HelmetFS container
+        run: |
+          docker run -d --name helmetfs -p 8080:8080 helmetfs:test
+          Start-Sleep -Seconds 5
+
+      - name: Wait for server readiness
+        shell: powershell
+        run: |
+          $maxAttempts = 30
+          $attempt = 0
+          while ($attempt -lt $maxAttempts) {
+            try {
+              $response = Invoke-WebRequest -Uri "http://localhost:8080/" -Method GET -UseBasicParsing -TimeoutSec 5
+              if ($response.StatusCode -eq 200) {
+                Write-Host "Server is ready"
+                exit 0
+              }
+            } catch {
+              Write-Host "Waiting for server... (attempt $($attempt + 1)/$maxAttempts)"
+            }
+            Start-Sleep -Seconds 2
+            $attempt++
+          }
+          Write-Error "Server failed to become ready"
+          exit 1
+
+      - name: Configure Windows WebClient
+        shell: powershell
+        run: |
+          Start-Service WebClient
+          Set-Service WebClient -StartupType Automatic
+
+          $regPath = "HKLM:\SYSTEM\CurrentControlSet\Services\WebClient\Parameters"
+          Set-ItemProperty -Path $regPath -Name "BasicAuthLevel" -Value 2
+          Set-ItemProperty -Path $regPath -Name "FileSizeLimitInBytes" -Value 4294967295
+
+          Restart-Service WebClient
+          Write-Host "WebClient service configured"
+
+      - name: Run CRUD tests
+        shell: powershell
+        run: |
+          $ErrorActionPreference = "Stop"
+          $driveLetter = "W"
+          $testDir = "test-$([guid]::NewGuid().ToString('N').Substring(0,8))"
+          $mounted = $false
+
+          try {
+            Write-Host "=== Mounting WebDAV share ==="
+            net use ${driveLetter}: http://localhost:8080/
+            if ($LASTEXITCODE -ne 0) {
+              throw "Failed to mount WebDAV share"
+            }
+            $mounted = $true
+            Write-Host "Mounted to ${driveLetter}:"
+
+            Write-Host "`n=== Test 1: CREATE directory ==="
+            $testPath = "${driveLetter}:\$testDir"
+            New-Item -Path $testPath -ItemType Directory -Force | Out-Null
+            if (Test-Path $testPath) {
+              Write-Host "PASS: Created directory $testDir"
+            } else {
+              throw "Failed to create directory"
+            }
+
+            Write-Host "`n=== Test 2: CREATE file ==="
+            $testFile = "$testPath\test.txt"
+            $content = "Hello from Windows!"
+            Set-Content -Path $testFile -Value $content -NoNewline
+            if (Test-Path $testFile) {
+              Write-Host "PASS: Created file test.txt"
+            } else {
+              throw "Failed to create file"
+            }
+
+            Write-Host "`n=== Test 3: READ file ==="
+            $readContent = Get-Content -Path $testFile -Raw
+            if ($readContent -eq $content) {
+              Write-Host "PASS: Read content matches written content"
+            } else {
+              throw "Content mismatch. Expected: '$content', Got: '$readContent'"
+            }
+
+            Write-Host "`n=== Test 4: UPDATE file ==="
+            $updatedContent = "Updated content from Windows!"
+            Set-Content -Path $testFile -Value $updatedContent -NoNewline
+            $verifyContent = Get-Content -Path $testFile -Raw
+            if ($verifyContent -eq $updatedContent) {
+              Write-Host "PASS: File updated successfully"
+            } else {
+              throw "Update failed. Expected: '$updatedContent', Got: '$verifyContent'"
+            }
+
+            Write-Host "`n=== Test 5: CREATE additional files ==="
+            1..3 | ForEach-Object {
+              $extraFile = "$testPath\file$_.txt"
+              Set-Content -Path $extraFile -Value "File number $_" -NoNewline
+              Write-Host "Created: file$_.txt"
+            }
+
+            Write-Host "`n=== Test 6: LIST directory ==="
+            $files = Get-ChildItem -Path $testPath
+            Write-Host "Files in directory:"
+            $files | ForEach-Object { Write-Host "  - $($_.Name)" }
+            if ($files.Count -eq 4) {
+              Write-Host "PASS: Directory listing correct (4 files)"
+            } else {
+              throw "Expected 4 files, found $($files.Count)"
+            }
+
+            Write-Host "`n=== Test 7: DELETE single file ==="
+            Remove-Item -Path "$testPath\file1.txt" -Force
+            if (-not (Test-Path "$testPath\file1.txt")) {
+              Write-Host "PASS: Deleted file1.txt"
+            } else {
+              throw "Failed to delete file1.txt"
+            }
+
+            Write-Host "`n=== Test 8: DELETE directory recursively ==="
+            Remove-Item -Path $testPath -Recurse -Force
+            if (-not (Test-Path $testPath)) {
+              Write-Host "PASS: Directory deleted"
+            } else {
+              throw "Failed to delete directory"
+            }
+
+            Write-Host "`n========================================="
+            Write-Host "All CRUD tests passed!"
+            Write-Host "========================================="
+
+          } finally {
+            if ($mounted) {
+              Write-Host "`n=== Cleanup: Unmounting drive ==="
+              net use ${driveLetter}: /delete /y 2>$null
+            }
+          }
+
+      - name: Show container logs on failure
+        if: failure()
+        run: docker logs helmetfs
+
+      - name: Cleanup
+        if: always()
+        run: docker rm -f helmetfs 2>$null
