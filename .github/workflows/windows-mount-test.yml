@@ -13,6 +13,10 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      - name: Switch to Linux containers
+        run: |
+          & "$env:ProgramFiles\Docker\Docker\DockerCli.exe" -SwitchLinuxEngine
+
       - name: Build Docker image
         run: docker build -t helmetfs:test .
 
