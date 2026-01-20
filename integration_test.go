@@ -67,3 +67,59 @@ func TestCRUD(t *testing.T) {
 	resp.Body.Close()
 	assert.Equal(t, http.StatusNotFound, resp.StatusCode)
 }
+
+func TestDeleteDirectoryWithFile(t *testing.T) {
+	db, blobsDir := initTestState(t)
+	mux := newRouter(db, blobsDir)
+	ts := httptest.NewServer(mux)
+	t.Cleanup(func() { ts.Close() })
+
+	client := &http.Client{}
+
+	// Create a subdirectory
+	req, err := http.NewRequest("MKCOL", ts.URL+"/subdir", nil)
+	require.NoError(t, err)
+	resp, err := client.Do(req)
+	require.NoError(t, err)
+	resp.Body.Close()
+	assert.Equal(t, http.StatusCreated, resp.StatusCode)
+
+	// Create a file in the subdirectory
+	req, err = http.NewRequest(http.MethodPut, ts.URL+"/subdir/file.txt", strings.NewReader("content in subdir"))
+	require.NoError(t, err)
+	resp, err = client.Do(req)
+	require.NoError(t, err)
+	resp.Body.Close()
+	assert.Equal(t, http.StatusCreated, resp.StatusCode)
+
+	// Verify the file exists
+	resp, err = client.Get(ts.URL + "/subdir/file.txt")
+	require.NoError(t, err)
+	body, err := io.ReadAll(resp.Body)
+	resp.Body.Close()
+	require.NoError(t, err)
+	assert.Equal(t, http.StatusOK, resp.StatusCode)
+	assert.Equal(t, "content in subdir", string(body))
+
+	// Delete the directory
+	req, err = http.NewRequest(http.MethodDelete, ts.URL+"/subdir", nil)
+	require.NoError(t, err)
+	resp, err = client.Do(req)
+	require.NoError(t, err)
+	resp.Body.Close()
+	assert.Equal(t, http.StatusNoContent, resp.StatusCode)
+
+	// Verify directory is gone
+	req, err = http.NewRequest("PROPFIND", ts.URL+"/subdir", nil)
+	require.NoError(t, err)
+	resp, err = client.Do(req)
+	require.NoError(t, err)
+	resp.Body.Close()
+	assert.Equal(t, http.StatusNotFound, resp.StatusCode)
+
+	// Verify file in directory is also gone
+	resp, err = client.Get(ts.URL + "/subdir/file.txt")
+	require.NoError(t, err)
+	resp.Body.Close()
+	assert.Equal(t, http.StatusNotFound, resp.StatusCode)
+}
