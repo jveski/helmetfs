@@ -27,6 +27,7 @@ var (
 	rcloneBwLimit          = flag.String("rclone-bwlimit", "0", "rclone bandwidth limit (e.g. '20M' for 20 Mbit/s, '0' for unlimited)")
 	integrityCheckInterval = flag.Duration("integrity-check-interval", 24*time.Hour, "minimum interval between integrity checks for each blob")
 	backupInterval         = flag.Duration("backup-interval", 1*time.Hour, "interval between database backups (0 to disable)")
+	debug                  = flag.Bool("debug", false, "enable debug logging")
 )
 
 const (
@@ -51,6 +52,12 @@ func main() {
 }
 
 func run() error {
+	logLevel := slog.LevelInfo
+	if *debug {
+		logLevel = slog.LevelDebug
+	}
+	slog.SetDefault(slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: logLevel})))
+
 	if err := restoreDatabase(dbPath, dbBackupPath, *rcloneRemote, *rcloneBwLimit); err != nil {
 		return err
 	}
@@ -78,6 +85,7 @@ func run() error {
 	}
 
 	mux := newRouter(db, blobsDir)
+	handler := logRequests(mux)
 
 	runLoop(10*time.Second, "garbage collection", func() (bool, error) {
 		return takeOutTheTrash(db)
@@ -99,7 +107,7 @@ func run() error {
 		})
 	}
 
-	return http.ListenAndServe(*listenAddr, mux)
+	return http.ListenAndServe(*listenAddr, handler)
 }
 
 func newRouter(db *sql.DB, blobsDir string) *http.ServeMux {
@@ -125,6 +133,15 @@ func newRouter(db *sql.DB, blobsDir string) *http.ServeMux {
 	mux.Handle("/", dav)
 
 	return mux
+}
+
+func logRequests(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		start := time.Now()
+		slog.Debug("request started", "method", r.Method, "url", r.URL.String())
+		next.ServeHTTP(w, r)
+		slog.Debug("request completed", "method", r.Method, "url", r.URL.String(), "duration", time.Since(start))
+	})
 }
 
 func handleRestore(w http.ResponseWriter, r *http.Request, db *sql.DB) {
