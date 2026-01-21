@@ -10,7 +10,7 @@ RUN CGO_ENABLED=1 go build -o helmetfs .
 
 FROM ubuntu:24.04
 
-ARG TARGETARCH=amd64
+ARG TARGETARCH
 
 RUN apt-get update && \
     apt-get install -y --no-install-recommends ca-certificates curl unzip && \
