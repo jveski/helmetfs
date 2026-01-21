@@ -2,90 +2,165 @@
 <html>
 <head>
 <title>HelmetFS Status</title>
+<meta name="viewport" content="width=device-width, initial-scale=1">
 <style>
+:root {
+	--bg-primary: #0d1117;
+	--bg-card: #161b22;
+	--bg-card-hover: #1c2128;
+	--border: #30363d;
+	--text-primary: #e6edf3;
+	--text-secondary: #8b949e;
+	--accent: #58a6ff;
+	--accent-glow: rgba(88, 166, 255, 0.15);
+	--warning: #f85149;
+}
 * { box-sizing: border-box; }
 body {
 	font-family: system-ui, -apple-system, sans-serif;
-	max-width: 600px;
+	max-width: 700px;
 	margin: 0 auto;
 	padding: 2rem;
-	background: #f5f5f5;
-	color: #333;
+	background: var(--bg-primary);
+	color: var(--text-primary);
+	min-height: 100vh;
 }
 h1 {
-	border-bottom: 2px solid #333;
-	padding-bottom: 0.5rem;
+	font-size: 1.75rem;
+	font-weight: 700;
+	margin-bottom: 2rem;
+	padding-bottom: 0.75rem;
+	border-bottom: 3px solid var(--accent);
 }
-h2 {
-	margin-top: 1.5rem;
-	font-size: 1.1rem;
-	color: #555;
+.grid {
+	display: grid;
+	grid-template-columns: repeat(auto-fit, minmax(160px, 1fr));
+	gap: 1rem;
+	margin-bottom: 1.5rem;
 }
 .card {
-	background: #fff;
+	background: var(--bg-card);
+	border: 1px solid var(--border);
+	border-left: 4px solid var(--accent);
 	border-radius: 8px;
-	padding: 1rem;
-	margin-bottom: 1rem;
-	box-shadow: 0 1px 3px rgba(0,0,0,0.1);
+	padding: 1.25rem;
+	transition: background 0.15s ease, box-shadow 0.15s ease;
 }
-.stat {
-	display: flex;
-	justify-content: space-between;
-	padding: 0.5rem 0;
-	border-bottom: 1px solid #eee;
+.card:hover {
+	background: var(--bg-card-hover);
+	box-shadow: 0 0 20px var(--accent-glow);
 }
-.stat:last-child { border-bottom: none; }
-.stat-label { color: #666; }
-.stat-value { font-weight: 600; }
-.stat-value.warning { color: #c00; }
+.card.warning {
+	border-left-color: var(--warning);
+}
+.card.warning:hover {
+	box-shadow: 0 0 20px rgba(248, 81, 73, 0.15);
+}
+.stat-value {
+	font-size: 2rem;
+	font-weight: 700;
+	line-height: 1.2;
+	color: var(--text-primary);
+}
+.card.warning .stat-value {
+	color: var(--warning);
+}
+.stat-label {
+	font-size: 0.85rem;
+	color: var(--text-secondary);
+	margin-top: 0.5rem;
+}
+.restore-card {
+	background: var(--bg-card);
+	border: 1px solid var(--border);
+	border-radius: 8px;
+	padding: 1.25rem;
+}
+.restore-card h2 {
+	font-size: 1rem;
+	font-weight: 600;
+	color: var(--text-secondary);
+	margin: 0 0 1rem 0;
+	text-transform: uppercase;
+	letter-spacing: 0.05em;
+}
 form {
 	display: flex;
-	gap: 0.5rem;
+	gap: 0.75rem;
 	align-items: center;
 	flex-wrap: wrap;
 }
 input[type="datetime-local"] {
-	padding: 0.5rem;
-	border: 1px solid #ccc;
-	border-radius: 4px;
+	padding: 0.625rem 0.75rem;
+	background: var(--bg-primary);
+	border: 1px solid var(--border);
+	border-radius: 6px;
+	color: var(--text-primary);
 	font-size: 1rem;
+	flex: 1;
+	min-width: 200px;
+}
+input[type="datetime-local"]:focus {
+	outline: none;
+	border-color: var(--accent);
+	box-shadow: 0 0 0 3px var(--accent-glow);
 }
 button {
-	padding: 0.5rem 1rem;
-	background: #333;
-	color: #fff;
+	padding: 0.625rem 1.25rem;
+	background: var(--accent);
+	color: var(--bg-primary);
 	border: none;
-	border-radius: 4px;
+	border-radius: 6px;
 	cursor: pointer;
 	font-size: 1rem;
+	font-weight: 600;
+	transition: opacity 0.15s ease;
 }
-button:hover { background: #555; }
+button:hover {
+	opacity: 0.9;
+}
+@media (max-width: 480px) {
+	body { padding: 1rem; }
+	.stat-value { font-size: 1.5rem; }
+}
 </style>
 </head>
 <body>
 <h1>HelmetFS Status</h1>
 
-<h2>Rclone Operations</h2>
+<div class="grid">
 <div class="card">
-<div class="stat"><span class="stat-label">Pending Downloads</span><span class="stat-value">{{.PendingDownloads}}</span></div>
-<div class="stat"><span class="stat-label">Pending Uploads</span><span class="stat-value">{{.PendingUploads}}</span></div>
-<div class="stat"><span class="stat-label">Pending Deletes</span><span class="stat-value">{{.PendingDeletes}}</span></div>
+<div class="stat-value">{{.PendingDownloads}}</div>
+<div class="stat-label">Pending Downloads</div>
+</div>
+<div class="card">
+<div class="stat-value">{{.PendingUploads}}</div>
+<div class="stat-label">Pending Uploads</div>
+</div>
+<div class="card">
+<div class="stat-value">{{.PendingDeletes}}</div>
+<div class="stat-label">Pending Deletes</div>
+</div>
+<div class="card{{if .OverdueIntegrity}} warning{{end}}">
+<div class="stat-value">{{.OverdueIntegrity}}</div>
+<div class="stat-label">Overdue Integrity Checks</div>
+</div>
+<div class="card">
+<div class="stat-value">{{.ActiveFiles}}</div>
+<div class="stat-label">Active Files</div>
+</div>
+<div class="card">
+<div class="stat-value">{{.LocalSpace}}</div>
+<div class="stat-label">Local Blob Space</div>
+</div>
+<div class="card">
+<div class="stat-value">{{.RemoteSpace}}</div>
+<div class="stat-label">Remote Blob Space</div>
+</div>
 </div>
 
-<h2>Integrity</h2>
-<div class="card">
-<div class="stat"><span class="stat-label">Overdue Integrity Checks</span><span class="stat-value{{if .OverdueIntegrity}} warning{{end}}">{{.OverdueIntegrity}}</span></div>
-</div>
-
-<h2>Storage</h2>
-<div class="card">
-<div class="stat"><span class="stat-label">Active Files</span><span class="stat-value">{{.ActiveFiles}}</span></div>
-<div class="stat"><span class="stat-label">Local Blob Space</span><span class="stat-value">{{.LocalSpace}}</span></div>
-<div class="stat"><span class="stat-label">Remote Blob Space</span><span class="stat-value">{{.RemoteSpace}}</span></div>
-</div>
-
+<div class="restore-card">
 <h2>Restore</h2>
-<div class="card">
 <form action="/api/restore" method="POST" onsubmit="return confirm('Restore filesystem to this timestamp?')">
 <input type="datetime-local" name="datetime" required>
 <input type="hidden" name="timestamp" id="timestamp">

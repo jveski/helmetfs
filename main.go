@@ -110,17 +110,7 @@ func run() error {
 	return http.ListenAndServe(*listenAddr, handler)
 }
 
-func newRouter(db *sql.DB, blobsDir string) *http.ServeMux {
-	mux := http.NewServeMux()
-
-	mux.HandleFunc("GET /{$}", func(w http.ResponseWriter, r *http.Request) {
-		handleStatus(w, r, db)
-	})
-
-	mux.HandleFunc("POST /api/restore", func(w http.ResponseWriter, r *http.Request) {
-		handleRestore(w, r, db)
-	})
-
+func newRouter(db *sql.DB, blobsDir string) http.Handler {
 	dav := &webdav.Handler{
 		FileSystem: &FS{db: db, blobsDir: blobsDir},
 		LockSystem: webdav.NewMemLS(),
@@ -130,9 +120,18 @@ func newRouter(db *sql.DB, blobsDir string) *http.ServeMux {
 			}
 		},
 	}
-	mux.Handle("/", dav)
 
-	return mux
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/" && r.Method == "GET" {
+			handleStatus(w, r, db)
+			return
+		}
+		if r.URL.Path == "/api/restore" && r.Method == "POST" {
+			handleRestore(w, r, db)
+			return
+		}
+		dav.ServeHTTP(w, r)
+	})
 }
 
 func logRequests(next http.Handler) http.Handler {
