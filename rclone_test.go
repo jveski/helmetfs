@@ -46,9 +46,10 @@ func TestSyncRemote(t *testing.T) {
 	_, err = syncRemote(db, blobsDir, "testremote:"+remoteDir, "0")
 	require.NoError(t, err)
 
-	// Prove the remote blob was created
-	localBlobPath := blobFilePath(blobsDir, blobID)
-	remoteBlobPath := remoteDir + localBlobPath
+	// Prove the remote blob was created with relative path structure (not nested under blobsDir)
+	// Remote should have: remoteDir/ab/cd1234... NOT remoteDir/full/local/path/blobs/ab/cd1234...
+	blobRelPath := blobID[:2] + "/" + blobID[2:]
+	remoteBlobPath := filepath.Join(remoteDir, blobRelPath)
 	content, err := os.ReadFile(remoteBlobPath)
 	require.NoError(t, err)
 	assert.Equal(t, "hello remote", string(content))
@@ -63,6 +64,7 @@ func TestSyncRemote(t *testing.T) {
 	assert.Equal(t, 0, remoteDeleted)
 
 	// Simulate local blob loss (e.g., disk failure) by deleting local file and marking as not written
+	localBlobPath := blobFilePath(blobsDir, blobID)
 	require.NoError(t, os.Remove(localBlobPath))
 	_, err = db.Exec(`UPDATE blobs SET local_written = 0 WHERE id = ?`, blobID)
 	require.NoError(t, err)
