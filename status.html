@@ -105,6 +105,24 @@ input[type="datetime-local"]:focus {
 	border-color: var(--accent);
 	box-shadow: 0 0 0 3px var(--accent-glow);
 }
+input[type="text"] {
+	padding: 0.625rem 0.75rem;
+	background: var(--bg-primary);
+	border: 1px solid var(--border);
+	border-radius: 6px;
+	color: var(--text-primary);
+	font-size: 1rem;
+	flex: 1;
+	min-width: 200px;
+}
+input[type="text"]:focus {
+	outline: none;
+	border-color: var(--accent);
+	box-shadow: 0 0 0 3px var(--accent-glow);
+}
+input[type="text"]::placeholder {
+	color: var(--text-secondary);
+}
 button {
 	padding: 0.625rem 1.25rem;
 	background: var(--accent);
@@ -161,17 +179,25 @@ button:hover {
 
 <div class="restore-card">
 <h2>Restore</h2>
-<form action="/api/restore" method="POST" onsubmit="return confirm('Restore filesystem to this timestamp?')">
+<form action="/api/restore" method="POST" id="restore-form">
 <input type="datetime-local" name="datetime" required>
+<input type="text" name="path" placeholder="/path/to/file or /dir/">
 <input type="hidden" name="timestamp" id="timestamp">
 <button type="submit">Restore</button>
 </form>
 </div>
 
 <script>
-document.querySelector('form').addEventListener('submit', function(e) {
+document.getElementById('restore-form').addEventListener('submit', function(e) {
 	var dt = document.querySelector('input[name="datetime"]').value;
 	if (dt) document.getElementById('timestamp').value = new Date(dt).toISOString();
+	var path = document.querySelector('input[name="path"]').value.trim();
+	var msg = path
+		? 'Restore "' + path + '" to this timestamp?'
+		: 'Restore entire filesystem to this timestamp?';
+	if (!confirm(msg)) {
+		e.preventDefault();
+	}
 });
 </script>
 </body>

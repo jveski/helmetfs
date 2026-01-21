@@ -13,6 +13,7 @@ import (
 	"math/rand/v2"
 	"net/http"
 	"os"
+	"strings"
 	"time"
 
 	_ "github.com/mattn/go-sqlite3"
@@ -167,6 +168,11 @@ func handleRestore(w http.ResponseWriter, r *http.Request, db *sql.DB) {
 		return
 	}
 
+	path := strings.TrimSpace(r.FormValue("path"))
+	if path != "" && !strings.HasPrefix(path, "/") {
+		path = "/" + path
+	}
+
 	tsUnix := ts.Unix()
 	now := time.Now().Unix()
 
@@ -182,7 +188,9 @@ func handleRestore(w http.ResponseWriter, r *http.Request, db *sql.DB) {
 			CASE WHEN hist.id IS NULL THEN 1 ELSE hist.deleted END,
 			hist.blob_id
 		FROM (
-			SELECT path, MAX(version) as version FROM files GROUP BY path
+			SELECT path, MAX(version) as version FROM files
+			WHERE ? = '' OR path = ? OR path LIKE ? || '%'
+			GROUP BY path
 		) latest
 		JOIN files curr ON curr.path = latest.path AND curr.version = latest.version
 		LEFT JOIN files hist ON hist.path = curr.path
@@ -195,7 +203,7 @@ func handleRestore(w http.ResponseWriter, r *http.Request, db *sql.DB) {
 			(hist.id IS NULL AND curr.deleted = 0)
 			OR (hist.id IS NOT NULL AND hist.deleted != curr.deleted)
 			OR (hist.id IS NOT NULL AND hist.blob_id IS NOT curr.blob_id)
-	`, now, tsUnix, tsUnix)
+	`, now, path, path, path, tsUnix, tsUnix)
 	if err != nil {
 		http.Error(w, "restore failed", http.StatusInternalServerError)
 		return
