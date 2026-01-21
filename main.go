@@ -117,7 +117,11 @@ func newRouter(db *sql.DB, blobsDir string) http.Handler {
 		LockSystem: webdav.NewMemLS(),
 		Logger: func(r *http.Request, err error) {
 			if err != nil {
-				slog.Error("webdav error", "error", err)
+				if os.IsExist(err) || os.IsNotExist(err) {
+					slog.Debug("webdav error", "error", err)
+				} else {
+					slog.Error("webdav error", "error", err)
+				}
 			}
 		},
 	}
