@@ -9,10 +9,9 @@ import (
 )
 
 type State struct {
-	global sync.RWMutex // Global lock for restore coordination
-	mu     sync.Mutex   // Fine-grained lock for map access
-	files  map[string][]byte
-	dirs   map[string]bool
+	mu    sync.Mutex // Lock for map access
+	files map[string][]byte
+	dirs  map[string]bool
 }
 
 func (s *State) addFile(path string, content []byte) {
@@ -106,34 +105,4 @@ func (s *State) listDir(dir string) []string {
 		}
 	}
 	return children
-}
-
-// LockForRestore acquires exclusive access for restore operations.
-// All other operations will block until UnlockRestore is called.
-func (s *State) LockForRestore() {
-	s.global.Lock()
-}
-
-// UnlockRestore releases the restore lock.
-func (s *State) UnlockRestore() {
-	s.global.Unlock()
-}
-
-// RLock acquires shared access for normal operations.
-func (s *State) RLock() {
-	s.global.RLock()
-}
-
-// RUnlock releases shared access.
-func (s *State) RUnlock() {
-	s.global.RUnlock()
-}
-
-// ReplaceState atomically replaces all tracked state.
-// Must be called while holding the restore lock.
-func (s *State) ReplaceState(files map[string][]byte, dirs map[string]bool) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	s.files = files
-	s.dirs = dirs
 }
