@@ -19,11 +19,6 @@ on:
         description: 'Probability of corrupting a blob (0-1, e.g., 0.01)'
         required: false
         default: '0'
-      rclone_failure:
-        description: 'Enable rclone failure injection (randomly kills rclone processes)'
-        required: false
-        type: boolean
-        default: false
   schedule:
     - cron: '0 3 * * *'
 
@@ -38,89 +33,11 @@ jobs:
         with:
           go-version-file: 'go.mod'
 
-      - name: Install rclone
-        run: |
-          curl -O https://downloads.rclone.org/rclone-current-linux-amd64.zip
-          unzip rclone-current-linux-amd64.zip
-          sudo cp rclone-*-linux-amd64/rclone /usr/local/bin/
-          rclone version
-
       - name: Build HelmetFS
         run: go build -o helmetfs .
 
-      - name: Create rclone killer wrapper
-        if: ${{ github.event.inputs.rclone_failure == 'true' }}
-        run: |
-          mkdir -p ${{ runner.temp }}/rclone-killer
-          cat > ${{ runner.temp }}/rclone-killer/rclone << 'WRAPPER_EOF'
-          #!/bin/bash
-          # Rclone killer wrapper - randomly kills rclone to simulate failures
-
-          # Find the real rclone binary (skip this wrapper)
-          REAL_RCLONE=""
-          IFS=':' read -ra PATHS <<< "$PATH"
-          for p in "${PATHS[@]}"; do
-              candidate="$p/rclone"
-              if [[ -x "$candidate" && "$candidate" != "$0" ]]; then
-                  REAL_RCLONE="$candidate"
-                  break
-              fi
-          done
-
-          if [[ -z "$REAL_RCLONE" ]]; then
-              echo "rclone-killer: could not find real rclone binary" >&2
-              exit 1
-          fi
-
-          # Generate random delay between 0 and 10000 milliseconds
-          DELAY_MS=$((RANDOM % 10001))
-
-          # Start rclone in background
-          "$REAL_RCLONE" "$@" &
-          RCLONE_PID=$!
-
-          # Convert ms to seconds for sleep
-          DELAY_SEC=$(awk "BEGIN {printf \"%.3f\", $DELAY_MS/1000}")
-
-          # Wait for either the delay or rclone to finish
-          sleep "$DELAY_SEC" &
-          SLEEP_PID=$!
-
-          # Wait for either process to finish
-          while kill -0 $RCLONE_PID 2>/dev/null && kill -0 $SLEEP_PID 2>/dev/null; do
-              sleep 0.01
-          done
-
-          # Check if rclone is still running (sleep finished first)
-          if kill -0 $RCLONE_PID 2>/dev/null; then
-              # Kill rclone and its children
-              kill -TERM $RCLONE_PID 2>/dev/null
-              sleep 0.1
-              kill -KILL $RCLONE_PID 2>/dev/null
-              wait $RCLONE_PID 2>/dev/null
-              echo "rclone-killer: killed rclone after ${DELAY_MS}ms" >&2
-              exit 137  # Killed by signal
-          fi
-
-          # Rclone finished naturally, get its exit code
-          wait $RCLONE_PID
-          EXIT_CODE=$?
-
-          # Clean up sleep if still running
-          kill $SLEEP_PID 2>/dev/null
-          wait $SLEEP_PID 2>/dev/null
-
-          exit $EXIT_CODE
-          WRAPPER_EOF
-          chmod +x ${{ runner.temp }}/rclone-killer/rclone
-          echo "Rclone killer wrapper created at ${{ runner.temp }}/rclone-killer/rclone"
-
       - name: Start HelmetFS
         run: |
-          if [[ "${{ github.event.inputs.rclone_failure }}" == "true" ]]; then
-            export PATH="${{ runner.temp }}/rclone-killer:$PATH"
-            echo "Rclone failure injection enabled - wrapper prepended to PATH"
-          fi
           ./helmetfs -addr :8080 &
           sleep 2
 
@@ -132,7 +49,6 @@ jobs:
             -duration ${{ github.event.inputs.duration || '10m' }} \
             -concurrency ${{ github.event.inputs.concurrency || '4' }} \
             -seed ${{ github.event.inputs.seed || '0' }} \
-            -db ../meta.db \
             -blobs ../blobs \
             -corrupt-rate ${{ github.event.inputs.corrupt_rate || '0' }} \
             -report ${{ runner.temp }}/soak-report.md

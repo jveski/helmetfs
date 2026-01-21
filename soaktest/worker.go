@@ -3,200 +3,94 @@ package main
 import (
 	"bytes"
 	"context"
-	"database/sql"
+	"crypto/sha256"
+	"encoding/hex"
 	"fmt"
 	"io"
-	"log"
 	"math/rand/v2"
 	"net/http"
-	"path"
-	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
 )
 
-type weightedOp struct {
-	name   string
-	weight int
-}
-
-// baseOps are the core operations always available
-var baseOps = []weightedOp{
-	{"createFile", 30},
-	{"readFile", 25},
-	{"deleteFile", 10},
-	{"createDir", 10},
-	{"listDir", 10},
-	{"rename", 5},
-	{"verifyDeletedReturns404", 2},
-	{"verifyParentMustExist", 2},
-	{"verifyPathExclusivity", 2},
-	{"verifyCannotDeleteRoot", 1},
-	// WebDAV operations
-	{"copyFile", 5},
-	{"lockUnlock", 3},
-	{"proppatch", 2},
-	// Edge cases
-	{"createFileExclusive", 2},
-	{"truncateFile", 3},
-	{"createEmptyFile", 2},
-	{"verifyDeduplication", 2},
-	{"verifyReadPermissions", 1},
-	// Concurrent access
-	{"concurrentReaders", 2},
-	{"concurrentReadWrite", 2},
-}
-
+// Worker runs tests against the server. Each test uses isolated files
+// with unique names to avoid interference from other workers.
 type Worker struct {
 	id       int
 	client   *http.Client
-	state    *State
 	rng      *rand.Rand
 	baseURL  string
 	failures chan<- Failure
-	injector *FailureInjector
-	opStats  *OpStats
+	stats    *Stats
+	injector *Injector
 }
 
-// newRequest creates a new HTTP request with the baseURL prepended to the path.
-// Returns nil if request creation fails.
-func (w *Worker) newRequest(ctx context.Context, method, path string, body io.Reader) *http.Request {
-	req, err := http.NewRequestWithContext(ctx, method, w.baseURL+path, body)
-	if err != nil {
-		return nil
-	}
-	return req
+// Test is a function that verifies a specific invariant.
+// Returns an error describing the invariant violation, or nil if the test passed.
+type Test struct {
+	Name   string
+	Weight int
+	Fn     func(ctx context.Context, w *Worker) error
 }
 
-// doRequest is a helper that performs an HTTP request and returns the response.
-// It handles common error cases by returning nil response (caller should check).
-// The caller is responsible for closing resp.Body if resp is non-nil.
-func (w *Worker) doRequest(ctx context.Context, method, path string, body io.Reader) *http.Response {
-	req := w.newRequest(ctx, method, path, body)
-	if req == nil {
-		return nil
-	}
-	resp, err := w.client.Do(req)
-	if err != nil {
-		return nil
-	}
-	return resp
+// tests defines all available tests with their relative weights.
+// Higher weight = more frequently selected.
+var tests = []Test{
+	// Core data integrity
+	{"ReadAfterWrite", 30, testReadAfterWrite},
+	{"ConsecutiveReads", 20, testConsecutiveReads},
+	{"Overwrite", 15, testOverwrite},
+	{"EmptyFile", 5, testEmptyFile},
+
+	// Concurrency
+	{"ConcurrentReaders", 10, testConcurrentReaders},
+	{"ConcurrentWriters", 10, testConcurrentWriters},
+	{"ReadDuringWrite", 10, testReadDuringWrite},
+
+	// Directory operations
+	{"MkdirRequiresParent", 5, testMkdirRequiresParent},
+	{"FileRequiresParent", 5, testFileRequiresParent},
+	{"DeleteReturns404", 5, testDeleteReturns404},
+	{"CannotDeleteRoot", 2, testCannotDeleteRoot},
+	{"PathExclusivity", 5, testPathExclusivity},
+
+	// WebDAV operations
+	{"Copy", 10, testCopy},
+	{"Move", 10, testMove},
+
+	// Chaos (generates load without strict invariant checks)
+	{"Chaos", 30, testChaos},
 }
 
-// doRequestDiscard performs an HTTP request and discards the response body.
-// Returns the status code, or 0 if the request failed.
-func (w *Worker) doRequestDiscard(ctx context.Context, method, path string, body io.Reader) int {
-	resp := w.doRequest(ctx, method, path, body)
-	if resp == nil {
-		return 0
+func (w *Worker) Run(ctx context.Context, opCount *atomic.Int64) {
+	totalWeight := 0
+	for _, t := range tests {
+		totalWeight += t.Weight
 	}
-	defer resp.Body.Close()
-	io.Copy(io.Discard, resp.Body)
-	return resp.StatusCode
-}
 
-// doReq executes a pre-built request and returns the response.
-// Returns nil if the request fails.
-func (w *Worker) doReq(req *http.Request) *http.Response {
-	if req == nil {
-		return nil
-	}
-	resp, err := w.client.Do(req)
-	if err != nil {
-		return nil
-	}
-	return resp
-}
-
-// doReqDiscard executes a pre-built request and discards the response body.
-// Returns the status code, or 0 if the request failed.
-func (w *Worker) doReqDiscard(req *http.Request) int {
-	resp := w.doReq(req)
-	if resp == nil {
-		return 0
-	}
-	defer resp.Body.Close()
-	io.Copy(io.Discard, resp.Body)
-	return resp.StatusCode
-}
-
-// deleteTestFile is a helper for cleaning up test files.
-func (w *Worker) deleteTestFile(ctx context.Context, path string) {
-	w.doRequestDiscard(ctx, http.MethodDelete, path, nil)
-}
-
-func (w *Worker) run(ctx context.Context, opCount *atomic.Int64) {
 	for {
 		select {
 		case <-ctx.Done():
 			return
 		default:
 		}
-		op := w.selectOperation()
-		if w.opStats != nil {
-			w.opStats.Inc(op)
+
+		// Select a test weighted by frequency
+		n := w.rng.IntN(totalWeight)
+		var test Test
+		for _, t := range tests {
+			n -= t.Weight
+			if n < 0 {
+				test = t
+				break
+			}
 		}
-		var err error
-		switch op {
-		case "createFile":
-			err = w.createFile(ctx)
-		case "readFile":
-			err = w.readFile(ctx)
-		case "deleteFile":
-			err = w.deleteFile(ctx)
-		case "createDir":
-			err = w.createDir(ctx)
-		case "listDir":
-			err = w.listDir(ctx)
-		case "rename":
-			err = w.rename(ctx)
-		case "verifyDeletedReturns404":
-			err = w.verifyDeletedReturns404(ctx)
-		case "verifyParentMustExist":
-			err = w.verifyParentMustExist(ctx)
-		case "verifyPathExclusivity":
-			err = w.verifyPathExclusivity(ctx)
-		case "verifyCannotDeleteRoot":
-			err = w.verifyCannotDeleteRoot(ctx)
-		case "injectCorruption":
-			err = w.injectCorruption()
-		case "injectBlobDeletion":
-			err = w.injectBlobDeletion()
-		case "verifyCorruptionDetected":
-			err = w.verifyCorruptionDetected(ctx)
-		// WebDAV operations
-		case "copyFile":
-			err = w.copyFile(ctx)
-		case "lockUnlock":
-			err = w.lockUnlock(ctx)
-		case "proppatch":
-			err = w.proppatch(ctx)
-		// Edge cases
-		case "createFileExclusive":
-			err = w.createFileExclusive(ctx)
-		case "truncateFile":
-			err = w.truncateFile(ctx)
-		case "createEmptyFile":
-			err = w.createEmptyFile(ctx)
-		case "verifyDeduplication":
-			err = w.verifyDeduplication(ctx)
-		case "verifyReadPermissions":
-			err = w.verifyReadPermissions(ctx)
-		// Concurrent access
-		case "concurrentReaders":
-			err = w.concurrentReaders(ctx)
-		case "concurrentReadWrite":
-			err = w.concurrentReadWrite(ctx)
-		// Garbage collection / integrity (when db access enabled)
-		case "verifyGarbageCollection":
-			err = w.verifyGarbageCollection(ctx)
-		case "verifyIntegrityCheckLoop":
-			err = w.verifyIntegrityCheckLoop(ctx)
-		}
-		if err != nil {
+
+		w.stats.Inc(test.Name)
+		if err := test.Fn(ctx, w); err != nil {
 			select {
-			case w.failures <- Failure{Operation: op, Error: err.Error(), Timestamp: time.Now()}:
+			case w.failures <- Failure{Test: test.Name, Error: err.Error(), Timestamp: time.Now()}:
 			default:
 			}
 		}
@@ -204,1105 +98,512 @@ func (w *Worker) run(ctx context.Context, opCount *atomic.Int64) {
 	}
 }
 
-func (w *Worker) selectOperation() string {
-	ops := baseOps
-
-	// Add failure injection operations if enabled
-	if w.injector != nil {
-		if w.injector.corruptRate > 0 {
-			ops = append(ops,
-				weightedOp{"injectCorruption", 2},
-				weightedOp{"injectBlobDeletion", 1},
-				weightedOp{"verifyCorruptionDetected", 2},
-			)
-		}
-		// Add GC and integrity checks when we have db access
-		if w.injector.db != nil {
-			ops = append(ops,
-				weightedOp{"verifyGarbageCollection", 2},
-				weightedOp{"verifyIntegrityCheckLoop", 2},
-			)
-		}
-	}
-
-	total := 0
-	for _, op := range ops {
-		total += op.weight
-	}
-	n := w.rng.IntN(total)
-	for _, op := range ops {
-		n -= op.weight
-		if n < 0 {
-			return op.name
-		}
-	}
-	return "createFile"
+// uid returns a unique identifier for this worker's test files.
+func (w *Worker) uid() string {
+	return fmt.Sprintf("%d_%d", w.id, w.rng.Uint64())
 }
 
-func (w *Worker) createFile(ctx context.Context) error {
-	dir, ok := w.state.randomDir(w.rng)
-	if !ok {
-		dir = "/"
-	}
-	name := randomName(w.rng)
-	filePath := path.Join(dir, name+".txt")
-	content := randomContent(w.rng)
-
-	status := w.doRequestDiscard(ctx, http.MethodPut, filePath, bytes.NewReader(content))
-	if status != http.StatusCreated && status != http.StatusNoContent {
-		return nil
-	}
-	w.state.addFile(filePath, content)
-
-	readResp := w.doRequest(ctx, http.MethodGet, filePath, nil)
-	if readResp == nil {
-		return nil
-	}
-	defer readResp.Body.Close()
-	readContent, _ := io.ReadAll(readResp.Body)
-
-	// If the file was deleted (404), it might be due to a concurrent delete operation.
-	if readResp.StatusCode == http.StatusNotFound {
-		w.state.removeFile(filePath)
-		return nil
-	}
-
-	// 500 errors on read-after-write could indicate a real bug (e.g., blob not written correctly).
-	// Retry once to distinguish transient failures from persistent issues.
-	if readResp.StatusCode == http.StatusInternalServerError {
-		time.Sleep(50 * time.Millisecond)
-		retryResp := w.doRequest(ctx, http.MethodGet, filePath, nil)
-		if retryResp == nil {
-			return nil
-		}
-		defer retryResp.Body.Close()
-		retryContent, _ := io.ReadAll(retryResp.Body)
-
-		if retryResp.StatusCode == http.StatusInternalServerError {
-			return fmt.Errorf("invariant #3 violated: persistent 500 error on read-after-write for %s", filePath)
-		}
-		if retryResp.StatusCode == http.StatusOK {
-			if !bytes.Equal(content, retryContent) {
-				return fmt.Errorf("invariant #1 violated: read-after-write mismatch for %s (wrote %d bytes, read %d bytes)", filePath, len(content), len(retryContent))
-			}
-			return nil
-		}
-		if retryResp.StatusCode == http.StatusNotFound {
-			w.state.removeFile(filePath)
-			return nil
-		}
-	}
-
-	if readResp.StatusCode != http.StatusOK {
-		return nil // Other status codes (e.g., 400-range) are not invariant violations
-	}
-
-	if !bytes.Equal(content, readContent) {
-		return fmt.Errorf("invariant #1 violated: read-after-write mismatch for %s (wrote %d bytes, read %d bytes)", filePath, len(content), len(readContent))
-	}
-	return nil
-}
-
-func (w *Worker) readFile(ctx context.Context) error {
-	filePath, expectedContent, ok := w.state.randomFile(w.rng)
-	if !ok {
-		return nil
-	}
-
-	resp := w.doRequest(ctx, http.MethodGet, filePath, nil)
-	if resp == nil {
-		return nil
-	}
-	defer resp.Body.Close()
-	content, _ := io.ReadAll(resp.Body)
-
-	if resp.StatusCode == http.StatusNotFound {
-		// File was deleted by concurrent delete operation
-		w.state.removeFile(filePath)
-		return nil
-	}
-	if resp.StatusCode != http.StatusOK {
-		return nil
-	}
-
-	// If content is nil (file discovered via sync), just update state with actual content
-	if expectedContent == nil {
-		w.state.addFile(filePath, content)
-		return nil
-	}
-
-	// Content mismatch check: if content differs from expected, this could be:
-	// 1. A concurrent write (legitimate) - we need to verify by re-reading
-	// 2. Data corruption (bug) - should be reported
-	if !bytes.Equal(expectedContent, content) {
-		// Re-read to check if this is a stable state or transient
-		time.Sleep(10 * time.Millisecond)
-		verifyResp := w.doRequest(ctx, http.MethodGet, filePath, nil)
-		if verifyResp == nil {
-			return nil
-		}
-		defer verifyResp.Body.Close()
-		verifyContent, _ := io.ReadAll(verifyResp.Body)
-
-		if verifyResp.StatusCode == http.StatusNotFound {
-			// File was deleted between reads - concurrent operation
-			w.state.removeFile(filePath)
-			return nil
-		}
-		if verifyResp.StatusCode == http.StatusOK {
-			if bytes.Equal(content, verifyContent) {
-				// Content is stable but different from expected - concurrent write occurred
-				// Update our state to reflect the new content
-				w.state.addFile(filePath, content)
-			} else {
-				// Content changed between two reads - could be another concurrent write.
-				// Do a third read to distinguish between concurrent writes and true instability.
-				time.Sleep(10 * time.Millisecond)
-				finalResp := w.doRequest(ctx, http.MethodGet, filePath, nil)
-				if finalResp == nil {
-					return nil
-				}
-				defer finalResp.Body.Close()
-				finalContent, _ := io.ReadAll(finalResp.Body)
-
-				if finalResp.StatusCode == http.StatusNotFound {
-					w.state.removeFile(filePath)
-					return nil
-				}
-				if finalResp.StatusCode == http.StatusOK {
-					if bytes.Equal(verifyContent, finalContent) {
-						// Content stabilized at verifyContent - concurrent write completed
-						w.state.addFile(filePath, verifyContent)
-					} else {
-						// Content changed again - still could be concurrent writes.
-						// Only report if all three reads returned different content,
-						// as this is very unlikely from concurrent writes alone.
-						if !bytes.Equal(content, verifyContent) && !bytes.Equal(verifyContent, finalContent) && !bytes.Equal(content, finalContent) {
-							return fmt.Errorf("invariant #2 violated: file %s content unstable between reads (first=%d bytes, second=%d bytes, third=%d bytes)", filePath, len(content), len(verifyContent), len(finalContent))
-						}
-						// Otherwise, assume concurrent writes and update state
-						w.state.addFile(filePath, finalContent)
-					}
-				}
-			}
-		}
-	}
-	return nil
-}
-
-func (w *Worker) deleteFile(ctx context.Context) error {
-	filePath, _, ok := w.state.randomFile(w.rng)
-	if !ok {
-		return nil
-	}
-
-	status := w.doRequestDiscard(ctx, http.MethodDelete, filePath, nil)
-	if status == http.StatusNoContent || status == http.StatusNotFound {
-		w.state.removeFile(filePath)
-	}
-	return nil
-}
-
-func (w *Worker) createDir(ctx context.Context) error {
-	parentDir, ok := w.state.randomDir(w.rng)
-	if !ok {
-		parentDir = "/"
-	}
-	name := randomName(w.rng)
-	dirPath := path.Join(parentDir, name)
-
-	if w.doRequestDiscard(ctx, "MKCOL", dirPath, nil) == http.StatusCreated {
-		w.state.addDir(dirPath)
-	}
-	return nil
-}
-
-func (w *Worker) listDir(ctx context.Context) error {
-	dir, ok := w.state.randomDir(w.rng)
-	if !ok {
-		return nil
-	}
-
-	req := w.newRequest(ctx, "PROPFIND", dir, strings.NewReader(`<?xml version="1.0" encoding="utf-8"?><propfind xmlns="DAV:"><prop><resourcetype/></prop></propfind>`))
-	if req == nil {
-		return nil
-	}
-	req.Header.Set("Depth", "1")
-	req.Header.Set("Content-Type", "application/xml")
-	w.doReqDiscard(req)
-	return nil
-}
-
-func (w *Worker) rename(ctx context.Context) error {
-	srcPath, content, ok := w.state.randomFile(w.rng)
-	if !ok {
-		return nil
-	}
-
-	dir := path.Dir(srcPath)
-	newName := randomName(w.rng) + ".txt"
-	destPath := path.Join(dir, newName)
-
-	req := w.newRequest(ctx, "MOVE", srcPath, nil)
-	if req == nil {
-		return nil
-	}
-	req.Header.Set("Destination", w.baseURL+destPath)
-	status := w.doReqDiscard(req)
-
-	if status == http.StatusCreated || status == http.StatusNoContent {
-		w.state.removeFile(srcPath)
-		w.state.addFile(destPath, content)
-	}
-	return nil
-}
-
-func (w *Worker) verifyDeletedReturns404(ctx context.Context) error {
-	name := randomName(w.rng) + "_deleted.txt"
-	filePath := "/" + name
-	content := []byte("test content")
-
-	if w.doRequestDiscard(ctx, http.MethodPut, filePath, bytes.NewReader(content)) != http.StatusCreated {
-		return nil
-	}
-
-	w.doRequestDiscard(ctx, http.MethodDelete, filePath, nil)
-
-	status := w.doRequestDiscard(ctx, http.MethodGet, filePath, nil)
-	if status != http.StatusNotFound {
-		return fmt.Errorf("invariant #12 violated: deleted file %s returned %d instead of 404", filePath, status)
-	}
-	return nil
-}
-
-func (w *Worker) verifyParentMustExist(ctx context.Context) error {
-	nonExistent := "/" + randomName(w.rng) + "_noparent/" + randomName(w.rng) + ".txt"
-	content := []byte("test")
-
-	status := w.doRequestDiscard(ctx, http.MethodPut, nonExistent, bytes.NewReader(content))
-	if status == http.StatusCreated || status == http.StatusNoContent {
-		return fmt.Errorf("invariant #4 violated: created file %s without parent directory existing", nonExistent)
-	}
-	return nil
-}
-
-func (w *Worker) verifyPathExclusivity(ctx context.Context) error {
-	dirName := "/" + randomName(w.rng) + "_excl"
-
-	if w.doRequestDiscard(ctx, "MKCOL", dirName, nil) != http.StatusCreated {
-		return nil
-	}
-	w.state.addDir(dirName)
-
-	putStatus := w.doRequestDiscard(ctx, http.MethodPut, dirName, bytes.NewReader([]byte("test")))
-	if putStatus == http.StatusCreated || putStatus == http.StatusNoContent {
-		// Before reporting an invariant violation, verify the directory still exists.
-		// A concurrent delete operation might have removed the directory
-		// between the MKCOL and PUT, making the PUT success expected behavior.
-		statReq := w.newRequest(ctx, "PROPFIND", dirName, strings.NewReader(`<?xml version="1.0" encoding="utf-8"?><propfind xmlns="DAV:"><prop><resourcetype/></prop></propfind>`))
-		if statReq == nil {
-			return nil
-		}
-		statReq.Header.Set("Depth", "0")
-		statReq.Header.Set("Content-Type", "application/xml")
-		statResp := w.doReq(statReq)
-		if statResp == nil {
-			return nil
-		}
-		body, _ := io.ReadAll(statResp.Body)
-		statResp.Body.Close()
-
-		// If the path now returns 404 or is a file (no <collection/> in response),
-		// the directory was deleted/replaced and the PUT success is expected behavior.
-		if statResp.StatusCode == http.StatusNotFound {
-			w.state.removeDir(dirName)
-			return nil
-		}
-		// Check if it's now a file (not a directory). A directory response contains <collection/>.
-		if !strings.Contains(string(body), "<collection") {
-			w.state.removeDir(dirName)
-			return nil
-		}
-
-		return fmt.Errorf("invariant #5 violated: created file at path %s which is already a directory", dirName)
-	}
-	return nil
-}
-
-func (w *Worker) verifyCannotDeleteRoot(ctx context.Context) error {
-	if w.doRequestDiscard(ctx, http.MethodDelete, "/", nil) == http.StatusNoContent {
-		return fmt.Errorf("invariant #34 violated: root directory was deleted")
-	}
-	return nil
-}
-
-func randomName(rng *rand.Rand) string {
-	const chars = "abcdefghijklmnopqrstuvwxyz0123456789"
-	length := 3 + rng.IntN(8)
-	b := make([]byte, length)
-	for i := range b {
-		b[i] = chars[rng.IntN(len(chars))]
-	}
-	return string(b)
-}
-
-func randomContent(rng *rand.Rand) []byte {
-	size := rng.IntN(10 * 1024)
+// randomContent generates random bytes of the given size.
+func (w *Worker) randomContent(size int) []byte {
 	b := make([]byte, size)
 	for i := range b {
-		b[i] = byte(rng.IntN(256))
+		b[i] = byte(w.rng.IntN(256))
 	}
 	return b
 }
 
-// Failure injection worker methods
-
-func (w *Worker) injectCorruption() error {
-	if w.injector == nil {
-		return nil
-	}
-	return w.injector.CorruptRandomBlob(w.rng)
-}
-
-func (w *Worker) injectBlobDeletion() error {
-	if w.injector == nil {
-		return nil
-	}
-	return w.injector.DeleteRandomLocalBlob(w.rng)
-}
-
-// verifyCorruptionDetected checks that reading a corrupted file returns an error
-// This verifies the server's checksum validation is working correctly
-func (w *Worker) verifyCorruptionDetected(ctx context.Context) error {
-	if w.injector == nil {
-		return nil
-	}
-
-	// Create a file and immediately corrupt its blob
-	dir, ok := w.state.randomDir(w.rng)
-	if !ok {
-		dir = "/"
-	}
-	name := randomName(w.rng)
-	filePath := path.Join(dir, name+"_corrupt_test.txt")
-	content := randomContent(w.rng)
-	if len(content) == 0 {
-		content = []byte("test content for corruption")
-	}
-
-	// Create the file
-	status := w.doRequestDiscard(ctx, http.MethodPut, filePath, bytes.NewReader(content))
-	if status != http.StatusCreated && status != http.StatusNoContent {
-		return nil // file creation failed, skip test
-	}
-
-	// Find and corrupt the blob for this file
-	if w.injector.db != nil && w.injector.blobsDir != "" {
-		var blobID int64
-		var size int64
-		err := w.injector.db.QueryRow(`
-			SELECT b.id, b.size FROM files f
-			JOIN blobs b ON f.blob_id = b.id
-			WHERE f.path = ? AND f.deleted = 0 AND b.size > 0
-			ORDER BY f.version DESC LIMIT 1`, filePath).Scan(&blobID, &size)
-		if err == nil && size > 0 {
-			blobPath := blobFilePath(w.injector.blobsDir, blobID)
-			if err := corruptFile(blobPath, w.rng, size); err == nil {
-				// Now read should fail with checksum error
-				time.Sleep(10 * time.Millisecond) // brief delay for filesystem
-				readResp := w.doRequest(ctx, http.MethodGet, filePath, nil)
-				if readResp == nil {
-					return nil
-				}
-				defer readResp.Body.Close()
-				readContent, _ := io.ReadAll(readResp.Body)
-
-				// The server MUST detect corruption and return an error (non-200).
-				// Acceptable responses:
-				// - 500 Internal Server Error (checksum validation failed)
-				// - 404 Not Found (blob marked as missing, pending re-download)
-				// Unacceptable responses:
-				// - 200 OK with original content (corruption not detected - bits somehow uncorrupted)
-				// - 200 OK with different/garbage content (silent data corruption served to client!)
-				if readResp.StatusCode == http.StatusOK {
-					if bytes.Equal(content, readContent) {
-						// This is actually surprising - we corrupted the file but got original content back.
-						// This could happen if:
-						// 1. The corruption didn't actually happen (file locked, etc)
-						// 2. There's a caching layer returning stale data
-						// Either way, not necessarily a bug, so just log it
-						log.Printf("[failure-injection] corrupted file %s returned original content (corruption may not have taken effect)", filePath)
-					} else {
-						// This is the critical bug: server returned 200 OK with corrupted/garbage data!
-						// The checksum validation should have caught this and returned an error.
-						return fmt.Errorf("invariant #99 violated: corrupted file %s returned 200 OK with garbage content (wrote %d bytes, read %d bytes)", filePath, len(content), len(readContent))
-					}
-				} else {
-					// Non-200 response means server correctly detected the corruption
-					log.Printf("[failure-injection] corruption detection verified for %s (status=%d)", filePath, readResp.StatusCode)
-				}
-			}
-		}
-	}
-
-	// Clean up
-	w.deleteTestFile(ctx, filePath)
-
-	return nil
-}
-
-// ==================== WebDAV Operations ====================
-
-// copyFile tests the WebDAV COPY operation
-// Uses a dedicated source file to ensure content consistency during the test.
-func (w *Worker) copyFile(ctx context.Context) error {
-	// Create a dedicated source file to avoid interference from concurrent writers
-	srcPath := "/" + randomName(w.rng) + "_copysrc.txt"
-	content := randomContent(w.rng)
-	if len(content) == 0 {
-		content = []byte("copy source test content")
-	}
-
-	status := w.doRequestDiscard(ctx, http.MethodPut, srcPath, bytes.NewReader(content))
-	if status != http.StatusCreated && status != http.StatusNoContent {
-		return nil
-	}
-
-	dir := path.Dir(srcPath)
-	newName := randomName(w.rng) + "_copy.txt"
-	destPath := path.Join(dir, newName)
-
-	req := w.newRequest(ctx, "COPY", srcPath, nil)
-	if req == nil {
-		w.deleteTestFile(ctx, srcPath)
-		return nil
-	}
-	req.Header.Set("Destination", w.baseURL+destPath)
-	copyStatus := w.doReqDiscard(req)
-
-	if copyStatus == http.StatusCreated || copyStatus == http.StatusNoContent {
-		w.state.addFile(destPath, content)
-
-		// Verify the copy has the same content
-		getResp := w.doRequest(ctx, http.MethodGet, destPath, nil)
-		if getResp == nil {
-			w.deleteTestFile(ctx, srcPath)
-			w.deleteTestFile(ctx, destPath)
-			return nil
-		}
-		defer getResp.Body.Close()
-		copiedContent, _ := io.ReadAll(getResp.Body)
-
-		// Clean up both files
-		w.deleteTestFile(ctx, srcPath)
-		w.deleteTestFile(ctx, destPath)
-
-		if getResp.StatusCode == http.StatusNotFound {
-			// File was deleted by concurrent operation - not a violation
-			return nil
-		}
-
-		if getResp.StatusCode == http.StatusOK && !bytes.Equal(content, copiedContent) {
-			return fmt.Errorf("invariant #20 violated: COPY produced different content for %s", destPath)
-		}
-	} else {
-		w.deleteTestFile(ctx, srcPath)
-	}
-	return nil
-}
-
-// lockUnlock tests WebDAV LOCK and UNLOCK operations
-func (w *Worker) lockUnlock(ctx context.Context) error {
-	filePath, _, ok := w.state.randomFile(w.rng)
-	if !ok {
-		// Create a test file
-		filePath = "/" + randomName(w.rng) + "_lock.txt"
-		content := []byte("lock test content")
-		if w.doRequestDiscard(ctx, http.MethodPut, filePath, bytes.NewReader(content)) != http.StatusCreated {
-			return nil
-		}
-		w.state.addFile(filePath, content)
-	}
-
-	// Request a write lock
-	lockBody := `<?xml version="1.0" encoding="utf-8"?>
-<lockinfo xmlns="DAV:">
-  <lockscope><exclusive/></lockscope>
-  <locktype><write/></locktype>
-  <owner><href>soaktest</href></owner>
-</lockinfo>`
-
-	lockReq := w.newRequest(ctx, "LOCK", filePath, strings.NewReader(lockBody))
-	if lockReq == nil {
-		return nil
-	}
-	lockReq.Header.Set("Content-Type", "application/xml")
-	lockReq.Header.Set("Timeout", "Second-60")
-	lockResp := w.doReq(lockReq)
-	if lockResp == nil {
-		return nil
-	}
-	defer lockResp.Body.Close()
-	lockRespBody, _ := io.ReadAll(lockResp.Body)
-
-	// Extract lock token from response
-	if lockResp.StatusCode != http.StatusOK {
-		return nil // Lock not supported or failed, that's ok
-	}
-
-	// Parse lock token from Lock-Token header or response body
-	lockToken := lockResp.Header.Get("Lock-Token")
-	if lockToken == "" {
-		// Try to extract from XML response
-		if idx := strings.Index(string(lockRespBody), "<opaquelocktoken:"); idx >= 0 {
-			end := strings.Index(string(lockRespBody)[idx:], "</href>")
-			if end > 0 {
-				start := strings.Index(string(lockRespBody)[idx:], ">") + 1
-				lockToken = "<" + string(lockRespBody)[idx+start:idx+end] + ">"
-			}
-		}
-	}
-
-	if lockToken == "" {
-		return nil // Couldn't get lock token
-	}
-
-	// Unlock
-	unlockReq := w.newRequest(ctx, "UNLOCK", filePath, nil)
-	if unlockReq == nil {
-		return nil
-	}
-	unlockReq.Header.Set("Lock-Token", lockToken)
-	unlockStatus := w.doReqDiscard(unlockReq)
-
-	// 204 No Content is success for UNLOCK
-	if unlockStatus != http.StatusNoContent && unlockStatus != http.StatusOK {
-		log.Printf("[lock] UNLOCK returned %d for %s", unlockStatus, filePath)
-	}
-
-	return nil
-}
-
-// proppatch tests WebDAV PROPPATCH operation
-func (w *Worker) proppatch(ctx context.Context) error {
-	filePath, _, ok := w.state.randomFile(w.rng)
-	if !ok {
-		return nil
-	}
-
-	// Set a custom property
-	propBody := `<?xml version="1.0" encoding="utf-8"?>
-<propertyupdate xmlns="DAV:">
-  <set>
-    <prop>
-      <displayname>` + randomName(w.rng) + `</displayname>
-    </prop>
-  </set>
-</propertyupdate>`
-
-	req := w.newRequest(ctx, "PROPPATCH", filePath, strings.NewReader(propBody))
-	if req == nil {
-		return nil
-	}
-	req.Header.Set("Content-Type", "application/xml")
-	w.doReqDiscard(req)
-
-	// PROPPATCH should return 207 Multi-Status
-	// We don't verify the actual property change since it may not be persisted
-	return nil
-}
-
-// ==================== Edge Cases ====================
-
-// createFileExclusive tests that creating a file twice works correctly (second write overwrites)
-func (w *Worker) createFileExclusive(ctx context.Context) error {
-	name := randomName(w.rng) + "_excl.txt"
-	filePath := "/" + name
-	content1 := []byte("first content")
-	content2 := []byte("second content")
-
-	// First create
-	if w.doRequestDiscard(ctx, http.MethodPut, filePath, bytes.NewReader(content1)) != http.StatusCreated {
-		return nil // May have been created by another worker
-	}
-	w.state.addFile(filePath, content1)
-
-	// Second create should overwrite
-	status2 := w.doRequestDiscard(ctx, http.MethodPut, filePath, bytes.NewReader(content2))
-	if status2 != http.StatusCreated && status2 != http.StatusNoContent {
-		return nil
-	}
-	w.state.addFile(filePath, content2)
-
-	// Verify the second content is what we read back
-	getResp := w.doRequest(ctx, http.MethodGet, filePath, nil)
-	if getResp == nil {
-		return nil
-	}
-	defer getResp.Body.Close()
-	readContent, _ := io.ReadAll(getResp.Body)
-
-	if getResp.StatusCode == http.StatusNotFound {
-		w.state.removeFile(filePath)
-		return nil // Concurrent delete
-	}
-	if getResp.StatusCode == http.StatusOK && !bytes.Equal(content2, readContent) {
-		// Content mismatch - could be concurrent write, verify stability
-		if !bytes.Equal(content1, readContent) {
-			// Neither content1 nor content2 - concurrent write from another worker
-			w.state.addFile(filePath, readContent)
-		}
-	}
-
-	return nil
-}
-
-// truncateFile tests overwriting a file with new content (O_TRUNC behavior)
-func (w *Worker) truncateFile(ctx context.Context) error {
-	filePath, _, ok := w.state.randomFile(w.rng)
-	if !ok {
-		return nil
-	}
-
-	// Write new, different content
-	newContent := []byte("truncated content: " + randomName(w.rng))
-
-	status := w.doRequestDiscard(ctx, http.MethodPut, filePath, bytes.NewReader(newContent))
-	if status != http.StatusCreated && status != http.StatusNoContent {
-		return nil
-	}
-	w.state.addFile(filePath, newContent)
-
-	// Verify the new content
-	getResp := w.doRequest(ctx, http.MethodGet, filePath, nil)
-	if getResp == nil {
-		return nil
-	}
-	defer getResp.Body.Close()
-	readContent, _ := io.ReadAll(getResp.Body)
-
-	if getResp.StatusCode == http.StatusNotFound {
-		w.state.removeFile(filePath)
-		return nil
-	}
-	if getResp.StatusCode == http.StatusOK && !bytes.Equal(newContent, readContent) {
-		return fmt.Errorf("invariant #22 violated: truncate/overwrite produced wrong content for %s", filePath)
-	}
-	return nil
-}
-
-// createEmptyFile tests creating a file with no content
-func (w *Worker) createEmptyFile(ctx context.Context) error {
-	dir, ok := w.state.randomDir(w.rng)
-	if !ok {
-		dir = "/"
-	}
-	name := randomName(w.rng) + "_empty.txt"
-	filePath := path.Join(dir, name)
-
-	// Create with empty body
-	status := w.doRequestDiscard(ctx, http.MethodPut, filePath, bytes.NewReader([]byte{}))
-	if status != http.StatusCreated && status != http.StatusNoContent {
-		return nil
-	}
-	w.state.addFile(filePath, []byte{})
-
-	// Verify the file exists and is empty
-	getResp := w.doRequest(ctx, http.MethodGet, filePath, nil)
-	if getResp == nil {
-		return nil
-	}
-	defer getResp.Body.Close()
-	content, _ := io.ReadAll(getResp.Body)
-
-	if getResp.StatusCode == http.StatusNotFound {
-		w.state.removeFile(filePath)
-		return nil
-	}
-	if getResp.StatusCode == http.StatusOK && len(content) != 0 {
-		return fmt.Errorf("invariant #23 violated: empty file %s returned %d bytes", filePath, len(content))
-	}
-
-	return nil
-}
-
-// verifyDeduplication tests that identical content is deduplicated
-func (w *Worker) verifyDeduplication(ctx context.Context) error {
-	if w.injector == nil || w.injector.db == nil {
-		return nil // Need db access to verify dedup
-	}
-
-	content := []byte("dedup test content " + randomName(w.rng))
-	file1 := "/" + randomName(w.rng) + "_dedup1.txt"
-	file2 := "/" + randomName(w.rng) + "_dedup2.txt"
-
-	// Create first file
-	if w.doRequestDiscard(ctx, http.MethodPut, file1, bytes.NewReader(content)) != http.StatusCreated {
-		return nil
-	}
-
-	// Create second file with same content
-	if w.doRequestDiscard(ctx, http.MethodPut, file2, bytes.NewReader(content)) != http.StatusCreated {
-		return nil
-	}
-
-	// Query the database to check if both files share the same blob_id
-	var blobID1, blobID2 sql.NullInt64
-	err := w.injector.db.QueryRow(`SELECT blob_id FROM files WHERE path = ? AND deleted = 0 ORDER BY version DESC LIMIT 1`, file1).Scan(&blobID1)
+// put writes content to a path. Returns status code or 0 on error.
+func (w *Worker) put(ctx context.Context, path string, content []byte) int {
+	req, err := http.NewRequestWithContext(ctx, http.MethodPut, w.baseURL+path, bytes.NewReader(content))
 	if err != nil {
-		return nil
+		return 0
 	}
-	err = w.injector.db.QueryRow(`SELECT blob_id FROM files WHERE path = ? AND deleted = 0 ORDER BY version DESC LIMIT 1`, file2).Scan(&blobID2)
+	resp, err := w.client.Do(req)
 	if err != nil {
-		return nil
+		return 0
+	}
+	io.Copy(io.Discard, resp.Body)
+	resp.Body.Close()
+	return resp.StatusCode
+}
+
+// get reads a path. Returns content, status code, or nil/0 on error.
+func (w *Worker) get(ctx context.Context, path string) ([]byte, int) {
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, w.baseURL+path, nil)
+	if err != nil {
+		return nil, 0
+	}
+	resp, err := w.client.Do(req)
+	if err != nil {
+		return nil, 0
+	}
+	defer resp.Body.Close()
+	content, _ := io.ReadAll(resp.Body)
+	return content, resp.StatusCode
+}
+
+// delete removes a path. Returns status code or 0 on error.
+func (w *Worker) delete(ctx context.Context, path string) int {
+	req, err := http.NewRequestWithContext(ctx, http.MethodDelete, w.baseURL+path, nil)
+	if err != nil {
+		return 0
+	}
+	resp, err := w.client.Do(req)
+	if err != nil {
+		return 0
+	}
+	io.Copy(io.Discard, resp.Body)
+	resp.Body.Close()
+	return resp.StatusCode
+}
+
+// mkcol creates a directory. Returns status code or 0 on error.
+func (w *Worker) mkcol(ctx context.Context, path string) int {
+	req, err := http.NewRequestWithContext(ctx, "MKCOL", w.baseURL+path, nil)
+	if err != nil {
+		return 0
+	}
+	resp, err := w.client.Do(req)
+	if err != nil {
+		return 0
+	}
+	io.Copy(io.Discard, resp.Body)
+	resp.Body.Close()
+	return resp.StatusCode
+}
+
+// copy copies src to dst. Returns status code or 0 on error.
+func (w *Worker) copy(ctx context.Context, src, dst string) int {
+	req, err := http.NewRequestWithContext(ctx, "COPY", w.baseURL+src, nil)
+	if err != nil {
+		return 0
+	}
+	req.Header.Set("Destination", w.baseURL+dst)
+	resp, err := w.client.Do(req)
+	if err != nil {
+		return 0
+	}
+	io.Copy(io.Discard, resp.Body)
+	resp.Body.Close()
+	return resp.StatusCode
+}
+
+// move moves src to dst. Returns status code or 0 on error.
+func (w *Worker) move(ctx context.Context, src, dst string) int {
+	req, err := http.NewRequestWithContext(ctx, "MOVE", w.baseURL+src, nil)
+	if err != nil {
+		return 0
+	}
+	req.Header.Set("Destination", w.baseURL+dst)
+	resp, err := w.client.Do(req)
+	if err != nil {
+		return 0
+	}
+	io.Copy(io.Discard, resp.Body)
+	resp.Body.Close()
+	return resp.StatusCode
+}
+
+// cleanup removes a test file, ignoring errors.
+func (w *Worker) cleanup(ctx context.Context, paths ...string) {
+	for _, p := range paths {
+		w.delete(ctx, p)
+	}
+}
+
+// ===========================================================================
+// Tests
+// ===========================================================================
+
+// testReadAfterWrite verifies that content written can be immediately read back.
+func testReadAfterWrite(ctx context.Context, w *Worker) error {
+	path := "/test_raw_" + w.uid() + ".txt"
+	content := w.randomContent(1 + w.rng.IntN(10*1024))
+	defer w.cleanup(ctx, path)
+
+	status := w.put(ctx, path, content)
+	if status != http.StatusCreated && status != http.StatusNoContent {
+		return nil // write failed, not an invariant violation
 	}
 
-	// Both blob IDs should be valid (non-NULL) for files with content
-	if !blobID1.Valid || !blobID2.Valid {
-		// Files may have been deleted - retry query once
-		time.Sleep(10 * time.Millisecond)
-		err = w.injector.db.QueryRow(`SELECT blob_id FROM files WHERE path = ? AND deleted = 0 ORDER BY version DESC LIMIT 1`, file1).Scan(&blobID1)
-		if err != nil || !blobID1.Valid {
-			// File was deleted, skip this test
-			return nil
-		}
-		err = w.injector.db.QueryRow(`SELECT blob_id FROM files WHERE path = ? AND deleted = 0 ORDER BY version DESC LIMIT 1`, file2).Scan(&blobID2)
-		if err != nil || !blobID2.Valid {
-			// File was deleted, skip this test
-			return nil
-		}
+	got, status := w.get(ctx, path)
+	if status != http.StatusOK {
+		return fmt.Errorf("GET after PUT returned %d", status)
 	}
-
-	if blobID1.Int64 != blobID2.Int64 {
-		return fmt.Errorf("invariant #24 violated: identical content not deduplicated (%s blob=%d, %s blob=%d)", file1, blobID1.Int64, file2, blobID2.Int64)
+	if !bytes.Equal(content, got) {
+		return fmt.Errorf("content mismatch: wrote %d bytes (sha256=%s), read %d bytes (sha256=%s)",
+			len(content), sha256sum(content), len(got), sha256sum(got))
 	}
-
-	// Clean up
-	for _, f := range []string{file1, file2} {
-		w.deleteTestFile(ctx, f)
-	}
-
 	return nil
 }
 
-// verifyReadPermissions tests that consecutive reads return consistent content
-// Uses a dedicated test file to avoid interference from other workers.
-func (w *Worker) verifyReadPermissions(ctx context.Context) error {
-	// Create a dedicated test file to avoid interference from concurrent writers
-	filePath := "/" + randomName(w.rng) + "_readperm.txt"
-	content := randomContent(w.rng)
-	if len(content) == 0 {
-		content = []byte("read permission test content")
+// testConsecutiveReads verifies that reading the same file twice returns identical content.
+func testConsecutiveReads(ctx context.Context, w *Worker) error {
+	path := "/test_consec_" + w.uid() + ".txt"
+	content := w.randomContent(1 + w.rng.IntN(10*1024))
+	defer w.cleanup(ctx, path)
+
+	if w.put(ctx, path, content) == 0 {
+		return nil
 	}
 
-	status := w.doRequestDiscard(ctx, http.MethodPut, filePath, bytes.NewReader(content))
+	read1, s1 := w.get(ctx, path)
+	if s1 != http.StatusOK {
+		return nil
+	}
+	read2, s2 := w.get(ctx, path)
+	if s2 != http.StatusOK {
+		return nil
+	}
+
+	if !bytes.Equal(read1, read2) {
+		return fmt.Errorf("consecutive reads differ: first=%d bytes, second=%d bytes", len(read1), len(read2))
+	}
+	return nil
+}
+
+// testOverwrite verifies that overwriting a file replaces its content completely.
+func testOverwrite(ctx context.Context, w *Worker) error {
+	path := "/test_overwrite_" + w.uid() + ".txt"
+	content1 := w.randomContent(1000 + w.rng.IntN(5000))
+	content2 := w.randomContent(500 + w.rng.IntN(2000)) // different size
+	defer w.cleanup(ctx, path)
+
+	if w.put(ctx, path, content1) == 0 {
+		return nil
+	}
+	status := w.put(ctx, path, content2)
 	if status != http.StatusCreated && status != http.StatusNoContent {
 		return nil
 	}
 
-	// Read the file
-	getResp := w.doRequest(ctx, http.MethodGet, filePath, nil)
-	if getResp == nil {
-		w.deleteTestFile(ctx, filePath)
+	got, status := w.get(ctx, path)
+	if status != http.StatusOK {
 		return nil
 	}
-	defer getResp.Body.Close()
-	readContent, _ := io.ReadAll(getResp.Body)
-
-	if getResp.StatusCode != http.StatusOK {
-		w.deleteTestFile(ctx, filePath)
-		return nil
+	if !bytes.Equal(content2, got) {
+		// Check if we got content1 (stale read) or garbage
+		if bytes.Equal(content1, got) {
+			return fmt.Errorf("stale read after overwrite: got original content instead of new")
+		}
+		return fmt.Errorf("overwrite produced wrong content: expected %d bytes, got %d bytes", len(content2), len(got))
 	}
-
-	// Read again and verify content hasn't changed
-	getResp2 := w.doRequest(ctx, http.MethodGet, filePath, nil)
-	if getResp2 == nil {
-		w.deleteTestFile(ctx, filePath)
-		return nil
-	}
-	defer getResp2.Body.Close()
-	readContent2, _ := io.ReadAll(getResp2.Body)
-
-	// Clean up the test file
-	w.deleteTestFile(ctx, filePath)
-
-	if getResp2.StatusCode == http.StatusNotFound {
-		// File was deleted by concurrent operation - not a violation
-		return nil
-	}
-
-	if getResp2.StatusCode == http.StatusOK && !bytes.Equal(readContent, readContent2) {
-		return fmt.Errorf("invariant #25 violated: consecutive reads returned different content for %s", filePath)
-	}
-
 	return nil
 }
 
-// ==================== Concurrent Access ====================
+// testEmptyFile verifies that empty files can be created and read.
+func testEmptyFile(ctx context.Context, w *Worker) error {
+	path := "/test_empty_" + w.uid() + ".txt"
+	defer w.cleanup(ctx, path)
 
-// concurrentReaders tests multiple simultaneous reads of the same file
-// Uses a dedicated test file to avoid interference from other workers.
-func (w *Worker) concurrentReaders(ctx context.Context) error {
-	// Create a dedicated test file to avoid interference from concurrent writers
-	filePath := "/" + randomName(w.rng) + "_concurrent.txt"
-	content := randomContent(w.rng)
-	if len(content) == 0 {
-		content = []byte("concurrent readers test content")
-	}
-
-	status := w.doRequestDiscard(ctx, http.MethodPut, filePath, bytes.NewReader(content))
+	status := w.put(ctx, path, []byte{})
 	if status != http.StatusCreated && status != http.StatusNoContent {
 		return nil
 	}
 
-	// Launch 3 concurrent readers
+	got, status := w.get(ctx, path)
+	if status != http.StatusOK {
+		return fmt.Errorf("GET empty file returned %d", status)
+	}
+	if len(got) != 0 {
+		return fmt.Errorf("empty file returned %d bytes", len(got))
+	}
+	return nil
+}
+
+// testConcurrentReaders verifies multiple simultaneous reads return identical content.
+func testConcurrentReaders(ctx context.Context, w *Worker) error {
+	path := "/test_concurrent_read_" + w.uid() + ".txt"
+	content := w.randomContent(5000 + w.rng.IntN(10000))
+	defer w.cleanup(ctx, path)
+
+	if w.put(ctx, path, content) == 0 {
+		return nil
+	}
+
+	const numReaders = 5
+	results := make(chan []byte, numReaders)
 	var wg sync.WaitGroup
-	results := make(chan []byte, 3)
-	errors := make(chan error, 3)
 
-	for i := 0; i < 3; i++ {
+	for i := 0; i < numReaders; i++ {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
-			resp, err := w.client.Get(w.baseURL + filePath)
-			if err != nil {
-				errors <- err
-				return
-			}
-			defer resp.Body.Close()
-			readContent, _ := io.ReadAll(resp.Body)
-			if resp.StatusCode == http.StatusOK {
-				results <- readContent
-			} else if resp.StatusCode == http.StatusNotFound {
-				errors <- fmt.Errorf("file not found")
+			got, status := w.get(ctx, path)
+			if status == http.StatusOK {
+				results <- got
 			}
 		}()
 	}
-
 	wg.Wait()
 	close(results)
-	close(errors)
 
-	// Clean up the test file
-	w.deleteTestFile(ctx, filePath)
-
-	// All successful reads should return the same content
-	var contents [][]byte
-	for c := range results {
-		contents = append(contents, c)
+	var all [][]byte
+	for r := range results {
+		all = append(all, r)
 	}
 
-	if len(contents) >= 2 {
-		for i := 1; i < len(contents); i++ {
-			if !bytes.Equal(contents[0], contents[i]) {
-				return fmt.Errorf("invariant #26 violated: concurrent reads returned different content for %s", filePath)
-			}
+	if len(all) < 2 {
+		return nil // not enough successful reads
+	}
+
+	first := all[0]
+	for i, r := range all[1:] {
+		if !bytes.Equal(first, r) {
+			return fmt.Errorf("concurrent read %d differs: first=%d bytes, this=%d bytes", i+1, len(first), len(r))
 		}
 	}
-
 	return nil
 }
 
-// concurrentReadWrite tests reading while another request writes
-func (w *Worker) concurrentReadWrite(ctx context.Context) error {
-	// Create a test file
-	filePath := "/" + randomName(w.rng) + "_rw.txt"
-	originalContent := []byte("original content for read-write test")
-	newContent := []byte("new content after write")
+// testConcurrentWriters verifies that concurrent writes to the same path result in
+// exactly one of the written values (no torn writes or data mixing).
+func testConcurrentWriters(ctx context.Context, w *Worker) error {
+	path := "/test_concurrent_write_" + w.uid() + ".txt"
+	defer w.cleanup(ctx, path)
 
-	// Create the file
-	if w.doRequestDiscard(ctx, http.MethodPut, filePath, bytes.NewReader(originalContent)) != http.StatusCreated {
+	// Create distinct content for each writer
+	const numWriters = 5
+	contents := make([][]byte, numWriters)
+	checksums := make(map[string]int) // checksum -> writer index
+	for i := range contents {
+		// Use different sizes to make torn writes more detectable
+		contents[i] = w.randomContent(1000 + i*500)
+		checksums[sha256sum(contents[i])] = i
+	}
+
+	var wg sync.WaitGroup
+	for i := 0; i < numWriters; i++ {
+		wg.Add(1)
+		go func(idx int) {
+			defer wg.Done()
+			w.put(ctx, path, contents[idx])
+		}(i)
+	}
+	wg.Wait()
+
+	// Read the final result
+	got, status := w.get(ctx, path)
+	if status != http.StatusOK {
+		return nil // file might not exist if all writes failed
+	}
+
+	// The result must be exactly one of the written values
+	gotSum := sha256sum(got)
+	if _, ok := checksums[gotSum]; !ok {
+		return fmt.Errorf("concurrent writes produced invalid content: got %d bytes (sha256=%s), expected one of %d values",
+			len(got), gotSum, numWriters)
+	}
+	return nil
+}
+
+// testReadDuringWrite verifies that reads during concurrent writes return
+// either the old content or the new content, never garbage.
+func testReadDuringWrite(ctx context.Context, w *Worker) error {
+	path := "/test_read_during_write_" + w.uid() + ".txt"
+	content1 := w.randomContent(5000)
+	content2 := w.randomContent(8000) // different size
+	defer w.cleanup(ctx, path)
+
+	// Write initial content
+	if w.put(ctx, path, content1) == 0 {
 		return nil
 	}
 
-	// Launch concurrent read and write
-	var wg sync.WaitGroup
+	sum1 := sha256sum(content1)
+	sum2 := sha256sum(content2)
+
+	// Start concurrent read and write
 	readResult := make(chan []byte, 1)
-	writeResult := make(chan bool, 1)
+	var wg sync.WaitGroup
 
 	wg.Add(2)
-
-	// Reader
 	go func() {
 		defer wg.Done()
-		resp, err := w.client.Get(w.baseURL + filePath)
-		if err != nil {
-			return
+		got, status := w.get(ctx, path)
+		if status == http.StatusOK {
+			readResult <- got
 		}
-		defer resp.Body.Close()
-		content, _ := io.ReadAll(resp.Body)
-		if resp.StatusCode == http.StatusOK {
-			readResult <- content
-		}
+		close(readResult)
 	}()
-
-	// Writer
 	go func() {
 		defer wg.Done()
-		req, err := http.NewRequestWithContext(ctx, http.MethodPut, w.baseURL+filePath, bytes.NewReader(newContent))
-		if err != nil {
-			return
-		}
-		resp, err := w.client.Do(req)
-		if err != nil {
-			return
-		}
-		resp.Body.Close()
-		writeResult <- (resp.StatusCode == http.StatusCreated || resp.StatusCode == http.StatusNoContent)
+		w.put(ctx, path, content2)
 	}()
-
 	wg.Wait()
-	close(readResult)
-	close(writeResult)
 
-	// The read should return either original or new content (not garbage/torn data)
-	// Valid scenarios:
-	// - Read got original content (read completed before write took effect)
-	// - Read got new content (write completed before read)
-	// Invalid scenarios:
-	// - Read got partial/torn content (neither original nor new)
-	if content, ok := <-readResult; ok {
-		if !bytes.Equal(content, originalContent) && !bytes.Equal(content, newContent) && len(content) > 0 {
-			// Content is not empty but doesn't match either expected value.
-			// This could be a torn read or data corruption.
-			// If it's a prefix/suffix of either expected content, it's a torn read (bug).
-			isPartialOriginal := len(content) < len(originalContent) && bytes.HasPrefix(originalContent, content)
-			isPartialNew := len(content) < len(newContent) && bytes.HasPrefix(newContent, content)
+	got, ok := <-readResult
+	if !ok {
+		return nil // read failed
+	}
 
-			if isPartialOriginal || isPartialNew {
-				return fmt.Errorf("invariant #27 violated: torn read detected for %s (got %d bytes, appears to be partial content)", filePath, len(content))
-			}
+	gotSum := sha256sum(got)
+	if gotSum != sum1 && gotSum != sum2 {
+		return fmt.Errorf("read during write returned invalid content: got %d bytes (sha256=%s), expected sha256=%s or sha256=%s",
+			len(got), gotSum, sum1, sum2)
+	}
+	return nil
+}
 
-			// Content doesn't match anything expected - could be corruption
-			// Re-read to check if this is the stable state
-			verifyResp := w.doRequest(ctx, http.MethodGet, filePath, nil)
-			if verifyResp != nil {
-				defer verifyResp.Body.Close()
-				verifyContent, _ := io.ReadAll(verifyResp.Body)
-				if verifyResp.StatusCode == http.StatusOK && !bytes.Equal(content, verifyContent) {
-					return fmt.Errorf("invariant #27 violated: concurrent read returned unstable content for %s", filePath)
-				}
-			}
+// testMkdirRequiresParent verifies that MKCOL fails when parent doesn't exist.
+func testMkdirRequiresParent(ctx context.Context, w *Worker) error {
+	path := "/nonexistent_" + w.uid() + "/subdir"
+
+	status := w.mkcol(ctx, path)
+	if status == http.StatusCreated {
+		w.cleanup(ctx, path)
+		return fmt.Errorf("MKCOL succeeded without parent directory existing")
+	}
+	return nil
+}
+
+// testFileRequiresParent verifies that PUT fails when parent doesn't exist.
+func testFileRequiresParent(ctx context.Context, w *Worker) error {
+	path := "/nonexistent_" + w.uid() + "/file.txt"
+
+	status := w.put(ctx, path, []byte("test"))
+	if status == http.StatusCreated || status == http.StatusNoContent {
+		w.cleanup(ctx, path)
+		return fmt.Errorf("PUT succeeded without parent directory existing")
+	}
+	return nil
+}
+
+// testDeleteReturns404 verifies that deleted files return 404.
+func testDeleteReturns404(ctx context.Context, w *Worker) error {
+	path := "/test_delete404_" + w.uid() + ".txt"
+
+	if w.put(ctx, path, []byte("test")) == 0 {
+		return nil
+	}
+	w.delete(ctx, path)
+
+	_, status := w.get(ctx, path)
+	if status != http.StatusNotFound {
+		return fmt.Errorf("GET after DELETE returned %d, expected 404", status)
+	}
+	return nil
+}
+
+// testCannotDeleteRoot verifies that the root directory cannot be deleted.
+func testCannotDeleteRoot(ctx context.Context, w *Worker) error {
+	status := w.delete(ctx, "/")
+	if status == http.StatusNoContent || status == http.StatusOK {
+		return fmt.Errorf("DELETE / succeeded with status %d", status)
+	}
+	return nil
+}
+
+// testPathExclusivity verifies that a path cannot be both a file and directory.
+func testPathExclusivity(ctx context.Context, w *Worker) error {
+	path := "/test_excl_" + w.uid()
+	defer w.cleanup(ctx, path)
+
+	// Create as directory
+	status := w.mkcol(ctx, path)
+	if status != http.StatusCreated {
+		return nil
+	}
+
+	// Try to create as file - should fail
+	status = w.put(ctx, path, []byte("test"))
+	if status == http.StatusCreated || status == http.StatusNoContent {
+		return fmt.Errorf("PUT succeeded at path that is a directory")
+	}
+	return nil
+}
+
+// testCopy verifies that COPY produces an identical file.
+func testCopy(ctx context.Context, w *Worker) error {
+	src := "/test_copy_src_" + w.uid() + ".txt"
+	dst := "/test_copy_dst_" + w.uid() + ".txt"
+	content := w.randomContent(1 + w.rng.IntN(10*1024))
+	defer w.cleanup(ctx, src, dst)
+
+	if w.put(ctx, src, content) == 0 {
+		return nil
+	}
+
+	status := w.copy(ctx, src, dst)
+	if status != http.StatusCreated && status != http.StatusNoContent {
+		return nil // COPY failed, not an invariant violation
+	}
+
+	got, status := w.get(ctx, dst)
+	if status != http.StatusOK {
+		return fmt.Errorf("GET copied file returned %d", status)
+	}
+	if !bytes.Equal(content, got) {
+		return fmt.Errorf("COPY produced different content: src=%d bytes, dst=%d bytes", len(content), len(got))
+	}
+	return nil
+}
+
+// testMove verifies that MOVE relocates a file correctly.
+func testMove(ctx context.Context, w *Worker) error {
+	src := "/test_move_src_" + w.uid() + ".txt"
+	dst := "/test_move_dst_" + w.uid() + ".txt"
+	content := w.randomContent(1 + w.rng.IntN(10*1024))
+	defer w.cleanup(ctx, src, dst)
+
+	if w.put(ctx, src, content) == 0 {
+		return nil
+	}
+
+	status := w.move(ctx, src, dst)
+	if status != http.StatusCreated && status != http.StatusNoContent {
+		return nil
+	}
+
+	// Source should be gone
+	_, srcStatus := w.get(ctx, src)
+	if srcStatus != http.StatusNotFound {
+		return fmt.Errorf("source still exists after MOVE (status=%d)", srcStatus)
+	}
+
+	// Destination should have content
+	got, dstStatus := w.get(ctx, dst)
+	if dstStatus != http.StatusOK {
+		return fmt.Errorf("GET moved file returned %d", dstStatus)
+	}
+	if !bytes.Equal(content, got) {
+		return fmt.Errorf("MOVE produced different content: original=%d bytes, moved=%d bytes", len(content), len(got))
+	}
+	return nil
+}
+
+// testChaos generates random operations to create background load.
+// It doesn't check strict invariants - just exercises the server.
+func testChaos(ctx context.Context, w *Worker) error {
+	path := "/chaos_" + w.uid() + ".txt"
+	defer w.cleanup(ctx, path)
+
+	// Random sequence of operations
+	ops := w.rng.IntN(5) + 1
+	for i := 0; i < ops; i++ {
+		switch w.rng.IntN(4) {
+		case 0: // write
+			w.put(ctx, path, w.randomContent(w.rng.IntN(50*1024)))
+		case 1: // read
+			w.get(ctx, path)
+		case 2: // overwrite
+			w.put(ctx, path, w.randomContent(w.rng.IntN(10*1024)))
+		case 3: // delete and recreate
+			w.delete(ctx, path)
+			w.put(ctx, path, w.randomContent(w.rng.IntN(5*1024)))
 		}
 	}
 
-	// Clean up
-	w.deleteTestFile(ctx, filePath)
-
-	return nil
-}
-
-// ==================== Garbage Collection & Integrity ====================
-
-// verifyGarbageCollection verifies that GC is working by checking for orphaned blobs
-func (w *Worker) verifyGarbageCollection(ctx context.Context) error {
-	if w.injector == nil || w.injector.db == nil {
-		return nil
-	}
-
-	// Check for old orphaned blobs that should have been cleaned up
-	// These are blobs where local_written=0, local_deleting=0, and creation_time is old
-	uploadTTL := 5 * time.Minute // Default from main.go
-	// Use 3x the TTL to allow for GC timing jitter and loop intervals
-	cutoff := time.Now().Add(-3 * uploadTTL).Unix()
-
-	var orphanedCount int
-	err := w.injector.db.QueryRow(`
-		SELECT COUNT(*) FROM blobs
-		WHERE local_written = 0
-		AND local_deleting = 0
-		AND creation_time < ?`, cutoff).Scan(&orphanedCount)
-	if err != nil {
-		return nil
-	}
-
-	// If there are many orphaned blobs well past the TTL, GC is not working
-	// Threshold: more than 500 orphaned blobs is a strong signal of GC failure
-	if orphanedCount > 500 {
-		return fmt.Errorf("invariant #30 violated: %d orphaned blobs older than 3x upload TTL, GC may not be running", orphanedCount)
-	}
-
-	// Check that old file versions are being compacted
-	ttl := 24 * time.Hour // Default from main.go
-	// Use 2x the TTL to allow for compaction timing
-	fileCutoff := time.Now().Add(-2 * ttl).Unix()
-
-	var oldVersions int
-	err = w.injector.db.QueryRow(`
-		SELECT COUNT(*) FROM files f
-		WHERE f.created_at < ?
-		AND (f.deleted = 1 OR EXISTS (SELECT 1 FROM files f2 WHERE f2.path = f.path AND f2.version > f.version))`, fileCutoff).Scan(&oldVersions)
-	if err != nil {
-		return nil
-	}
-
-	// If there are many old versions well past the TTL, compaction is not working
-	// Threshold: more than 10000 old file versions is a strong signal
-	if oldVersions > 10000 {
-		return fmt.Errorf("invariant #31 violated: %d old file versions older than 2x TTL, compaction may not be running", oldVersions)
+	// Optionally inject corruption if configured
+	if w.injector != nil && w.rng.Float64() < w.injector.corruptRate {
+		w.injector.CorruptRandomBlob(w.rng)
 	}
 
 	return nil
 }
 
-// verifyIntegrityCheckLoop verifies the background integrity check is working
-func (w *Worker) verifyIntegrityCheckLoop(ctx context.Context) error {
-	if w.injector == nil || w.injector.db == nil {
-		return nil
-	}
-
-	// Check for blobs that should have been integrity-checked but haven't been
-	// The default integrity check interval is 24 hours, so we use 3x that
-	integrityCheckInterval := 24 * time.Hour
-	overdueThreshold := time.Now().Add(-3 * integrityCheckInterval).Unix()
-
-	var overdueCount int
-	err := w.injector.db.QueryRow(`
-		SELECT COUNT(*) FROM blobs
-		WHERE local_written = 1
-		AND remote_written = 1
-		AND local_deleting = 0
-		AND checksum IS NOT NULL
-		AND (last_integrity_check IS NULL OR last_integrity_check < ?)`, overdueThreshold).Scan(&overdueCount)
-	if err != nil {
-		return nil
-	}
-
-	var totalEligible int
-	err = w.injector.db.QueryRow(`
-		SELECT COUNT(*) FROM blobs
-		WHERE local_written = 1
-		AND remote_written = 1
-		AND local_deleting = 0
-		AND checksum IS NOT NULL`).Scan(&totalEligible)
-	if err != nil {
-		return nil
-	}
-
-	// If most eligible blobs are overdue for integrity check, the loop may not be working
-	// Only report if there are enough blobs to make this meaningful
-	if totalEligible > 100 && overdueCount > totalEligible*9/10 {
-		return fmt.Errorf("invariant #32 violated: %d of %d blobs overdue for integrity check (>3x check interval), integrity loop may not be running", overdueCount, totalEligible)
-	}
-
-	// Check for blobs that need re-download (marked as corrupted or missing)
-	// These should be getting re-downloaded if remote sync is enabled
-	var needsRedownload int
-	err = w.injector.db.QueryRow(`
-		SELECT COUNT(*) FROM blobs
-		WHERE local_written = 0
-		AND remote_written = 1
-		AND remote_deleted = 0`).Scan(&needsRedownload)
-	if err != nil {
-		return nil
-	}
-
-	// If many blobs need re-download for an extended time, something is wrong
-	// This is informational - we can't easily check "how long" they've been waiting
-	// without additional timestamp tracking
-	if needsRedownload > 100 {
-		log.Printf("[integrity-check] %d blobs awaiting re-download from remote", needsRedownload)
-	}
-
-	return nil
+// sha256sum returns the hex-encoded SHA256 of data.
+func sha256sum(data []byte) string {
+	h := sha256.Sum256(data)
+	return hex.EncodeToString(h[:])
 }
