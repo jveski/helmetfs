@@ -97,7 +97,10 @@ func openFile(ctx context.Context, db *sql.DB, blobsDir, name string, flag int, 
 					f.readFile.Close()
 					return nil, fmt.Errorf("checksum verification failed: expected=%s actual=%s", checksum.String, actual)
 				}
-				f.readFile.Seek(0, io.SeekStart)
+				if _, err := f.readFile.Seek(0, io.SeekStart); err != nil {
+					f.readFile.Close()
+					return nil, err
+				}
 			}
 		}
 		return f, nil
@@ -264,9 +267,9 @@ func (f *file) Close() error {
 	if err != nil {
 		return err
 	}
+	defer verifyFile.Close()
 	verifyHash := sha256.New()
 	_, err = io.Copy(verifyHash, verifyFile)
-	verifyFile.Close()
 	if err != nil {
 		return err
 	}
