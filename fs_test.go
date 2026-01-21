@@ -6,6 +6,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/google/uuid"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
@@ -189,9 +190,8 @@ func TestDeleteLocalBlobs(t *testing.T) {
 
 	// Deletes blob file and marks as deleted
 	now := time.Now().Unix()
-	result, err := db.Exec(`INSERT INTO blobs (creation_time, modified_time, local_written, local_deleting) VALUES (?, ?, 1, 1)`, now, now)
-	require.NoError(t, err)
-	blobID, err := result.LastInsertId()
+	blobID := uuid.New().String()
+	_, err := db.Exec(`INSERT INTO blobs (id, creation_time, modified_time, local_written, local_deleting) VALUES (?, ?, ?, 1, 1)`, blobID, now, now)
 	require.NoError(t, err)
 
 	blobPath := blobFilePath(blobsDir, blobID)
@@ -208,9 +208,8 @@ func TestDeleteLocalBlobs(t *testing.T) {
 	assert.Equal(t, 1, localDeleted)
 
 	// Skips blobs with active readers
-	result, err = db.Exec(`INSERT INTO blobs (creation_time, modified_time, local_written, local_deleting) VALUES (?, ?, 1, 1)`, now, now)
-	require.NoError(t, err)
-	blobID, err = result.LastInsertId()
+	blobID = uuid.New().String()
+	_, err = db.Exec(`INSERT INTO blobs (id, creation_time, modified_time, local_written, local_deleting) VALUES (?, ?, ?, 1, 1)`, blobID, now, now)
 	require.NoError(t, err)
 
 	blobPath = blobFilePath(blobsDir, blobID)
@@ -231,9 +230,8 @@ func TestDeleteLocalBlobs(t *testing.T) {
 	reader.Close()
 
 	// Handles missing file gracefully
-	result, err = db.Exec(`INSERT INTO blobs (creation_time, modified_time, local_written, local_deleting) VALUES (?, ?, 1, 1)`, now, now)
-	require.NoError(t, err)
-	blobID, err = result.LastInsertId()
+	blobID = uuid.New().String()
+	_, err = db.Exec(`INSERT INTO blobs (id, creation_time, modified_time, local_written, local_deleting) VALUES (?, ?, ?, 1, 1)`, blobID, now, now)
 	require.NoError(t, err)
 
 	_, err = deleteLocalBlobs(db, blobsDir)

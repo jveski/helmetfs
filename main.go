@@ -260,7 +260,7 @@ func takeOutTheTrash(db *sql.DB) (bool, error) {
 
 func checkFileIntegrity(db *sql.DB, blobsDir string, checkInterval time.Duration) (bool, error) {
 	cutoff := time.Now().Add(-checkInterval).Unix()
-	var blobID int64
+	var blobID string
 	var checksum string
 	err := db.QueryRow(`
 		SELECT id, checksum FROM blobs

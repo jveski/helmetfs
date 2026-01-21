@@ -56,9 +56,9 @@ func rcloneBatchOp(db *sql.DB, blobsDir, selectQuery, updateQuery string, rclone
 	if err != nil {
 		return 0, err
 	}
-	var blobIDs []int64
+	var blobIDs []string
 	for rows.Next() {
-		var blobID int64
+		var blobID string
 		if err := rows.Scan(&blobID); err != nil {
 			rows.Close()
 			return 0, err

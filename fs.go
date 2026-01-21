@@ -218,9 +218,9 @@ func deleteLocalBlobs(db *sql.DB, blobsDir string) (bool, error) {
 	if err != nil {
 		return false, err
 	}
-	var blobIDs []int64
+	var blobIDs []string
 	for rows.Next() {
-		var blobID int64
+		var blobID string
 		if err := rows.Scan(&blobID); err != nil {
 			rows.Close()
 			return false, err

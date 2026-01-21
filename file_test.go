@@ -176,7 +176,7 @@ func TestChecksumDeduplication(t *testing.T) {
 	require.NoError(t, err)
 	require.NoError(t, f2.Close())
 
-	var file1BlobID, file2BlobID int64
+	var file1BlobID, file2BlobID string
 	err = db.QueryRow(`SELECT blob_id FROM files WHERE path = ? ORDER BY version DESC LIMIT 1`, "/file1.txt").Scan(&file1BlobID)
 	require.NoError(t, err)
 	err = db.QueryRow(`SELECT blob_id FROM files WHERE path = ? ORDER BY version DESC LIMIT 1`, "/file2.txt").Scan(&file2BlobID)
@@ -210,7 +210,7 @@ func TestChecksumDeduplication(t *testing.T) {
 	require.NoError(t, err)
 	require.NoError(t, f3.Close())
 
-	var newBlobID int64
+	var newBlobID string
 	err = db.QueryRow(`SELECT blob_id FROM files WHERE path = ? ORDER BY version DESC LIMIT 1`, "/file1.txt").Scan(&newBlobID)
 	require.NoError(t, err)
 	assert.NotEqual(t, firstBlobID, newBlobID, "different content should use different blob")
@@ -221,7 +221,7 @@ func TestChecksumDeduplication(t *testing.T) {
 	require.NoError(t, err)
 	require.NoError(t, f4.Close())
 
-	var reusedBlobID int64
+	var reusedBlobID string
 	err = db.QueryRow(`SELECT blob_id FROM files WHERE path = ? ORDER BY version DESC LIMIT 1`, "/file1.txt").Scan(&reusedBlobID)
 	require.NoError(t, err)
 	assert.Equal(t, firstBlobID, reusedBlobID, "writing original content again should reuse first blob")

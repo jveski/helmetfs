@@ -4,11 +4,9 @@ import (
 	"context"
 	"crypto/sha256"
 	"database/sql"
-	"encoding/binary"
 	"encoding/hex"
 	"fmt"
 	"hash"
-	"hash/fnv"
 	"io"
 	"io/fs"
 	"os"
@@ -16,6 +14,8 @@ import (
 	"path/filepath"
 	"syscall"
 	"time"
+
+	"github.com/google/uuid"
 )
 
 type file struct {
@@ -30,7 +30,7 @@ type file struct {
 	modTime   int64
 	readFile  *os.File
 	writeFile *os.File
-	blobID    int64
+	blobID    string
 	dirOffset int
 	created   bool
 	writeHash hash.Hash
@@ -38,7 +38,7 @@ type file struct {
 
 func openFile(ctx context.Context, db *sql.DB, blobsDir, name string, flag int, perm os.FileMode) (*file, error) {
 	var version int
-	var blobID sql.NullInt64
+	var blobID sql.NullString
 	var isDir bool
 	var size int64
 	var mode int64
@@ -80,7 +80,7 @@ func openFile(ctx context.Context, db *sql.DB, blobsDir, name string, flag int, 
 			if !localWritten.Valid || !localWritten.Bool {
 				return nil, fmt.Errorf("blob not available locally")
 			}
-			blobPath := blobFilePath(blobsDir, blobID.Int64)
+			blobPath := blobFilePath(blobsDir, blobID.String)
 			f.readFile, err = open(blobPath, os.O_RDONLY, 0)
 			if err != nil {
 				return nil, err
@@ -156,11 +156,8 @@ func (f *file) Write(p []byte) (int, error) {
 
 	// Create a new blob
 	now := time.Now().Unix()
-	result, err := f.db.Exec(`INSERT INTO blobs (creation_time, modified_time, local_written) VALUES (?, ?, 0)`, now, now)
-	if err != nil {
-		return 0, err
-	}
-	f.blobID, err = result.LastInsertId()
+	f.blobID = uuid.New().String()
+	_, err := f.db.Exec(`INSERT INTO blobs (id, creation_time, modified_time, local_written) VALUES (?, ?, ?, 0)`, f.blobID, now, now)
 	if err != nil {
 		return 0, err
 	}
@@ -286,7 +283,7 @@ func (f *file) Close() error {
 	}
 	defer tx.Rollback()
 
-	var useBlobID int64
+	var useBlobID string
 	err = tx.QueryRow(`SELECT id FROM blobs WHERE checksum = ? AND local_written = 1 AND local_deleting = 0`, streamChecksum).Scan(&useBlobID)
 	if err == nil {
 		// Reuse existing blob with same content
@@ -423,18 +420,21 @@ func (fi *fileInfo) ModTime() time.Time { return time.Unix(fi.modTime, 0) }
 func (fi *fileInfo) IsDir() bool        { return fi.isDir }
 func (fi *fileInfo) Sys() any           { return nil }
 
-func blobFilePath(blobsDir string, blobID int64) string {
-	h := fnv.New64a()
-	binary.Write(h, binary.LittleEndian, blobID)
-	hash := h.Sum64()
-	return filepath.Join(blobsDir, fmt.Sprintf("%02x", hash&0xff), fmt.Sprintf("%014x", hash>>8))
+func blobFilePath(blobsDir string, blobID string) string {
+	// Use first 2 chars for directory, rest for filename
+	// UUID format: xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx
+	return filepath.Join(blobsDir, blobID[:2], blobID[2:])
 }
 
 func initBlobDirs(blobsDir string) error {
-	for i := 0; i < 256; i++ {
-		dir := filepath.Join(blobsDir, fmt.Sprintf("%02x", i))
-		if err := os.MkdirAll(dir, 0755); err != nil {
-			return err
+	// Create directories for all possible 2-char hex prefixes (UUID first 2 chars)
+	hexChars := "0123456789abcdef"
+	for _, c1 := range hexChars {
+		for _, c2 := range hexChars {
+			dir := filepath.Join(blobsDir, string(c1)+string(c2))
+			if err := os.MkdirAll(dir, 0755); err != nil {
+				return err
+			}
 		}
 	}
 	return nil

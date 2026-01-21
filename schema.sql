@@ -2,7 +2,7 @@ PRAGMA auto_vacuum=FULL;
 PRAGMA foreign_keys=ON;
 
 CREATE TABLE IF NOT EXISTS blobs (
-	id INTEGER PRIMARY KEY AUTOINCREMENT,
+	id TEXT PRIMARY KEY,
 	creation_time INTEGER NOT NULL,
 	modified_time INTEGER NOT NULL,
 	last_integrity_check INTEGER,
@@ -38,7 +38,7 @@ CREATE TABLE IF NOT EXISTS files (
 	mod_time INTEGER NOT NULL,
 	is_dir INTEGER NOT NULL,
 	deleted INTEGER NOT NULL DEFAULT 0,
-	blob_id INTEGER REFERENCES blobs(id)
+	blob_id TEXT REFERENCES blobs(id)
 ) STRICT;
 
 CREATE INDEX IF NOT EXISTS idx_files_path_version ON files (path, version DESC);

@@ -15,6 +15,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/google/uuid"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
@@ -94,10 +95,9 @@ func TestAPIRestore(t *testing.T) {
 		require.NoError(t, err)
 
 		t2 := t1 + 10
-		_, err = db.Exec(`INSERT INTO blobs (creation_time, modified_time, local_written) VALUES (?, ?, 1)`, t2, t2)
+		blobID := uuid.New().String()
+		_, err = db.Exec(`INSERT INTO blobs (id, creation_time, modified_time, local_written) VALUES (?, ?, ?, 1)`, blobID, t2, t2)
 		require.NoError(t, err)
-		var blobID int64
-		require.NoError(t, db.QueryRow(`SELECT last_insert_rowid()`).Scan(&blobID))
 		_, err = db.Exec(`INSERT INTO files (created_at, version, path, mode, mod_time, is_dir, blob_id) VALUES (?, 2, '/doc.txt', 0644, ?, 0, ?)`, t2, t2, blobID)
 		require.NoError(t, err)
 
@@ -107,7 +107,7 @@ func TestAPIRestore(t *testing.T) {
 		assert.Equal(t, http.StatusSeeOther, resp.StatusCode)
 		assert.Equal(t, "/", resp.Header.Get("Location"))
 
-		var blobIDAfter sql.NullInt64
+		var blobIDAfter sql.NullString
 		err = db.QueryRow(`SELECT blob_id FROM files WHERE path = '/doc.txt' ORDER BY version DESC LIMIT 1`).Scan(&blobIDAfter)
 		require.NoError(t, err)
 		assert.False(t, blobIDAfter.Valid)
@@ -223,11 +223,11 @@ func TestStatusPage(t *testing.T) {
 
 	t.Run("shows pending rclone operations", func(t *testing.T) {
 		now := time.Now().Unix()
-		_, err := db.Exec(`INSERT INTO blobs (creation_time, modified_time, local_written, remote_written) VALUES (?, ?, 0, 1)`, now, now)
+		_, err := db.Exec(`INSERT INTO blobs (id, creation_time, modified_time, local_written, remote_written) VALUES (?, ?, ?, 0, 1)`, uuid.New().String(), now, now)
 		require.NoError(t, err)
-		_, err = db.Exec(`INSERT INTO blobs (creation_time, modified_time, local_written, remote_written, local_deleting) VALUES (?, ?, 1, 0, 0)`, now, now)
+		_, err = db.Exec(`INSERT INTO blobs (id, creation_time, modified_time, local_written, remote_written, local_deleting) VALUES (?, ?, ?, 1, 0, 0)`, uuid.New().String(), now, now)
 		require.NoError(t, err)
-		_, err = db.Exec(`INSERT INTO blobs (creation_time, modified_time, local_written, remote_written, remote_deleting) VALUES (?, ?, 1, 1, 1)`, now, now)
+		_, err = db.Exec(`INSERT INTO blobs (id, creation_time, modified_time, local_written, remote_written, remote_deleting) VALUES (?, ?, ?, 1, 1, 1)`, uuid.New().String(), now, now)
 		require.NoError(t, err)
 
 		_, body := getStatus()
@@ -239,7 +239,7 @@ func TestStatusPage(t *testing.T) {
 	t.Run("shows overdue integrity checks", func(t *testing.T) {
 		now := time.Now().Unix()
 		oldCheck := now - int64((*integrityCheckInterval).Seconds()) - 3600
-		_, err := db.Exec(`INSERT INTO blobs (creation_time, modified_time, local_written, remote_written, checksum, last_integrity_check) VALUES (?, ?, 1, 1, 'abc123', ?)`, now, now, oldCheck)
+		_, err := db.Exec(`INSERT INTO blobs (id, creation_time, modified_time, local_written, remote_written, checksum, last_integrity_check) VALUES (?, ?, ?, 1, 1, 'abc123', ?)`, uuid.New().String(), now, now, oldCheck)
 		require.NoError(t, err)
 
 		_, body := getStatus()
@@ -257,7 +257,7 @@ func TestStatusPage(t *testing.T) {
 
 	t.Run("shows local and remote space", func(t *testing.T) {
 		now := time.Now().Unix()
-		_, err := db.Exec(`INSERT INTO blobs (creation_time, modified_time, local_written, remote_written, size) VALUES (?, ?, 1, 1, 1024)`, now, now)
+		_, err := db.Exec(`INSERT INTO blobs (id, creation_time, modified_time, local_written, remote_written, size) VALUES (?, ?, ?, 1, 1, 1024)`, uuid.New().String(), now, now)
 		require.NoError(t, err)
 
 		_, body := getStatus()
@@ -293,11 +293,9 @@ func TestGarbageCollection(t *testing.T) {
 	t.Run("marks orphaned blobs for deletion", func(t *testing.T) {
 		// Create a blob that was never written to (simulates interrupted upload)
 		oldTime := time.Now().Add(-time.Hour).Unix()
-		_, err := db.Exec(`INSERT INTO blobs (creation_time, modified_time, local_written, local_deleting) VALUES (?, ?, 0, 0)`, oldTime, oldTime)
+		orphanedBlobID := uuid.New().String()
+		_, err := db.Exec(`INSERT INTO blobs (id, creation_time, modified_time, local_written, local_deleting) VALUES (?, ?, ?, 0, 0)`, orphanedBlobID, oldTime, oldTime)
 		require.NoError(t, err)
-
-		var orphanedBlobID int64
-		require.NoError(t, db.QueryRow(`SELECT last_insert_rowid()`).Scan(&orphanedBlobID))
 
 		// Run garbage collection
 		_, err = takeOutTheTrash(db)
@@ -313,11 +311,9 @@ func TestGarbageCollection(t *testing.T) {
 	t.Run("does not mark recent orphaned blobs", func(t *testing.T) {
 		// Create a recent blob that was never written to
 		recentTime := time.Now().Unix()
-		_, err := db.Exec(`INSERT INTO blobs (creation_time, modified_time, local_written, local_deleting) VALUES (?, ?, 0, 0)`, recentTime, recentTime)
+		recentBlobID := uuid.New().String()
+		_, err := db.Exec(`INSERT INTO blobs (id, creation_time, modified_time, local_written, local_deleting) VALUES (?, ?, ?, 0, 0)`, recentBlobID, recentTime, recentTime)
 		require.NoError(t, err)
-
-		var recentBlobID int64
-		require.NoError(t, db.QueryRow(`SELECT last_insert_rowid()`).Scan(&recentBlobID))
 
 		// Run garbage collection
 		_, err = takeOutTheTrash(db)
@@ -412,11 +408,9 @@ func TestDeleteLocalBlobsExtended(t *testing.T) {
 	t.Run("deletes blob files marked for deletion", func(t *testing.T) {
 		// Create a blob and its file
 		now := time.Now().Unix()
-		_, err := db.Exec(`INSERT INTO blobs (creation_time, modified_time, local_written, local_deleting, checksum) VALUES (?, ?, 1, 1, 'delete-test-1')`, now, now)
+		blobID := uuid.New().String()
+		_, err := db.Exec(`INSERT INTO blobs (id, creation_time, modified_time, local_written, local_deleting, checksum) VALUES (?, ?, ?, 1, 1, 'delete-test-1')`, blobID, now, now)
 		require.NoError(t, err)
-
-		var blobID int64
-		require.NoError(t, db.QueryRow(`SELECT last_insert_rowid()`).Scan(&blobID))
 
 		blobPath := blobFilePath(blobsDir, blobID)
 		require.NoError(t, os.WriteFile(blobPath, []byte("test content"), 0644))
@@ -443,11 +437,9 @@ func TestDeleteLocalBlobsExtended(t *testing.T) {
 	t.Run("handles already deleted blob files", func(t *testing.T) {
 		// Create a blob marked for deletion but file doesn't exist
 		now := time.Now().Unix()
-		_, err := db.Exec(`INSERT INTO blobs (creation_time, modified_time, local_written, local_deleting, checksum) VALUES (?, ?, 1, 1, 'delete-test-2')`, now, now)
+		blobID := uuid.New().String()
+		_, err := db.Exec(`INSERT INTO blobs (id, creation_time, modified_time, local_written, local_deleting, checksum) VALUES (?, ?, ?, 1, 1, 'delete-test-2')`, blobID, now, now)
 		require.NoError(t, err)
-
-		var blobID int64
-		require.NoError(t, db.QueryRow(`SELECT last_insert_rowid()`).Scan(&blobID))
 
 		// Don't create the file - simulates already deleted
 
@@ -465,11 +457,9 @@ func TestDeleteLocalBlobsExtended(t *testing.T) {
 	t.Run("does not delete blobs not marked for deletion", func(t *testing.T) {
 		// Create a blob NOT marked for deletion
 		now := time.Now().Unix()
-		_, err := db.Exec(`INSERT INTO blobs (creation_time, modified_time, local_written, local_deleting, checksum) VALUES (?, ?, 1, 0, 'nodelete-test')`, now, now)
+		blobID := uuid.New().String()
+		_, err := db.Exec(`INSERT INTO blobs (id, creation_time, modified_time, local_written, local_deleting, checksum) VALUES (?, ?, ?, 1, 0, 'nodelete-test')`, blobID, now, now)
 		require.NoError(t, err)
-
-		var blobID int64
-		require.NoError(t, db.QueryRow(`SELECT last_insert_rowid()`).Scan(&blobID))
 
 		blobPath := blobFilePath(blobsDir, blobID)
 		require.NoError(t, os.WriteFile(blobPath, []byte("keep this content"), 0644))
@@ -504,11 +494,9 @@ func TestIntegrityCheck(t *testing.T) {
 
 		oldCheck := time.Now().Add(-time.Hour).Unix()
 		now := time.Now().Unix()
-		_, err := db.Exec(`INSERT INTO blobs (creation_time, modified_time, local_written, remote_written, checksum, last_integrity_check) VALUES (?, ?, 1, 1, ?, ?)`, now, now, checksumHex, oldCheck)
+		blobID := uuid.New().String()
+		_, err := db.Exec(`INSERT INTO blobs (id, creation_time, modified_time, local_written, remote_written, checksum, last_integrity_check) VALUES (?, ?, ?, 1, 1, ?, ?)`, blobID, now, now, checksumHex, oldCheck)
 		require.NoError(t, err)
-
-		var blobID int64
-		require.NoError(t, db.QueryRow(`SELECT last_insert_rowid()`).Scan(&blobID))
 
 		blobPath := blobFilePath(blobsDir, blobID)
 		require.NoError(t, os.WriteFile(blobPath, content, 0644))
@@ -532,11 +520,9 @@ func TestIntegrityCheck(t *testing.T) {
 
 		oldCheck := time.Now().Add(-time.Hour).Unix()
 		now := time.Now().Unix()
-		_, err := db.Exec(`INSERT INTO blobs (creation_time, modified_time, local_written, remote_written, checksum, last_integrity_check) VALUES (?, ?, 1, 1, ?, ?)`, now, now, checksumHex, oldCheck)
+		blobID := uuid.New().String()
+		_, err := db.Exec(`INSERT INTO blobs (id, creation_time, modified_time, local_written, remote_written, checksum, last_integrity_check) VALUES (?, ?, ?, 1, 1, ?, ?)`, blobID, now, now, checksumHex, oldCheck)
 		require.NoError(t, err)
-
-		var blobID int64
-		require.NoError(t, db.QueryRow(`SELECT last_insert_rowid()`).Scan(&blobID))
 
 		// Write corrupted content
 		blobPath := blobFilePath(blobsDir, blobID)
@@ -562,11 +548,9 @@ func TestIntegrityCheck(t *testing.T) {
 
 		oldCheck := time.Now().Add(-time.Hour).Unix()
 		now := time.Now().Unix()
-		_, err := db.Exec(`INSERT INTO blobs (creation_time, modified_time, local_written, remote_written, checksum, last_integrity_check) VALUES (?, ?, 1, 1, ?, ?)`, now, now, checksumHex, oldCheck)
+		blobID := uuid.New().String()
+		_, err := db.Exec(`INSERT INTO blobs (id, creation_time, modified_time, local_written, remote_written, checksum, last_integrity_check) VALUES (?, ?, ?, 1, 1, ?, ?)`, blobID, now, now, checksumHex, oldCheck)
 		require.NoError(t, err)
-
-		var blobID int64
-		require.NoError(t, db.QueryRow(`SELECT last_insert_rowid()`).Scan(&blobID))
 
 		// Don't create the blob file - simulates missing file
 
@@ -589,11 +573,9 @@ func TestIntegrityCheck(t *testing.T) {
 
 		// Set last_integrity_check to now (within interval)
 		now := time.Now().Unix()
-		_, err := db.Exec(`INSERT INTO blobs (creation_time, modified_time, local_written, remote_written, checksum, last_integrity_check) VALUES (?, ?, 1, 1, ?, ?)`, now, now, checksumHex, now)
+		blobID := uuid.New().String()
+		_, err := db.Exec(`INSERT INTO blobs (id, creation_time, modified_time, local_written, remote_written, checksum, last_integrity_check) VALUES (?, ?, ?, 1, 1, ?, ?)`, blobID, now, now, checksumHex, now)
 		require.NoError(t, err)
-
-		var blobID int64
-		require.NoError(t, db.QueryRow(`SELECT last_insert_rowid()`).Scan(&blobID))
 
 		blobPath := blobFilePath(blobsDir, blobID)
 		require.NoError(t, os.WriteFile(blobPath, content, 0644))
@@ -621,18 +603,16 @@ func TestIntegrityCheck(t *testing.T) {
 		oldCheck := now - 3600*48 // 48 hours ago
 
 		// Create blob that was checked long ago
-		_, err := db.Exec(`INSERT INTO blobs (creation_time, modified_time, local_written, remote_written, checksum, last_integrity_check) VALUES (?, ?, 1, 1, ?, ?)`, now, now, checksumHex2, oldCheck)
+		blobID2 := uuid.New().String()
+		_, err := db.Exec(`INSERT INTO blobs (id, creation_time, modified_time, local_written, remote_written, checksum, last_integrity_check) VALUES (?, ?, ?, 1, 1, ?, ?)`, blobID2, now, now, checksumHex2, oldCheck)
 		require.NoError(t, err)
-		var blobID2 int64
-		require.NoError(t, db.QueryRow(`SELECT last_insert_rowid()`).Scan(&blobID2))
 		blobPath2 := blobFilePath(blobsDir, blobID2)
 		require.NoError(t, os.WriteFile(blobPath2, content2, 0644))
 
 		// Create blob that was never checked (NULL)
-		_, err = db.Exec(`INSERT INTO blobs (creation_time, modified_time, local_written, remote_written, checksum, last_integrity_check) VALUES (?, ?, 1, 1, ?, NULL)`, now, now, checksumHex1)
+		blobID1 := uuid.New().String()
+		_, err = db.Exec(`INSERT INTO blobs (id, creation_time, modified_time, local_written, remote_written, checksum, last_integrity_check) VALUES (?, ?, ?, 1, 1, ?, NULL)`, blobID1, now, now, checksumHex1)
 		require.NoError(t, err)
-		var blobID1 int64
-		require.NoError(t, db.QueryRow(`SELECT last_insert_rowid()`).Scan(&blobID1))
 		blobPath1 := blobFilePath(blobsDir, blobID1)
 		require.NoError(t, os.WriteFile(blobPath1, content1, 0644))
 
