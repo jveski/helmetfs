@@ -1,12 +1,15 @@
 package main
 
 import (
+	"context"
 	"crypto/sha256"
 	"database/sql"
 	"encoding/hex"
+	"fmt"
 	"io"
 	"os"
 	"path/filepath"
+	"sync"
 	"testing"
 
 	"github.com/stretchr/testify/assert"
@@ -225,4 +228,407 @@ func TestChecksumDeduplication(t *testing.T) {
 	err = db.QueryRow(`SELECT blob_id FROM files WHERE path = ? ORDER BY version DESC LIMIT 1`, "/file1.txt").Scan(&reusedBlobID)
 	require.NoError(t, err)
 	assert.Equal(t, firstBlobID, reusedBlobID, "writing original content again should reuse first blob")
+}
+
+func TestConcurrentWriteVersions(t *testing.T) {
+	db, blobsDir := initTestState(t)
+	ctx := t.Context()
+
+	const numWriters = 10
+	const writesPerWriter = 5
+	path := "/concurrent_version.txt"
+
+	// Create initial file
+	f, err := openFile(ctx, db, blobsDir, path, os.O_CREATE|os.O_WRONLY, 0644)
+	require.NoError(t, err)
+	_, err = f.Write([]byte("initial"))
+	require.NoError(t, err)
+	require.NoError(t, f.Close())
+
+	// Multiple goroutines writing to the same file
+	var wg sync.WaitGroup
+	for i := 0; i < numWriters; i++ {
+		wg.Add(1)
+		go func(workerID int) {
+			defer wg.Done()
+			for j := 0; j < writesPerWriter; j++ {
+				f, err := openFile(ctx, db, blobsDir, path, os.O_WRONLY|os.O_TRUNC, 0644)
+				if err != nil {
+					continue // might get errors due to contention, that's ok
+				}
+				f.Write([]byte(fmt.Sprintf("worker %d write %d", workerID, j)))
+				f.Close()
+			}
+		}(i)
+	}
+	wg.Wait()
+
+	// Verify versions are still monotonically increasing (no duplicates or reversals)
+	rows, err := db.Query(`SELECT version FROM files WHERE path = ? ORDER BY version`, path)
+	require.NoError(t, err)
+	defer rows.Close()
+
+	seen := make(map[int]bool)
+	var prevVersion int
+	first := true
+	for rows.Next() {
+		var version int
+		require.NoError(t, rows.Scan(&version))
+		assert.False(t, seen[version], "duplicate version found: %d", version)
+		seen[version] = true
+		if !first {
+			assert.Greater(t, version, prevVersion, "versions must be strictly increasing")
+		}
+		prevVersion = version
+		first = false
+	}
+	require.NoError(t, rows.Err())
+}
+
+func TestLockContention(t *testing.T) {
+	db, blobsDir := initTestState(t)
+	ctx := t.Context()
+
+	// Create a file
+	f, err := openFile(ctx, db, blobsDir, "/locked.txt", os.O_CREATE|os.O_WRONLY, 0644)
+	require.NoError(t, err)
+	_, err = f.Write([]byte("content to be locked"))
+	require.NoError(t, err)
+	require.NoError(t, f.Close())
+	blobID := f.blobID
+
+	// Open the blob for reading (acquires LOCK_SH)
+	blobPath := blobFilePath(blobsDir, blobID)
+	readFile, err := open(blobPath, os.O_RDONLY, 0)
+	require.NoError(t, err)
+	defer readFile.Close()
+
+	// tryDeleteBlob should fail because the file is locked with LOCK_SH
+	// and tryDeleteBlob needs LOCK_EX|LOCK_NB
+	deleted, err := tryDeleteBlob(blobPath)
+	require.NoError(t, err)
+	assert.False(t, deleted, "should not delete blob while it has readers")
+
+	// Verify the blob file still exists
+	_, err = os.Stat(blobPath)
+	assert.NoError(t, err, "blob file should still exist")
+
+	// Close the reader
+	readFile.Close()
+
+	// Now deletion should succeed
+	deleted, err = tryDeleteBlob(blobPath)
+	require.NoError(t, err)
+	assert.True(t, deleted, "should delete blob after readers release lock")
+
+	// Verify the blob file is gone
+	_, err = os.Stat(blobPath)
+	assert.True(t, os.IsNotExist(err), "blob file should be deleted")
+}
+
+func TestConcurrentReadDuringGC(t *testing.T) {
+	db, blobsDir := initTestState(t)
+	ctx := t.Context()
+
+	// Create a file
+	f, err := openFile(ctx, db, blobsDir, "/gc_test.txt", os.O_CREATE|os.O_WRONLY, 0644)
+	require.NoError(t, err)
+	content := []byte("content that will be read during GC")
+	_, err = f.Write(content)
+	require.NoError(t, err)
+	require.NoError(t, f.Close())
+
+	blobID := f.blobID
+	blobPath := blobFilePath(blobsDir, blobID)
+
+	// Start multiple readers
+	const numReaders = 5
+	readResults := make(chan []byte, numReaders)
+	var wg sync.WaitGroup
+
+	for i := 0; i < numReaders; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			f, err := openFile(ctx, db, blobsDir, "/gc_test.txt", os.O_RDONLY, 0)
+			if err != nil {
+				return
+			}
+			defer f.Close()
+
+			// Simulate slow read
+			buf := make([]byte, len(content))
+			n, err := f.Read(buf)
+			if err == nil {
+				readResults <- buf[:n]
+			}
+		}()
+	}
+
+	// Attempt deletion while reads are in progress
+	// This simulates GC trying to delete the blob
+	deleted, err := tryDeleteBlob(blobPath)
+	require.NoError(t, err)
+	// Deletion might succeed or fail depending on timing - both are valid
+
+	wg.Wait()
+	close(readResults)
+
+	// If any reads completed, they should have correct content
+	for result := range readResults {
+		assert.Equal(t, content, result, "read content should match original")
+	}
+
+	// Check final state
+	_, statErr := os.Stat(blobPath)
+	if deleted {
+		assert.True(t, os.IsNotExist(statErr), "blob should be gone after successful delete")
+	} else {
+		assert.NoError(t, statErr, "blob should exist if delete was blocked")
+	}
+}
+
+func TestFileErrorPaths(t *testing.T) {
+	db, blobsDir := initTestState(t)
+	ctx := t.Context()
+
+	t.Run("Read from write-only file returns permission error", func(t *testing.T) {
+		f, err := openFile(ctx, db, blobsDir, "/writeonly.txt", os.O_CREATE|os.O_WRONLY, 0644)
+		require.NoError(t, err)
+		defer f.Close()
+
+		_, err = f.Read(make([]byte, 10))
+		assert.ErrorIs(t, err, os.ErrPermission)
+	})
+
+	t.Run("Write to read-only file returns permission error", func(t *testing.T) {
+		// Create file first
+		f, err := openFile(ctx, db, blobsDir, "/readonly.txt", os.O_CREATE|os.O_WRONLY, 0644)
+		require.NoError(t, err)
+		f.Write([]byte("content"))
+		f.Close()
+
+		f, err = openFile(ctx, db, blobsDir, "/readonly.txt", os.O_RDONLY, 0)
+		require.NoError(t, err)
+		defer f.Close()
+
+		_, err = f.Write([]byte("test"))
+		assert.ErrorIs(t, err, os.ErrPermission)
+	})
+
+	t.Run("Write to directory returns invalid error", func(t *testing.T) {
+		fs := &FS{db: db, blobsDir: blobsDir}
+		require.NoError(t, fs.Mkdir(ctx, "/testdir", 0755))
+
+		// Opening directory with O_WRONLY should fail
+		_, err := fs.OpenFile(ctx, "/testdir", os.O_WRONLY, 0)
+		assert.ErrorIs(t, err, os.ErrInvalid)
+	})
+
+	t.Run("Read from directory returns invalid error", func(t *testing.T) {
+		fs := &FS{db: db, blobsDir: blobsDir}
+		require.NoError(t, fs.Mkdir(ctx, "/testdir2", 0755))
+
+		f, err := fs.OpenFile(ctx, "/testdir2", os.O_RDONLY, 0)
+		require.NoError(t, err)
+		defer f.Close()
+
+		_, err = f.Read(make([]byte, 10))
+		assert.ErrorIs(t, err, os.ErrInvalid)
+	})
+
+	t.Run("Open with O_EXCL on existing file returns exist error", func(t *testing.T) {
+		f, err := openFile(ctx, db, blobsDir, "/exists.txt", os.O_CREATE|os.O_WRONLY, 0644)
+		require.NoError(t, err)
+		f.Write([]byte("content"))
+		f.Close()
+
+		_, err = openFile(ctx, db, blobsDir, "/exists.txt", os.O_CREATE|os.O_EXCL|os.O_WRONLY, 0644)
+		assert.ErrorIs(t, err, os.ErrExist)
+	})
+
+	t.Run("Open nonexistent file without O_CREATE returns not exist", func(t *testing.T) {
+		_, err := openFile(ctx, db, blobsDir, "/nonexistent.txt", os.O_RDONLY, 0)
+		assert.ErrorIs(t, err, os.ErrNotExist)
+	})
+
+	t.Run("Create file under nonexistent parent returns not exist", func(t *testing.T) {
+		_, err := openFile(ctx, db, blobsDir, "/noparent/file.txt", os.O_CREATE|os.O_WRONLY, 0644)
+		assert.ErrorIs(t, err, os.ErrNotExist)
+	})
+
+	t.Run("Create file under file (not directory) returns invalid", func(t *testing.T) {
+		f, err := openFile(ctx, db, blobsDir, "/notadir.txt", os.O_CREATE|os.O_WRONLY, 0644)
+		require.NoError(t, err)
+		f.Write([]byte("content"))
+		f.Close()
+
+		_, err = openFile(ctx, db, blobsDir, "/notadir.txt/child.txt", os.O_CREATE|os.O_WRONLY, 0644)
+		assert.ErrorIs(t, err, os.ErrInvalid)
+	})
+
+	t.Run("Open directory with write flag returns invalid", func(t *testing.T) {
+		fs := &FS{db: db, blobsDir: blobsDir}
+		require.NoError(t, fs.Mkdir(ctx, "/writedir", 0755))
+
+		_, err := fs.OpenFile(ctx, "/writedir", os.O_WRONLY, 0)
+		assert.ErrorIs(t, err, os.ErrInvalid)
+	})
+
+	t.Run("Open directory with truncate flag returns invalid", func(t *testing.T) {
+		fs := &FS{db: db, blobsDir: blobsDir}
+		require.NoError(t, fs.Mkdir(ctx, "/truncdir", 0755))
+
+		_, err := fs.OpenFile(ctx, "/truncdir", os.O_TRUNC, 0)
+		assert.ErrorIs(t, err, os.ErrInvalid)
+	})
+}
+
+func TestEmptyFileOperations(t *testing.T) {
+	db, blobsDir := initTestState(t)
+	ctx := t.Context()
+
+	t.Run("Create and read empty file", func(t *testing.T) {
+		// Create empty file (close without writing)
+		f, err := openFile(ctx, db, blobsDir, "/empty.txt", os.O_CREATE|os.O_WRONLY, 0644)
+		require.NoError(t, err)
+		require.NoError(t, f.Close())
+
+		// Read empty file
+		f, err = openFile(ctx, db, blobsDir, "/empty.txt", os.O_RDONLY, 0)
+		require.NoError(t, err)
+		defer f.Close()
+
+		content, err := io.ReadAll(f)
+		require.NoError(t, err)
+		assert.Empty(t, content)
+	})
+
+	t.Run("Seek on empty file", func(t *testing.T) {
+		f, err := openFile(ctx, db, blobsDir, "/empty2.txt", os.O_CREATE|os.O_WRONLY, 0644)
+		require.NoError(t, err)
+		require.NoError(t, f.Close())
+
+		f, err = openFile(ctx, db, blobsDir, "/empty2.txt", os.O_RDONLY, 0)
+		require.NoError(t, err)
+		defer f.Close()
+
+		// Seek on empty file
+		pos, err := f.Seek(0, io.SeekStart)
+		require.NoError(t, err)
+		assert.Equal(t, int64(0), pos)
+
+		// Seek to end on empty file
+		pos, err = f.Seek(0, io.SeekEnd)
+		// EOF is expected since file is empty and we're seeking past it
+		if err == nil {
+			assert.Equal(t, int64(0), pos)
+		}
+	})
+
+	t.Run("Stat shows zero size for empty file", func(t *testing.T) {
+		f, err := openFile(ctx, db, blobsDir, "/empty3.txt", os.O_CREATE|os.O_WRONLY, 0644)
+		require.NoError(t, err)
+		require.NoError(t, f.Close())
+
+		f, err = openFile(ctx, db, blobsDir, "/empty3.txt", os.O_RDONLY, 0)
+		require.NoError(t, err)
+		defer f.Close()
+
+		info, err := f.Stat()
+		require.NoError(t, err)
+		assert.Equal(t, int64(0), info.Size())
+	})
+}
+
+func TestReaddirEdgeCases(t *testing.T) {
+	db, blobsDir := initTestState(t)
+	ctx := t.Context()
+	fs := &FS{db: db, blobsDir: blobsDir}
+
+	t.Run("Readdir on empty directory", func(t *testing.T) {
+		require.NoError(t, fs.Mkdir(ctx, "/emptydir", 0755))
+
+		f, err := fs.OpenFile(ctx, "/emptydir", os.O_RDONLY, 0)
+		require.NoError(t, err)
+		defer f.Close()
+
+		entries, err := f.Readdir(-1)
+		require.NoError(t, err)
+		assert.Empty(t, entries)
+	})
+
+	t.Run("Readdir with count=0", func(t *testing.T) {
+		require.NoError(t, fs.Mkdir(ctx, "/countdir", 0755))
+		f1, _ := fs.OpenFile(ctx, "/countdir/a.txt", os.O_CREATE|os.O_WRONLY, 0644)
+		f1.Close()
+
+		f, err := fs.OpenFile(ctx, "/countdir", os.O_RDONLY, 0)
+		require.NoError(t, err)
+		defer f.Close()
+
+		// count=0 should return all entries
+		entries, err := f.Readdir(0)
+		require.NoError(t, err)
+		assert.Len(t, entries, 1)
+	})
+
+	t.Run("Readdir with negative count", func(t *testing.T) {
+		require.NoError(t, fs.Mkdir(ctx, "/negdir", 0755))
+		f1, _ := fs.OpenFile(ctx, "/negdir/a.txt", os.O_CREATE|os.O_WRONLY, 0644)
+		f1.Close()
+		f2, _ := fs.OpenFile(ctx, "/negdir/b.txt", os.O_CREATE|os.O_WRONLY, 0644)
+		f2.Close()
+
+		f, err := fs.OpenFile(ctx, "/negdir", os.O_RDONLY, 0)
+		require.NoError(t, err)
+		defer f.Close()
+
+		// Negative count should return all entries
+		entries, err := f.Readdir(-1)
+		require.NoError(t, err)
+		assert.Len(t, entries, 2)
+	})
+
+	t.Run("Readdir on file returns error", func(t *testing.T) {
+		f, err := openFile(ctx, db, blobsDir, "/notdir.txt", os.O_CREATE|os.O_WRONLY, 0644)
+		require.NoError(t, err)
+		f.Write([]byte("content"))
+		f.Close()
+
+		f, err = openFile(ctx, db, blobsDir, "/notdir.txt", os.O_RDONLY, 0)
+		require.NoError(t, err)
+		defer f.Close()
+
+		_, err = f.Readdir(-1)
+		assert.ErrorIs(t, err, os.ErrInvalid)
+	})
+}
+
+func TestFileContextCancellation(t *testing.T) {
+	db, blobsDir := initTestState(t)
+
+	t.Run("openFile with cancelled context", func(t *testing.T) {
+		ctx, cancel := context.WithCancel(context.Background())
+		cancel()
+
+		_, err := openFile(ctx, db, blobsDir, "/cancelled.txt", os.O_CREATE|os.O_WRONLY, 0644)
+		assert.Error(t, err)
+	})
+
+	t.Run("openFile read with cancelled context", func(t *testing.T) {
+		// Create file first with valid context
+		ctx := context.Background()
+		f, err := openFile(ctx, db, blobsDir, "/forcancel.txt", os.O_CREATE|os.O_WRONLY, 0644)
+		require.NoError(t, err)
+		f.Write([]byte("content"))
+		f.Close()
+
+		// Try to open with cancelled context
+		cancelCtx, cancel := context.WithCancel(context.Background())
+		cancel()
+
+		_, err = openFile(cancelCtx, db, blobsDir, "/forcancel.txt", os.O_RDONLY, 0)
+		assert.Error(t, err)
+	})
 }

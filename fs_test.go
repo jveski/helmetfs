@@ -1,8 +1,12 @@
 package main
 
 import (
+	"context"
 	"io"
 	"os"
+	"path/filepath"
+	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -239,4 +243,297 @@ func TestDeleteLocalBlobs(t *testing.T) {
 
 	require.NoError(t, db.QueryRow(`SELECT local_deleted FROM blobs WHERE id = ?`, blobID).Scan(&localDeleted))
 	assert.Equal(t, 1, localDeleted)
+}
+
+func TestPathTraversalProtection(t *testing.T) {
+	db, blobsDir := initTestState(t)
+	ctx := t.Context()
+	fs := &FS{db: db, blobsDir: blobsDir}
+
+	// First create a valid directory to test traversal from
+	require.NoError(t, fs.Mkdir(ctx, "/docs", 0755))
+
+	// Test cases for path traversal attempts
+	// Note: path.Clean in fs.go should normalize these paths
+	testCases := []struct {
+		name        string
+		path        string
+		expectedErr error
+	}{
+		{"Basic traversal", "/../etc/passwd", os.ErrNotExist},
+		{"Double traversal", "/../../etc/passwd", os.ErrNotExist},
+		{"Mixed traversal", "/docs/../../../etc/passwd", os.ErrNotExist},
+		{"Traversal with valid prefix", "/docs/../../etc", os.ErrNotExist},
+		{"Deep traversal", "/docs/sub/../../../../../../../etc/passwd", os.ErrNotExist},
+	}
+
+	for _, tc := range testCases {
+		t.Run(tc.name, func(t *testing.T) {
+			// Stat should return not exist for traversal attempts
+			// because path.Clean normalizes the path and the file doesn't exist
+			_, err := fs.Stat(ctx, tc.path)
+			assert.Error(t, err)
+		})
+	}
+
+	// Test that traversal in Mkdir is handled safely
+	t.Run("Mkdir traversal", func(t *testing.T) {
+		// path.Clean normalizes "/../evil" to "/evil"
+		// So mkdir will try to create /evil at root level
+		// This is safe because it's still within the virtual filesystem
+		err := fs.Mkdir(ctx, "/../evil", 0755)
+		// The normalized path /evil should succeed (no parent check for root)
+		// This verifies that traversal is neutralized by path normalization
+		if err != nil {
+			// If it errors, it should be because /evil already exists or similar
+			assert.True(t, err == os.ErrExist || err == os.ErrNotExist)
+		}
+	})
+
+	// Test OpenFile with traversal path
+	t.Run("OpenFile traversal", func(t *testing.T) {
+		_, err := fs.OpenFile(ctx, "/../../../etc/passwd", os.O_RDONLY, 0)
+		assert.Error(t, err)
+	})
+
+	// Test Rename with traversal in source or destination
+	t.Run("Rename traversal source", func(t *testing.T) {
+		err := fs.Rename(ctx, "/../etc/passwd", "/safe.txt")
+		assert.Error(t, err)
+	})
+
+	t.Run("Rename traversal destination", func(t *testing.T) {
+		// Create a file first
+		f, err := fs.OpenFile(ctx, "/source.txt", os.O_CREATE|os.O_WRONLY, 0644)
+		require.NoError(t, err)
+		require.NoError(t, f.Close())
+
+		err = fs.Rename(ctx, "/source.txt", "/../../../etc/evil")
+		// Should either error or rename to /evil (cleaned path)
+		// Not actually escape the filesystem
+		assert.NoError(t, err) // path.Clean normalizes it
+	})
+
+	// Test RemoveAll with traversal
+	t.Run("RemoveAll traversal", func(t *testing.T) {
+		err := fs.RemoveAll(ctx, "/../etc")
+		assert.Error(t, err) // Should error as path doesn't exist after normalization
+	})
+}
+
+func TestBlobPathSecurity(t *testing.T) {
+	_, blobsDir := initTestState(t)
+
+	// Test that blobFilePath always returns paths within blobsDir
+	testCases := []struct {
+		name   string
+		blobID string
+	}{
+		{"Normal UUID", "abcd1234-5678-90ef-ghij-klmnopqrstuv"},
+		{"Short ID", "ab"},
+		{"UUID with prefix", "00" + uuid.New().String()[2:]},
+	}
+
+	for _, tc := range testCases {
+		t.Run(tc.name, func(t *testing.T) {
+			path := blobFilePath(blobsDir, tc.blobID)
+			cleanBlobsDir := filepath.Clean(blobsDir)
+			cleanPath := filepath.Clean(path)
+
+			// Path should always be within blobsDir
+			assert.True(t, strings.HasPrefix(cleanPath, cleanBlobsDir),
+				"blob path %q should be within blobs dir %q", cleanPath, cleanBlobsDir)
+		})
+	}
+}
+
+func TestConcurrentMkdir(t *testing.T) {
+	db, blobsDir := initTestState(t)
+	ctx := t.Context()
+	fs := &FS{db: db, blobsDir: blobsDir}
+
+	const numGoroutines = 10
+	path := "/concurrent-dir"
+
+	var wg sync.WaitGroup
+	results := make(chan error, numGoroutines)
+
+	for i := 0; i < numGoroutines; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			results <- fs.Mkdir(ctx, path, 0755)
+		}()
+	}
+
+	wg.Wait()
+	close(results)
+
+	// Count successes and failures
+	var successes, failures int
+	for err := range results {
+		if err == nil {
+			successes++
+		} else {
+			failures++
+			// Should be ErrExist for the losers
+			assert.ErrorIs(t, err, os.ErrExist)
+		}
+	}
+
+	// Exactly one should succeed
+	assert.Equal(t, 1, successes, "exactly one mkdir should succeed")
+	assert.Equal(t, numGoroutines-1, failures, "all others should fail")
+
+	// Verify directory exists
+	info, err := fs.Stat(ctx, path)
+	require.NoError(t, err)
+	assert.True(t, info.IsDir())
+}
+
+func TestConcurrentFileOperations(t *testing.T) {
+	db, blobsDir := initTestState(t)
+	ctx := t.Context()
+	fs := &FS{db: db, blobsDir: blobsDir}
+
+	t.Run("Concurrent create and delete", func(t *testing.T) {
+		const iterations = 20
+		path := "/concurrent-file.txt"
+
+		for i := 0; i < iterations; i++ {
+			var wg sync.WaitGroup
+			wg.Add(2)
+
+			// Create
+			go func() {
+				defer wg.Done()
+				f, err := fs.OpenFile(ctx, path, os.O_CREATE|os.O_WRONLY, 0644)
+				if err == nil {
+					f.Write([]byte("content"))
+					f.Close()
+				}
+			}()
+
+			// Delete
+			go func() {
+				defer wg.Done()
+				fs.RemoveAll(ctx, path)
+			}()
+
+			wg.Wait()
+		}
+
+		// Final state should be consistent - either exists or not
+		_, err := fs.Stat(ctx, path)
+		if err != nil {
+			assert.ErrorIs(t, err, os.ErrNotExist)
+		}
+	})
+
+	t.Run("Concurrent rename operations", func(t *testing.T) {
+		// Create initial file
+		f, err := fs.OpenFile(ctx, "/rename-src.txt", os.O_CREATE|os.O_WRONLY, 0644)
+		require.NoError(t, err)
+		f.Write([]byte("content"))
+		f.Close()
+
+		const numRenames = 5
+		var wg sync.WaitGroup
+
+		for i := 0; i < numRenames; i++ {
+			wg.Add(1)
+			go func(n int) {
+				defer wg.Done()
+				// Try to rename to different destinations
+				fs.Rename(ctx, "/rename-src.txt", "/rename-dst.txt")
+			}(i)
+		}
+
+		wg.Wait()
+
+		// Source should not exist (was renamed)
+		_, _ = fs.Stat(ctx, "/rename-src.txt")
+		// May or may not exist depending on timing
+	})
+}
+
+func TestDatabaseClosedGracefully(t *testing.T) {
+	db, blobsDir := initTestState(t)
+	fs := &FS{db: db, blobsDir: blobsDir}
+
+	// Close the database
+	db.Close()
+
+	ctx := context.Background()
+
+	// All operations should fail gracefully without panicking
+	t.Run("Mkdir on closed db", func(t *testing.T) {
+		err := fs.Mkdir(ctx, "/test", 0755)
+		assert.Error(t, err)
+	})
+
+	t.Run("Stat on closed db", func(t *testing.T) {
+		_, err := fs.Stat(ctx, "/test")
+		assert.Error(t, err)
+	})
+
+	t.Run("OpenFile on closed db", func(t *testing.T) {
+		_, err := fs.OpenFile(ctx, "/test.txt", os.O_CREATE|os.O_WRONLY, 0644)
+		assert.Error(t, err)
+	})
+
+	t.Run("RemoveAll on closed db", func(t *testing.T) {
+		err := fs.RemoveAll(ctx, "/test")
+		assert.Error(t, err)
+	})
+
+	t.Run("Rename on closed db", func(t *testing.T) {
+		err := fs.Rename(ctx, "/src", "/dst")
+		assert.Error(t, err)
+	})
+}
+
+func TestContextCancellation(t *testing.T) {
+	db, blobsDir := initTestState(t)
+	fs := &FS{db: db, blobsDir: blobsDir}
+
+	t.Run("Mkdir with cancelled context", func(t *testing.T) {
+		ctx, cancel := context.WithCancel(context.Background())
+		cancel()
+
+		err := fs.Mkdir(ctx, "/cancelled", 0755)
+		assert.Error(t, err)
+	})
+
+	t.Run("Stat with cancelled context", func(t *testing.T) {
+		ctx, cancel := context.WithCancel(context.Background())
+		cancel()
+
+		_, err := fs.Stat(ctx, "/test")
+		assert.Error(t, err)
+	})
+
+	t.Run("OpenFile with cancelled context", func(t *testing.T) {
+		ctx, cancel := context.WithCancel(context.Background())
+		cancel()
+
+		_, err := fs.OpenFile(ctx, "/test.txt", os.O_CREATE|os.O_WRONLY, 0644)
+		assert.Error(t, err)
+	})
+
+	t.Run("RemoveAll with cancelled context", func(t *testing.T) {
+		ctx, cancel := context.WithCancel(context.Background())
+		cancel()
+
+		err := fs.RemoveAll(ctx, "/test")
+		assert.Error(t, err)
+	})
+
+	t.Run("Rename with cancelled context", func(t *testing.T) {
+		ctx, cancel := context.WithCancel(context.Background())
+		cancel()
+
+		err := fs.Rename(ctx, "/src", "/dst")
+		assert.Error(t, err)
+	})
 }

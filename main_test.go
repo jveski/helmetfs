@@ -5,6 +5,7 @@ import (
 	"database/sql"
 	"encoding/hex"
 	"io"
+	"math"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
@@ -847,5 +848,103 @@ func TestBlobUnreferencedTrigger(t *testing.T) {
 		err = db.QueryRow(`SELECT local_deleting FROM blobs WHERE id = ?`, blobID).Scan(&localDeleting)
 		require.NoError(t, err)
 		assert.Equal(t, 0, localDeleting, "referenced blob should not be marked for deletion")
+	})
+}
+
+func TestFormatBytes(t *testing.T) {
+	testCases := []struct {
+		input    int64
+		expected string
+	}{
+		{0, "0 B"},
+		{1, "1 B"},
+		{512, "512 B"},
+		{1023, "1023 B"},
+		{1024, "1.0 KB"},
+		{1536, "1.5 KB"},
+		{2048, "2.0 KB"},
+		{1048576, "1.0 MB"},
+		{1572864, "1.5 MB"},
+		{1073741824, "1.0 GB"},
+		{1610612736, "1.5 GB"},
+		{1099511627776, "1.0 TB"},
+		{1125899906842624, "1.0 PB"},
+		{1152921504606846976, "1.0 EB"},
+		{math.MaxInt64, "8.0 EB"},
+	}
+
+	for _, tc := range testCases {
+		t.Run(tc.expected, func(t *testing.T) {
+			result := formatBytes(tc.input)
+			assert.Equal(t, tc.expected, result)
+		})
+	}
+}
+
+func TestRestoreAPIInputValidation(t *testing.T) {
+	db, blobsDir := initTestState(t)
+	mux := newRouter(db, blobsDir)
+	ts := httptest.NewServer(mux)
+	t.Cleanup(func() { ts.Close() })
+
+	client := &http.Client{CheckRedirect: func(req *http.Request, via []*http.Request) error {
+		return http.ErrUseLastResponse
+	}}
+
+	postForm := func(timestamp, path string) *http.Response {
+		form := url.Values{
+			"timestamp": {timestamp},
+			"path":      {path},
+		}
+		resp, err := client.Post(ts.URL+"/api/restore", "application/x-www-form-urlencoded", strings.NewReader(form.Encode()))
+		require.NoError(t, err)
+		return resp
+	}
+
+	t.Run("SQL injection in timestamp is rejected", func(t *testing.T) {
+		resp := postForm("'; DROP TABLE files;--", "")
+		defer resp.Body.Close()
+		assert.Equal(t, http.StatusBadRequest, resp.StatusCode)
+	})
+
+	t.Run("SQL injection in path is handled safely", func(t *testing.T) {
+		// Path with SQL injection attempt - should be handled safely
+		// The path is used in a parameterized query, so injection shouldn't work
+		validTimestamp := time.Now().Add(-time.Minute).UTC().Format(time.RFC3339)
+		resp := postForm(validTimestamp, "/'; DELETE FROM blobs;--")
+		defer resp.Body.Close()
+		// Should succeed (path is sanitized/parameterized)
+		assert.Equal(t, http.StatusSeeOther, resp.StatusCode)
+
+		// Verify database is still intact
+		var count int
+		err := db.QueryRow(`SELECT COUNT(*) FROM files`).Scan(&count)
+		require.NoError(t, err)
+	})
+
+	t.Run("Extremely long timestamp is rejected", func(t *testing.T) {
+		resp := postForm(strings.Repeat("2024-01-01T00:00:00Z", 100), "")
+		defer resp.Body.Close()
+		assert.Equal(t, http.StatusBadRequest, resp.StatusCode)
+	})
+
+	t.Run("Negative year is rejected", func(t *testing.T) {
+		resp := postForm("-9999-01-01T00:00:00Z", "")
+		defer resp.Body.Close()
+		assert.Equal(t, http.StatusBadRequest, resp.StatusCode)
+	})
+
+	t.Run("Far future date is rejected", func(t *testing.T) {
+		resp := postForm("9999-01-01T00:00:00Z", "")
+		defer resp.Body.Close()
+		assert.Equal(t, http.StatusBadRequest, resp.StatusCode)
+	})
+
+	t.Run("Unix epoch is valid but beyond retention", func(t *testing.T) {
+		resp := postForm("1970-01-01T00:00:00Z", "")
+		defer resp.Body.Close()
+		assert.Equal(t, http.StatusBadRequest, resp.StatusCode)
+		body, _ := io.ReadAll(resp.Body)
+		assert.Contains(t, string(body), "retention")
 	})
 }
