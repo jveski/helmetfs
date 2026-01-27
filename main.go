@@ -44,13 +44,13 @@ const (
 
 var historicalDownloadSem chan struct{}
 
-//go:embed status.html
+//go:embed assets/status.html
 var statusHTML string
 
-//go:embed browse.html
+//go:embed assets/browse.html
 var browseHTML string
 
-//go:embed schema.sql
+//go:embed assets/schema.sql
 var schema string
 
 var (
