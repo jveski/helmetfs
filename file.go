@@ -224,34 +224,25 @@ func (f *file) Close() error {
 	if f.writeFile == nil {
 		if f.created {
 			now := time.Now().Unix()
-			tx, err := f.db.Begin()
+
+			// Insert new file version, but fail if a non-deleted directory exists at this path (TOCTOU protection)
+			// Uses a subquery to atomically check for conflicting directories and calculate the next version
+			result, err := f.db.Exec(`
+				INSERT INTO files (created_at, version, path, mode, mod_time, is_dir)
+				SELECT ?, (SELECT COALESCE(MAX(version), 0) + 1 FROM files WHERE path = ?), ?, ?, ?, 0
+				WHERE NOT EXISTS (
+					SELECT 1 FROM files
+					WHERE path = ?
+					  AND deleted = 0
+					  AND is_dir = 1
+					  AND version = (SELECT MAX(version) FROM files WHERE path = ?)
+				)`, now, f.path, f.path, f.perm, now, f.path, f.path)
 			if err != nil {
 				return err
 			}
-			defer tx.Rollback()
-
-			// Re-check that no non-deleted directory exists at this path (TOCTOU protection)
-			var existingIsDir bool
-			var existingVersion int
-			var existingDeleted bool
-			err = tx.QueryRow(`SELECT is_dir, version, deleted FROM files WHERE path = ? ORDER BY version DESC LIMIT 1`, f.path).Scan(&existingIsDir, &existingVersion, &existingDeleted)
-			if err == nil && !existingDeleted && existingIsDir {
+			if n, _ := result.RowsAffected(); n == 0 {
 				return os.ErrExist // Directory exists at this path
 			}
-			if err != nil && err != sql.ErrNoRows {
-				return err
-			}
-
-			version := 1
-			if err == nil {
-				version = existingVersion + 1
-			}
-
-			_, err = tx.Exec(`INSERT INTO files (created_at, version, path, mode, mod_time, is_dir) VALUES (?, ?, ?, ?, ?, 0)`, now, version, f.path, f.perm, now)
-			if err != nil {
-				return err
-			}
-			return tx.Commit()
 		}
 		return nil
 	}
@@ -311,27 +302,24 @@ func (f *file) Close() error {
 		return err
 	}
 
-	// Re-check that no non-deleted directory exists at this path (TOCTOU protection)
-	var existingIsDir bool
-	var existingVersion int
-	var existingDeleted bool
-	err = tx.QueryRow(`SELECT is_dir, version, deleted FROM files WHERE path = ? ORDER BY version DESC LIMIT 1`, f.path).Scan(&existingIsDir, &existingVersion, &existingDeleted)
-	if err == nil && !existingDeleted && existingIsDir {
-		os.Remove(blobPath)
-		return os.ErrExist // Directory exists at this path
-	}
-	if err != nil && err != sql.ErrNoRows {
-		return err
-	}
-
-	version := 1
-	if err == nil {
-		version = existingVersion + 1
-	}
-
-	_, err = tx.Exec(`INSERT INTO files (created_at, version, path, mode, mod_time, is_dir, blob_id) VALUES (?, ?, ?, ?, ?, 0, ?)`, now, version, f.path, f.perm, now, useBlobID)
+	// Insert new file version, but fail if a non-deleted directory exists at this path (TOCTOU protection)
+	// Uses a subquery to atomically check for conflicting directories and calculate the next version
+	result, err := tx.Exec(`
+		INSERT INTO files (created_at, version, path, mode, mod_time, is_dir, blob_id)
+		SELECT ?, (SELECT COALESCE(MAX(version), 0) + 1 FROM files WHERE path = ?), ?, ?, ?, 0, ?
+		WHERE NOT EXISTS (
+			SELECT 1 FROM files
+			WHERE path = ?
+			  AND deleted = 0
+			  AND is_dir = 1
+			  AND version = (SELECT MAX(version) FROM files WHERE path = ?)
+		)`, now, f.path, f.path, f.perm, now, useBlobID, f.path, f.path)
 	if err != nil {
 		return err
+	}
+	if n, _ := result.RowsAffected(); n == 0 {
+		os.Remove(blobPath)
+		return os.ErrExist // Directory exists at this path
 	}
 
 	return tx.Commit()
