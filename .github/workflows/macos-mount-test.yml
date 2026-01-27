@@ -81,8 +81,117 @@ jobs:
 
           echo "All CRUD tests passed!"
 
+      - name: Large directory upload test
+        run: |
+          MOUNT=/tmp/helmetfs-mount
+          TESTDIR="$MOUNT/bulk-test"
+          SRCDIR="/tmp/bulk-source"
+          FILE_COUNT=200
+          FILE_SIZE_KB=512  # ~0.5MB per file
+
+          echo "Creating source directory with $FILE_COUNT files of ${FILE_SIZE_KB}KB each..."
+          mkdir -p "$SRCDIR"
+          for i in $(seq 1 $FILE_COUNT); do
+            dd if=/dev/urandom of="$SRCDIR/file_$(printf '%03d' $i).bin" bs=1024 count=$FILE_SIZE_KB 2>/dev/null
+          done
+
+          echo "Computing source checksums..."
+          (cd "$SRCDIR" && shasum -a 256 *.bin | sort) > /tmp/source_checksums.txt
+
+          echo "Uploading $FILE_COUNT files to WebDAV mount..."
+          UPLOAD_START=$(date +%s)
+          mkdir -p "$TESTDIR"
+          cp -r "$SRCDIR"/* "$TESTDIR/"
+          sync
+          UPLOAD_END=$(date +%s)
+          UPLOAD_DURATION=$((UPLOAD_END - UPLOAD_START))
+          echo "Upload completed in ${UPLOAD_DURATION}s"
+
+          # Verify file count
+          UPLOADED_COUNT=$(ls -1 "$TESTDIR" | wc -l | tr -d ' ')
+          if [ "$UPLOADED_COUNT" -ne "$FILE_COUNT" ]; then
+            echo "FAIL: Expected $FILE_COUNT files, found $UPLOADED_COUNT"
+            exit 1
+          fi
+          echo "PASS: Uploaded $FILE_COUNT files"
+
+          echo "Computing uploaded file checksums..."
+          (cd "$TESTDIR" && shasum -a 256 *.bin | sort) > /tmp/uploaded_checksums.txt
+
+          if ! diff /tmp/source_checksums.txt /tmp/uploaded_checksums.txt; then
+            echo "FAIL: Checksum mismatch after upload"
+            exit 1
+          fi
+          echo "PASS: Upload checksums verified"
+
+      - name: Large directory download test
+        run: |
+          MOUNT=/tmp/helmetfs-mount
+          TESTDIR="$MOUNT/bulk-test"
+          DLDIR="/tmp/bulk-download"
+          FILE_COUNT=200
+
+          echo "Downloading files from WebDAV mount..."
+          mkdir -p "$DLDIR"
+          DOWNLOAD_START=$(date +%s)
+          cp -r "$TESTDIR"/* "$DLDIR/"
+          DOWNLOAD_END=$(date +%s)
+          DOWNLOAD_DURATION=$((DOWNLOAD_END - DOWNLOAD_START))
+          echo "Download completed in ${DOWNLOAD_DURATION}s"
+
+          # Verify file count
+          DOWNLOADED_COUNT=$(ls -1 "$DLDIR" | wc -l | tr -d ' ')
+          if [ "$DOWNLOADED_COUNT" -ne "$FILE_COUNT" ]; then
+            echo "FAIL: Expected $FILE_COUNT files, found $DOWNLOADED_COUNT"
+            exit 1
+          fi
+          echo "PASS: Downloaded $FILE_COUNT files"
+
+          echo "Computing downloaded file checksums..."
+          (cd "$DLDIR" && shasum -a 256 *.bin | sort) > /tmp/downloaded_checksums.txt
+
+          if ! diff /tmp/source_checksums.txt /tmp/downloaded_checksums.txt; then
+            echo "FAIL: Checksum mismatch after download"
+            exit 1
+          fi
+          echo "PASS: Download checksums verified"
+
+          echo "Cleaning up test directory from mount..."
+          rm -r "$TESTDIR"
+          [ ! -d "$TESTDIR" ] || { echo "FAIL: Bulk test directory not deleted"; exit 1; }
+          echo "PASS: Bulk test directory cleaned up"
+
+          echo "Large directory upload/download test passed!"
+
+      - name: Unmount WebDAV share
+        run: |
+          echo "Unmounting WebDAV share..."
+          if ! diskutil unmount /tmp/helmetfs-mount; then
+            echo "FAIL: diskutil unmount failed"
+            exit 1
+          fi
+          echo "Unmount command succeeded"
+
+          # Verify mount is gone
+          sleep 1
+          if mount | grep -q "/tmp/helmetfs-mount"; then
+            echo "FAIL: Mount still appears in mount table"
+            exit 1
+          fi
+          echo "PASS: Mount no longer in mount table"
+
+          # Verify mount point is not accessible as a mount
+          if [ -d /tmp/helmetfs-mount ] && ls /tmp/helmetfs-mount 2>/dev/null | grep -q .; then
+            echo "FAIL: Mount point still has contents"
+            exit 1
+          fi
+          echo "PASS: Mount point is empty or inaccessible"
+
+          echo "Unmount verification complete!"
+
       - name: Cleanup
         if: always()
         run: |
-          diskutil unmount /tmp/helmetfs-mount || true
+          diskutil unmount /tmp/helmetfs-mount 2>/dev/null || true
           pkill helmetfs || true
+          rm -rf /tmp/bulk-source /tmp/bulk-download /tmp/*_checksums.txt || true
