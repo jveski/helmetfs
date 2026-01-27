@@ -7,6 +7,7 @@ import (
 	"net/http/httptest"
 	"net/url"
 	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 	"time"
@@ -238,6 +239,48 @@ func TestDownloadHistoricalAPI(t *testing.T) {
 		code, body, _ := getDownloadHistorical("/some/path.txt", oldTime)
 		assert.Equal(t, http.StatusBadRequest, code)
 		assert.Contains(t, body, "cannot download beyond retention period")
+	})
+
+	t.Run("streams file from remote storage", func(t *testing.T) {
+		rc, remoteDir := initRcloneTest(t, 1)
+		db2, _ := initTestState(t)
+		server2 := NewServer(db2, blobsDir, rc)
+		ts2 := httptest.NewServer(server2)
+		t.Cleanup(func() { ts2.Close() })
+
+		content := []byte("historical content from remote")
+		blobID := uuid.New().String()
+		now := time.Now().Unix()
+
+		// Create blob marked as remote_written (not local)
+		_, err := db2.Exec(`INSERT INTO blobs (id, creation_time, modified_time, local_written, remote_written, size) VALUES (?, ?, ?, 0, 1, ?)`, blobID, now, now, len(content))
+		require.NoError(t, err)
+
+		// Write blob to the "remote" directory with expected path structure
+		blobDir := filepath.Join(remoteDir, blobID[:2])
+		require.NoError(t, os.MkdirAll(blobDir, 0755))
+		blobPath := filepath.Join(blobDir, blobID[2:])
+		require.NoError(t, os.WriteFile(blobPath, content, 0644))
+
+		// Create file record pointing to the blob
+		t1 := time.Now().Unix() - 100
+		_, err = db2.Exec(`INSERT INTO files (created_at, version, path, mode, mod_time, is_dir, deleted, blob_id) VALUES (?, 1, '/remote-file.txt', 0644, ?, 0, 0, ?)`, t1, t1, blobID)
+		require.NoError(t, err)
+
+		// Download historical file
+		downloadTime := time.Unix(t1+10, 0).UTC().Format(time.RFC3339)
+		u := ts2.URL + "/api/download-historical?path=" + url.QueryEscape("/remote-file.txt") + "&at=" + url.QueryEscape(downloadTime)
+		resp, err := http.Get(u)
+		require.NoError(t, err)
+		defer resp.Body.Close()
+
+		assert.Equal(t, http.StatusOK, resp.StatusCode)
+		assert.Equal(t, "application/octet-stream", resp.Header.Get("Content-Type"))
+		assert.Contains(t, resp.Header.Get("Content-Disposition"), "remote-file.txt")
+
+		body, err := io.ReadAll(resp.Body)
+		require.NoError(t, err)
+		assert.Equal(t, string(content), string(body))
 	})
 }
 

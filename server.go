@@ -197,23 +197,21 @@ func (s *Server) handleDownloadHistorical(w http.ResponseWriter, r *http.Request
 	}
 
 	// Stream from remote storage
-	if remoteWritten && s.rclone != nil {
-		w.Header().Set("Content-Disposition", "attachment; filename=\""+path.Base(filePath)+"\"")
-		w.Header().Set("Content-Type", "application/octet-stream")
-		if size > 0 {
-			w.Header().Set("Content-Length", strconv.FormatInt(size, 10))
-		}
-
-		// Stream without bandwidth limit - historical downloads should be fast
-		// CatBlob handles semaphore acquisition internally
-		if err := s.rclone.CatBlob(r.Context(), blobID, w); err != nil {
-			// Headers already sent, can't send error response
-			slog.Error("failed to stream historical file from remote", "path", filePath, "blob_id", blobID, "error", err)
-		}
+	if !remoteWritten || s.rclone == nil {
+		http.Error(w, "file content not available", http.StatusNotFound)
 		return
 	}
 
-	http.Error(w, "file content not available", http.StatusNotFound)
+	w.Header().Set("Content-Disposition", "attachment; filename=\""+path.Base(filePath)+"\"")
+	w.Header().Set("Content-Type", "application/octet-stream")
+	w.Header().Set("Content-Length", strconv.FormatInt(size, 10))
+
+	// Stream without bandwidth limit - historical downloads should be fast
+	// CatBlob handles semaphore acquisition internally
+	if err := s.rclone.CatBlob(r.Context(), blobID, w); err != nil {
+		// Headers already sent, can't send error response
+		slog.Error("failed to stream historical file from remote", "path", filePath, "blob_id", blobID, "error", err)
+	}
 }
 
 func (s *Server) handleActivityTimeline(w http.ResponseWriter, r *http.Request) {

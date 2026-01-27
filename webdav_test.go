@@ -11,7 +11,7 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
-func TestCRUD(t *testing.T) {
+func TestWebDAVBasics(t *testing.T) {
 	db, blobsDir := initTestState(t)
 	server := NewServer(db, blobsDir, nil)
 	ts := httptest.NewServer(server)
@@ -68,7 +68,7 @@ func TestCRUD(t *testing.T) {
 	assert.Equal(t, http.StatusNotFound, resp.StatusCode)
 }
 
-func TestDeleteDirectoryWithFile(t *testing.T) {
+func TestWebDAVDeleteDirectoryWithFile(t *testing.T) {
 	db, blobsDir := initTestState(t)
 	server := NewServer(db, blobsDir, nil)
 	ts := httptest.NewServer(server)
