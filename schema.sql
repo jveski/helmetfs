@@ -59,10 +59,12 @@ BEGIN
 	AND local_deleting = 0
 	AND remote_written = 1
 	AND id NOT IN (
-		SELECT blob_id FROM files f1
-		WHERE blob_id IS NOT NULL
-		AND f1.version = (SELECT MAX(f2.version) FROM files f2 WHERE f2.path = f1.path)
-		AND f1.deleted = 0
+		SELECT blob_id FROM (
+			SELECT blob_id, deleted, ROW_NUMBER() OVER (PARTITION BY path ORDER BY version DESC) as rn
+			FROM files
+			WHERE blob_id IS NOT NULL
+		)
+		WHERE rn = 1 AND deleted = 0
 	);
 END;
 

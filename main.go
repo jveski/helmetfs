@@ -84,9 +84,6 @@ func run() error {
 		return err
 	}
 	defer db.Close()
-	db.SetMaxOpenConns(1)
-	db.SetMaxIdleConns(1)
-	db.SetConnMaxLifetime(0)
 
 	_, err = db.Exec(schema)
 	if err != nil {
@@ -534,27 +531,31 @@ func queryDirectoryEntries(ctx context.Context, db *sql.DB, prefix string, atUni
 	if atUnix > 0 {
 		// Historical query - shows files as they existed at the timestamp
 		return db.QueryContext(ctx, `
+			WITH latest AS (
+				SELECT *, ROW_NUMBER() OVER (PARTITION BY path ORDER BY version DESC) as rn
+				FROM files
+				WHERE path GLOB ? AND path NOT GLOB ? AND created_at <= ?
+			)
 			SELECT f.path, COALESCE(b.size, 0), f.mod_time, f.is_dir,
 			       COALESCE(b.remote_written, 0), f.deleted, COALESCE(b.local_written, 0)
-			FROM files f
+			FROM latest f
 			LEFT JOIN blobs b ON f.blob_id = b.id
-			WHERE f.path GLOB ? AND f.path NOT GLOB ?
-			AND f.created_at <= ?
-			AND f.version = (
-				SELECT MAX(f2.version) FROM files f2
-				WHERE f2.path = f.path AND f2.created_at <= ?
-			)
-			ORDER BY f.is_dir DESC, f.path`, prefix+"*", prefix+"*/*", atUnix, atUnix)
+			WHERE f.rn = 1
+			ORDER BY f.is_dir DESC, f.path`, prefix+"*", prefix+"*/*", atUnix)
 	}
 	// Current query - shows latest version of non-deleted files
 	// Returns constant 0 for deleted and 1 for local_written to match historical query columns
 	return db.QueryContext(ctx, `
+		WITH latest AS (
+			SELECT *, ROW_NUMBER() OVER (PARTITION BY path ORDER BY version DESC) as rn
+			FROM files
+			WHERE path GLOB ? AND path NOT GLOB ?
+		)
 		SELECT f.path, COALESCE(b.size, 0), f.mod_time, f.is_dir,
 		       COALESCE(b.remote_written, 0), 0, 1
-		FROM files f
+		FROM latest f
 		LEFT JOIN blobs b ON f.blob_id = b.id
-		WHERE f.path GLOB ? AND f.path NOT GLOB ? AND f.deleted = 0
-		AND f.version = (SELECT MAX(f2.version) FROM files f2 WHERE f2.path = f.path)
+		WHERE f.rn = 1 AND f.deleted = 0
 		ORDER BY f.is_dir DESC, f.path`, prefix+"*", prefix+"*/*")
 }
 
@@ -569,7 +570,12 @@ func handleStatus(w http.ResponseWriter, r *http.Request, db *sql.DB) {
 	db.QueryRowContext(r.Context(), `SELECT COUNT(*) FROM blobs WHERE local_written = 1 AND remote_written = 1 AND local_deleting = 0 AND checksum IS NOT NULL AND (last_integrity_check IS NULL OR last_integrity_check < ?)`, cutoff).Scan(&overdueIntegrity)
 
 	var activeFiles int64
-	db.QueryRowContext(r.Context(), `SELECT COUNT(*) FROM files f1 WHERE f1.version = (SELECT MAX(f2.version) FROM files f2 WHERE f2.path = f1.path) AND f1.deleted = 0`).Scan(&activeFiles)
+	db.QueryRowContext(r.Context(), `
+		WITH latest AS (
+			SELECT deleted, ROW_NUMBER() OVER (PARTITION BY path ORDER BY version DESC) as rn
+			FROM files
+		)
+		SELECT COUNT(*) FROM latest WHERE rn = 1 AND deleted = 0`).Scan(&activeFiles)
 
 	var localSpace, remoteSpace int64
 	db.QueryRowContext(r.Context(), `SELECT COALESCE(SUM(size), 0) FROM blobs WHERE local_written = 1 AND local_deleted = 0`).Scan(&localSpace)

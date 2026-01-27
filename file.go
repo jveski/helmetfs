@@ -190,10 +190,12 @@ func (f *file) Seek(offset int64, whence int) (int64, error) {
 			}
 			var count int
 			err := f.db.QueryRow(`
-				SELECT COUNT(*)
-				FROM files f
-				WHERE f.path GLOB ? AND f.path NOT GLOB ? AND f.deleted = 0
-				AND f.version = (SELECT MAX(f2.version) FROM files f2 WHERE f2.path = f.path)`,
+				WITH latest AS (
+					SELECT *, ROW_NUMBER() OVER (PARTITION BY path ORDER BY version DESC) as rn
+					FROM files
+					WHERE path GLOB ? AND path NOT GLOB ?
+				)
+				SELECT COUNT(*) FROM latest WHERE rn = 1 AND deleted = 0`,
 				prefix+"*", prefix+"*/*").Scan(&count)
 			if err != nil {
 				return 0, err
@@ -346,11 +348,15 @@ func (f *file) Readdir(count int) ([]os.FileInfo, error) {
 	}
 
 	query := `
+		WITH latest AS (
+			SELECT *, ROW_NUMBER() OVER (PARTITION BY path ORDER BY version DESC) as rn
+			FROM files
+			WHERE path GLOB ? AND path NOT GLOB ?
+		)
 		SELECT f.path, COALESCE(b.size, 0), f.mode, f.mod_time, f.is_dir
-		FROM files f
+		FROM latest f
 		LEFT JOIN blobs b ON f.blob_id = b.id
-		WHERE f.path GLOB ? AND f.path NOT GLOB ? AND f.deleted = 0
-		AND f.version = (SELECT MAX(f2.version) FROM files f2 WHERE f2.path = f.path)
+		WHERE f.rn = 1 AND f.deleted = 0
 		ORDER BY f.path`
 
 	var rows *sql.Rows
