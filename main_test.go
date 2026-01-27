@@ -76,8 +76,8 @@ func TestDatabaseBackupRestore(t *testing.T) {
 
 func TestStatusPage(t *testing.T) {
 	db, blobsDir := initTestState(t)
-	mux := newRouter(db, blobsDir)
-	ts := httptest.NewServer(mux)
+	server := NewServer(db, blobsDir)
+	ts := httptest.NewServer(server)
 	t.Cleanup(func() { ts.Close() })
 
 	getStatus := func() (int, string) {
@@ -586,8 +586,8 @@ func TestFormatBytes(t *testing.T) {
 
 func TestHistoricalBrowse(t *testing.T) {
 	db, blobsDir := initTestState(t)
-	mux := newRouter(db, blobsDir)
-	ts := httptest.NewServer(mux)
+	server := NewServer(db, blobsDir)
+	ts := httptest.NewServer(server)
 	t.Cleanup(func() { ts.Close() })
 
 	getBrowse := func(path, timestamp string) (int, string) {
@@ -670,8 +670,8 @@ func TestHistoricalBrowse(t *testing.T) {
 
 func TestRestoreFileAPI(t *testing.T) {
 	db, blobsDir := initTestState(t)
-	mux := newRouter(db, blobsDir)
-	ts := httptest.NewServer(mux)
+	server := NewServer(db, blobsDir)
+	ts := httptest.NewServer(server)
 	t.Cleanup(func() { ts.Close() })
 
 	postRestoreFile := func(timestamp, path string) (int, string) {
@@ -733,8 +733,8 @@ func TestRestoreFileAPI(t *testing.T) {
 
 func TestDownloadHistoricalAPI(t *testing.T) {
 	db, blobsDir := initTestState(t)
-	mux := newRouter(db, blobsDir)
-	ts := httptest.NewServer(mux)
+	server := NewServer(db, blobsDir)
+	ts := httptest.NewServer(server)
 	t.Cleanup(func() { ts.Close() })
 
 	getDownloadHistorical := func(path, timestamp string) (int, string, http.Header) {

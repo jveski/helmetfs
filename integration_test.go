@@ -13,8 +13,8 @@ import (
 
 func TestCRUD(t *testing.T) {
 	db, blobsDir := initTestState(t)
-	mux := newRouter(db, blobsDir)
-	ts := httptest.NewServer(mux)
+	server := NewServer(db, blobsDir)
+	ts := httptest.NewServer(server)
 	t.Cleanup(func() { ts.Close() })
 
 	client := &http.Client{}
@@ -70,8 +70,8 @@ func TestCRUD(t *testing.T) {
 
 func TestDeleteDirectoryWithFile(t *testing.T) {
 	db, blobsDir := initTestState(t)
-	mux := newRouter(db, blobsDir)
-	ts := httptest.NewServer(mux)
+	server := NewServer(db, blobsDir)
+	ts := httptest.NewServer(server)
 	t.Cleanup(func() { ts.Close() })
 
 	client := &http.Client{}
@@ -126,8 +126,8 @@ func TestDeleteDirectoryWithFile(t *testing.T) {
 
 func TestWebDAVCopy(t *testing.T) {
 	db, blobsDir := initTestState(t)
-	mux := newRouter(db, blobsDir)
-	ts := httptest.NewServer(mux)
+	server := NewServer(db, blobsDir)
+	ts := httptest.NewServer(server)
 	t.Cleanup(func() { ts.Close() })
 
 	client := &http.Client{}
@@ -170,8 +170,8 @@ func TestWebDAVCopy(t *testing.T) {
 
 func TestWebDAVMove(t *testing.T) {
 	db, blobsDir := initTestState(t)
-	mux := newRouter(db, blobsDir)
-	ts := httptest.NewServer(mux)
+	server := NewServer(db, blobsDir)
+	ts := httptest.NewServer(server)
 	t.Cleanup(func() { ts.Close() })
 
 	client := &http.Client{}
@@ -211,8 +211,8 @@ func TestWebDAVMove(t *testing.T) {
 
 func TestWebDAVCopyDirectory(t *testing.T) {
 	db, blobsDir := initTestState(t)
-	mux := newRouter(db, blobsDir)
-	ts := httptest.NewServer(mux)
+	server := NewServer(db, blobsDir)
+	ts := httptest.NewServer(server)
 	t.Cleanup(func() { ts.Close() })
 
 	client := &http.Client{}
@@ -263,8 +263,8 @@ func TestWebDAVCopyDirectory(t *testing.T) {
 
 func TestWebDAVMoveDirectory(t *testing.T) {
 	db, blobsDir := initTestState(t)
-	mux := newRouter(db, blobsDir)
-	ts := httptest.NewServer(mux)
+	server := NewServer(db, blobsDir)
+	ts := httptest.NewServer(server)
 	t.Cleanup(func() { ts.Close() })
 
 	client := &http.Client{}
@@ -312,8 +312,8 @@ func TestWebDAVMoveDirectory(t *testing.T) {
 
 func TestWebDAVPropfind(t *testing.T) {
 	db, blobsDir := initTestState(t)
-	mux := newRouter(db, blobsDir)
-	ts := httptest.NewServer(mux)
+	server := NewServer(db, blobsDir)
+	ts := httptest.NewServer(server)
 	t.Cleanup(func() { ts.Close() })
 
 	client := &http.Client{}
@@ -364,8 +364,8 @@ func TestWebDAVPropfind(t *testing.T) {
 
 func TestWebDAVCopyOverwrite(t *testing.T) {
 	db, blobsDir := initTestState(t)
-	mux := newRouter(db, blobsDir)
-	ts := httptest.NewServer(mux)
+	server := NewServer(db, blobsDir)
+	ts := httptest.NewServer(server)
 	t.Cleanup(func() { ts.Close() })
 
 	client := &http.Client{}
@@ -404,8 +404,8 @@ func TestWebDAVCopyOverwrite(t *testing.T) {
 
 func TestWebDAVMoveNoOverwrite(t *testing.T) {
 	db, blobsDir := initTestState(t)
-	mux := newRouter(db, blobsDir)
-	ts := httptest.NewServer(mux)
+	server := NewServer(db, blobsDir)
+	ts := httptest.NewServer(server)
 	t.Cleanup(func() { ts.Close() })
 
 	client := &http.Client{}
@@ -450,8 +450,8 @@ func TestWebDAVMoveNoOverwrite(t *testing.T) {
 
 func TestWebDAVCopyToNonexistentDirectory(t *testing.T) {
 	db, blobsDir := initTestState(t)
-	mux := newRouter(db, blobsDir)
-	ts := httptest.NewServer(mux)
+	server := NewServer(db, blobsDir)
+	ts := httptest.NewServer(server)
 	t.Cleanup(func() { ts.Close() })
 
 	client := &http.Client{}
