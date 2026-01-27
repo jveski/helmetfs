@@ -17,48 +17,38 @@ type FS struct {
 
 func (fs *FS) Mkdir(ctx context.Context, name string, perm os.FileMode) error {
 	name = path.Clean(name)
-	tx, err := fs.db.BeginTx(ctx, nil)
+	parent := path.Dir(name)
+	now := time.Now().Unix()
+
+	res, err := fs.db.ExecContext(ctx, `
+		INSERT INTO files (created_at, version, path, mode, mod_time, is_dir)
+		SELECT ?, COALESCE((SELECT version FROM files WHERE path = ? ORDER BY version DESC LIMIT 1), 0) + 1, ?, ?, ?, 1
+		WHERE (? IN ('/', '.') OR (SELECT is_dir AND NOT deleted FROM files WHERE path = ? ORDER BY version DESC LIMIT 1))
+		  AND NOT COALESCE((SELECT NOT deleted FROM files WHERE path = ? ORDER BY version DESC LIMIT 1), 0)`,
+		now, name, name, perm, now, parent, parent, name)
 	if err != nil {
 		return err
 	}
-	defer tx.Rollback()
+	n, err := res.RowsAffected()
+	if err != nil {
+		return err
+	}
+	if n != 0 {
+		return nil
+	}
 
-	// Make sure the parent directory exists
-	parent := path.Dir(name)
+	// Determine which error: parent missing vs not-a-dir vs already exists
 	if parent != "/" && parent != "." {
-		var parentIsDir bool
-		var parentDeleted bool
-		err := tx.QueryRowContext(ctx, `SELECT is_dir, deleted FROM files WHERE path = ? ORDER BY version DESC LIMIT 1`, parent).Scan(&parentIsDir, &parentDeleted)
+		var parentIsDir, parentDeleted bool
+		err := fs.db.QueryRowContext(ctx, `SELECT is_dir, deleted FROM files WHERE path = ? ORDER BY version DESC LIMIT 1`, parent).Scan(&parentIsDir, &parentDeleted)
 		if err == sql.ErrNoRows || parentDeleted {
 			return os.ErrNotExist
-		}
-		if err != nil {
-			return err
 		}
 		if !parentIsDir {
 			return os.ErrInvalid
 		}
 	}
-
-	// Check for existing entry
-	var version int
-	var deleted bool
-	err = tx.QueryRowContext(ctx, `SELECT version, deleted FROM files WHERE path = ? ORDER BY version DESC LIMIT 1`, name).Scan(&version, &deleted)
-	if err != nil && err != sql.ErrNoRows {
-		return err
-	}
-	if err == nil && !deleted {
-		return os.ErrExist
-	}
-
-	// Make it
-	now := time.Now().Unix()
-	_, err = tx.ExecContext(ctx, `INSERT INTO files (created_at, version, path, mode, mod_time, is_dir) VALUES (?, ?, ?, ?, ?, 1)`, now, version+1, name, perm, now)
-	if err != nil {
-		return err
-	}
-
-	return tx.Commit()
+	return os.ErrExist
 }
 
 func (fs *FS) RemoveAll(ctx context.Context, name string) error {
