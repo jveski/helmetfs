@@ -528,35 +528,23 @@ func handleBrowse(w http.ResponseWriter, r *http.Request, db *sql.DB) {
 }
 
 func queryDirectoryEntries(ctx context.Context, db *sql.DB, prefix string, atUnix int64) (*sql.Rows, error) {
-	if atUnix > 0 {
-		// Historical query - shows files as they existed at the timestamp
-		return db.QueryContext(ctx, `
-			WITH latest AS (
-				SELECT *, ROW_NUMBER() OVER (PARTITION BY path ORDER BY version DESC) as rn
-				FROM files
-				WHERE path GLOB ? AND path NOT GLOB ? AND created_at <= ?
-			)
-			SELECT f.path, COALESCE(b.size, 0), f.mod_time, f.is_dir,
-			       COALESCE(b.remote_written, 0), f.deleted, COALESCE(b.local_written, 0)
-			FROM latest f
-			LEFT JOIN blobs b ON f.blob_id = b.id
-			WHERE f.rn = 1
-			ORDER BY f.is_dir DESC, f.path`, prefix+"*", prefix+"*/*", atUnix)
-	}
-	// Current query - shows latest version of non-deleted files
-	// Returns constant 0 for deleted and 1 for local_written to match historical query columns
+	// When atUnix > 0 (historical): show files as they existed at that timestamp, including deleted
+	// When atUnix = 0 (current): show latest version of non-deleted files only
 	return db.QueryContext(ctx, `
 		WITH latest AS (
 			SELECT *, ROW_NUMBER() OVER (PARTITION BY path ORDER BY version DESC) as rn
 			FROM files
-			WHERE path GLOB ? AND path NOT GLOB ?
+			WHERE path GLOB ?1 AND path NOT GLOB ?2
+			  AND (?3 = 0 OR created_at <= ?3)
 		)
 		SELECT f.path, COALESCE(b.size, 0), f.mod_time, f.is_dir,
-		       COALESCE(b.remote_written, 0), 0, 1
+		       COALESCE(b.remote_written, 0),
+		       CASE WHEN ?3 > 0 THEN f.deleted ELSE 0 END,
+		       CASE WHEN ?3 > 0 THEN COALESCE(b.local_written, 0) ELSE 1 END
 		FROM latest f
 		LEFT JOIN blobs b ON f.blob_id = b.id
-		WHERE f.rn = 1 AND f.deleted = 0
-		ORDER BY f.is_dir DESC, f.path`, prefix+"*", prefix+"*/*")
+		WHERE f.rn = 1 AND (?3 > 0 OR f.deleted = 0)
+		ORDER BY f.is_dir DESC, f.path`, prefix+"*", prefix+"*/*", atUnix)
 }
 
 func handleStatus(w http.ResponseWriter, r *http.Request, db *sql.DB) {
