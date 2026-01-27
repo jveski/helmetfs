@@ -85,7 +85,7 @@ func initTestState(t *testing.T) (*sql.DB, string) {
 	t.Helper()
 	tmpDir := t.TempDir()
 	dbPath := filepath.Join(tmpDir, "test.db")
-	db, err := sql.Open("sqlite3", "file:"+dbPath+"?_journal_mode=WAL&_busy_timeout=15000")
+	db, err := sql.Open("sqlite3", "file:"+dbPath+"?_journal_mode=WAL&_busy_timeout=15000&_txlock=immediate")
 	require.NoError(t, err)
 	t.Cleanup(func() { db.Close() })
 

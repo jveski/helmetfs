@@ -79,7 +79,7 @@ func run() error {
 		return err
 	}
 
-	db, err := sql.Open("sqlite3", "file:"+dbPath+"?_journal_mode=WAL&_busy_timeout=5000")
+	db, err := sql.Open("sqlite3", "file:"+dbPath+"?_journal_mode=WAL&_busy_timeout=5000&_txlock=immediate")
 	if err != nil {
 		return err
 	}

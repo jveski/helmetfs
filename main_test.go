@@ -39,7 +39,7 @@ func TestDatabaseBackupRestore(t *testing.T) {
 	backupPath := filepath.Join(tmpDir, "test.db.backup")
 	remotePath := "testremote:" + remoteDir
 
-	db, err := sql.Open("sqlite3", dbPath)
+	db, err := sql.Open("sqlite3", "file:"+dbPath+"?_txlock=immediate")
 	require.NoError(t, err)
 	_, err = db.Exec(schema)
 	require.NoError(t, err)
@@ -64,7 +64,7 @@ func TestDatabaseBackupRestore(t *testing.T) {
 	_, err = os.Stat(backupPath)
 	require.NoError(t, err)
 
-	restoredDB, err := sql.Open("sqlite3", backupPath)
+	restoredDB, err := sql.Open("sqlite3", "file:"+backupPath+"?_txlock=immediate")
 	require.NoError(t, err)
 	t.Cleanup(func() { restoredDB.Close() })
 
