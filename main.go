@@ -5,6 +5,7 @@ import (
 	"database/sql"
 	_ "embed"
 	"encoding/hex"
+	"errors"
 	"flag"
 	"html/template"
 	"io"
@@ -276,22 +277,19 @@ func restoreDatabase(dbPath, backupPath string, rc *Rclone) error {
 		return nil // db still exists or no remote configured
 	}
 
-	if _, err := os.Stat(backupPath); err != nil {
-		tmpPath := backupPath + ".tmp"
-		slog.Info("local backup missing, attempting to download from remote")
-		if err := rc.CopyFile("meta.db.backup", tmpPath, false); err != nil {
-			return err
-		}
-
-		if _, err := os.Stat(tmpPath); err != nil {
-			slog.Info("database backup is missing - initializing new db")
-			return nil
-		}
-
-		slog.Info("database backup downloaded from remote")
-		return os.Rename(tmpPath, backupPath)
+	slog.Info("local backup missing, attempting to download from remote")
+	tmpPath := backupPath + ".tmp"
+	err := rc.CopyFile("meta.db.backup", tmpPath, false)
+	if errors.Is(err, ErrNotFound) {
+		slog.Info("database backup not found on remote - initializing new db")
+		return nil
 	}
-	return nil
+	if err != nil {
+		return err
+	}
+
+	slog.Info("database backup downloaded from remote")
+	return os.Rename(tmpPath, backupPath)
 }
 
 func runLoop(interval time.Duration, name string, fn func() (bool, error)) {

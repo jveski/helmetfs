@@ -4,11 +4,14 @@ import (
 	"bytes"
 	"context"
 	"database/sql"
+	"errors"
 	"io"
 	"log/slog"
 	"os/exec"
 	"strings"
 )
+
+var ErrNotFound = errors.New("remote file not found")
 
 type Rclone struct {
 	remotePath    string
@@ -116,10 +119,24 @@ func (r *Rclone) CopyFile(src, dst string, toRemote bool) error {
 	var stderr bytes.Buffer
 	cmd.Stderr = &stderr
 	if err := cmd.Run(); err != nil {
-		slog.Error("rclone copyto failed", "src", src, "dst", dst, "error", err, "stderr", stderr.String())
+		stderrStr := stderr.String()
+		slog.Error("rclone copyto failed", "src", src, "dst", dst, "error", err, "stderr", stderrStr)
+		if isNotFoundError(stderrStr) {
+			return ErrNotFound
+		}
 		return err
 	}
 	return nil
+}
+
+// isNotFoundError checks if rclone stderr indicates a file/directory not found error.
+func isNotFoundError(stderr string) bool {
+	lower := strings.ToLower(stderr)
+	return strings.Contains(lower, "not found") ||
+		strings.Contains(lower, "doesn't exist") ||
+		strings.Contains(lower, "does not exist") ||
+		strings.Contains(lower, "no such file") ||
+		strings.Contains(lower, "404")
 }
 
 func (r *Rclone) CatBlob(ctx context.Context, blobID string, w io.Writer) error {
