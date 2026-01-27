@@ -88,74 +88,46 @@ func (fs *FS) RemoveAll(ctx context.Context, name string) error {
 func (fs *FS) Rename(ctx context.Context, oldName, newName string) error {
 	oldName = path.Clean(oldName)
 	newName = path.Clean(newName)
+	oldPrefixLen := len(oldName) + 1 // +1 for the trailing slash
+	now := time.Now().Unix()
+
 	tx, err := fs.db.BeginTx(ctx, nil)
 	if err != nil {
 		return err
 	}
 	defer tx.Rollback()
 
-	now := time.Now().Unix()
-
-	var isDir bool
-	err = tx.QueryRowContext(ctx, `SELECT is_dir FROM files WHERE path = ? AND deleted = 0 ORDER BY version DESC LIMIT 1`, oldName).Scan(&isDir)
-	if err == sql.ErrNoRows {
+	// Create new entries at destination paths (handles both the item and children if directory)
+	res, err := tx.ExecContext(ctx, `
+		INSERT INTO files (created_at, version, path, mode, mod_time, is_dir, blob_id)
+		SELECT ?, version + 1, ? || SUBSTR(path, ?), mode, mod_time, is_dir, blob_id
+		FROM files
+		WHERE deleted = 0
+		  AND (path = ? OR (path GLOB ? AND (SELECT is_dir FROM files WHERE path = ? AND deleted = 0 ORDER BY version DESC LIMIT 1)))
+		GROUP BY path
+		HAVING version = MAX(version)`, now, newName, oldPrefixLen, oldName, oldName+"/*", oldName)
+	if err != nil {
+		return err
+	}
+	n, err := res.RowsAffected()
+	if err != nil {
+		return err
+	}
+	if n == 0 {
 		return os.ErrNotExist
 	}
-	if err != nil {
-		return err
-	}
 
-	// Create new entry at destination path
-	_, err = tx.ExecContext(ctx, `
-		INSERT INTO files (created_at, version, path, mode, mod_time, is_dir, blob_id)
-		SELECT ?, version + 1, ?, mode, mod_time, is_dir, blob_id
-		FROM files
-		WHERE path = ? AND deleted = 0
-		ORDER BY version DESC
-		LIMIT 1`, now, newName, oldName)
-	if err != nil {
-		return err
-	}
-
-	// Mark old path as deleted
+	// Mark old paths as deleted
 	_, err = tx.ExecContext(ctx, `
 		INSERT INTO files (created_at, version, path, mode, mod_time, is_dir, deleted, blob_id)
 		SELECT ?, version + 1, path, mode, mod_time, is_dir, 1, blob_id
 		FROM files
-		WHERE path = ? AND deleted = 0
-		ORDER BY version DESC
-		LIMIT 1`, now, oldName)
+		WHERE deleted = 0
+		  AND (path = ? OR (path GLOB ? AND (SELECT is_dir FROM files WHERE path = ? AND deleted = 0 ORDER BY version DESC LIMIT 1)))
+		GROUP BY path
+		HAVING version = MAX(version)`, now, oldName, oldName+"/*", oldName)
 	if err != nil {
 		return err
-	}
-
-	// If it's a directory, rename all contents in bulk
-	if isDir {
-		oldPrefixLen := len(oldName) + 1 // +1 for the trailing slash
-
-		// Create new entries at renamed paths (newName + suffix for each oldName + suffix)
-		_, err = tx.ExecContext(ctx, `
-			INSERT INTO files (created_at, version, path, mode, mod_time, is_dir, blob_id)
-			SELECT ?, version + 1, ? || SUBSTR(path, ?), mode, mod_time, is_dir, blob_id
-			FROM files
-			WHERE path GLOB ? AND deleted = 0
-			GROUP BY path
-			HAVING version = MAX(version)`, now, newName, oldPrefixLen, oldName+"/*")
-		if err != nil {
-			return err
-		}
-
-		// Mark old paths as deleted
-		_, err = tx.ExecContext(ctx, `
-			INSERT INTO files (created_at, version, path, mode, mod_time, is_dir, deleted, blob_id)
-			SELECT ?, version + 1, path, mode, mod_time, is_dir, 1, blob_id
-			FROM files
-			WHERE path GLOB ? AND deleted = 0
-			GROUP BY path
-			HAVING version = MAX(version)`, now, oldName+"/*")
-		if err != nil {
-			return err
-		}
 	}
 
 	return tx.Commit()
