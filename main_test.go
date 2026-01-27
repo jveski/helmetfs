@@ -430,7 +430,7 @@ func TestBlobUnreferencedTrigger(t *testing.T) {
 
 	t.Run("marks blob for deletion when file is overwritten", func(t *testing.T) {
 		// Create first file version with blob
-		f1, err := openFile(ctx, db, blobsDir, "/trigger-test.txt", os.O_CREATE|os.O_WRONLY, 0644)
+		f1, err := NewFile(ctx, db, blobsDir, "/trigger-test.txt", os.O_CREATE|os.O_WRONLY, 0644)
 		require.NoError(t, err)
 		_, err = f1.Write([]byte("first content"))
 		require.NoError(t, err)
@@ -442,7 +442,7 @@ func TestBlobUnreferencedTrigger(t *testing.T) {
 		require.NoError(t, err)
 
 		// Overwrite with different content
-		f2, err := openFile(ctx, db, blobsDir, "/trigger-test.txt", os.O_WRONLY|os.O_TRUNC, 0644)
+		f2, err := NewFile(ctx, db, blobsDir, "/trigger-test.txt", os.O_WRONLY|os.O_TRUNC, 0644)
 		require.NoError(t, err)
 		_, err = f2.Write([]byte("second content"))
 		require.NoError(t, err)
@@ -457,7 +457,7 @@ func TestBlobUnreferencedTrigger(t *testing.T) {
 
 	t.Run("does not mark blob if still referenced", func(t *testing.T) {
 		// Create a file
-		f1, err := openFile(ctx, db, blobsDir, "/still-ref.txt", os.O_CREATE|os.O_WRONLY, 0644)
+		f1, err := NewFile(ctx, db, blobsDir, "/still-ref.txt", os.O_CREATE|os.O_WRONLY, 0644)
 		require.NoError(t, err)
 		_, err = f1.Write([]byte("still referenced content"))
 		require.NoError(t, err)
@@ -469,7 +469,7 @@ func TestBlobUnreferencedTrigger(t *testing.T) {
 		require.NoError(t, err)
 
 		// Create a different file (should not affect our blob)
-		f2, err := openFile(ctx, db, blobsDir, "/other.txt", os.O_CREATE|os.O_WRONLY, 0644)
+		f2, err := NewFile(ctx, db, blobsDir, "/other.txt", os.O_CREATE|os.O_WRONLY, 0644)
 		require.NoError(t, err)
 		_, err = f2.Write([]byte("other content"))
 		require.NoError(t, err)

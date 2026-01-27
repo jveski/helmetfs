@@ -18,21 +18,21 @@ func TestFile(t *testing.T) {
 	ctx := t.Context()
 
 	// Create and write to files
-	f, err := openFile(ctx, db, blobsDir, "/aaa.txt", os.O_CREATE|os.O_WRONLY, 0644)
+	f, err := NewFile(ctx, db, blobsDir, "/aaa.txt", os.O_CREATE|os.O_WRONLY, 0644)
 	require.NoError(t, err)
 	n, err := f.Write([]byte("hello world"))
 	require.NoError(t, err)
 	assert.Equal(t, 11, n)
 	require.NoError(t, f.Close())
 
-	f, err = openFile(ctx, db, blobsDir, "/bbb.txt", os.O_CREATE|os.O_WRONLY, 0644)
+	f, err = NewFile(ctx, db, blobsDir, "/bbb.txt", os.O_CREATE|os.O_WRONLY, 0644)
 	require.NoError(t, err)
 	_, err = f.Write([]byte("content b"))
 	require.NoError(t, err)
 	require.NoError(t, f.Close())
 
 	// Read and seek within a file
-	f, err = openFile(ctx, db, blobsDir, "/aaa.txt", os.O_RDONLY, 0)
+	f, err = NewFile(ctx, db, blobsDir, "/aaa.txt", os.O_RDONLY, 0)
 	require.NoError(t, err)
 
 	buf := make([]byte, 5)
@@ -53,7 +53,7 @@ func TestFile(t *testing.T) {
 	require.NoError(t, f.Close())
 
 	// Readdir with pagination
-	root := &file{db: db, path: "/", isDir: true}
+	root := &File{db: db, path: "/", isDir: true}
 
 	entries, err := root.Readdir(1)
 	require.NoError(t, err)
@@ -86,11 +86,11 @@ func TestFile(t *testing.T) {
 		"/subdir", 0755)
 	require.NoError(t, err)
 
-	f, err = openFile(ctx, db, blobsDir, "/subdir/child1.txt", os.O_CREATE|os.O_WRONLY, 0644)
+	f, err = NewFile(ctx, db, blobsDir, "/subdir/child1.txt", os.O_CREATE|os.O_WRONLY, 0644)
 	require.NoError(t, err)
 	require.NoError(t, f.Close())
 
-	f, err = openFile(ctx, db, blobsDir, "/subdir/child2.txt", os.O_CREATE|os.O_WRONLY, 0644)
+	f, err = NewFile(ctx, db, blobsDir, "/subdir/child2.txt", os.O_CREATE|os.O_WRONLY, 0644)
 	require.NoError(t, err)
 	require.NoError(t, f.Close())
 
@@ -99,11 +99,11 @@ func TestFile(t *testing.T) {
 		"/subdir/nested", 0755)
 	require.NoError(t, err)
 
-	f, err = openFile(ctx, db, blobsDir, "/subdir/nested/deep.txt", os.O_CREATE|os.O_WRONLY, 0644)
+	f, err = NewFile(ctx, db, blobsDir, "/subdir/nested/deep.txt", os.O_CREATE|os.O_WRONLY, 0644)
 	require.NoError(t, err)
 	require.NoError(t, f.Close())
 
-	subdir := &file{db: db, path: "/subdir", isDir: true}
+	subdir := &File{db: db, path: "/subdir", isDir: true}
 	entries, err = subdir.Readdir(-1)
 	require.NoError(t, err)
 	require.Len(t, entries, 3) // child1.txt, child2.txt, nested (but not nested/deep.txt)
@@ -124,14 +124,14 @@ func TestFileSeek(t *testing.T) {
 
 	// Create a file with known content
 	content := []byte("0123456789")
-	f, err := openFile(ctx, db, blobsDir, "/seek.txt", os.O_CREATE|os.O_WRONLY, 0644)
+	f, err := NewFile(ctx, db, blobsDir, "/seek.txt", os.O_CREATE|os.O_WRONLY, 0644)
 	require.NoError(t, err)
 	_, err = f.Write(content)
 	require.NoError(t, err)
 	require.NoError(t, f.Close())
 
 	t.Run("file SeekStart", func(t *testing.T) {
-		f, err := openFile(ctx, db, blobsDir, "/seek.txt", os.O_RDONLY, 0)
+		f, err := NewFile(ctx, db, blobsDir, "/seek.txt", os.O_RDONLY, 0)
 		require.NoError(t, err)
 		defer f.Close()
 
@@ -147,7 +147,7 @@ func TestFileSeek(t *testing.T) {
 	})
 
 	t.Run("file SeekCurrent", func(t *testing.T) {
-		f, err := openFile(ctx, db, blobsDir, "/seek.txt", os.O_RDONLY, 0)
+		f, err := NewFile(ctx, db, blobsDir, "/seek.txt", os.O_RDONLY, 0)
 		require.NoError(t, err)
 		defer f.Close()
 
@@ -181,7 +181,7 @@ func TestFileSeek(t *testing.T) {
 	})
 
 	t.Run("file SeekEnd", func(t *testing.T) {
-		f, err := openFile(ctx, db, blobsDir, "/seek.txt", os.O_RDONLY, 0)
+		f, err := NewFile(ctx, db, blobsDir, "/seek.txt", os.O_RDONLY, 0)
 		require.NoError(t, err)
 		defer f.Close()
 
@@ -205,12 +205,12 @@ func TestFileSeek(t *testing.T) {
 	t.Run("dir SeekStart", func(t *testing.T) {
 		// Create directory entries
 		for _, name := range []string{"a.txt", "b.txt", "c.txt", "d.txt"} {
-			f, err := openFile(ctx, db, blobsDir, "/"+name, os.O_CREATE|os.O_WRONLY, 0644)
+			f, err := NewFile(ctx, db, blobsDir, "/"+name, os.O_CREATE|os.O_WRONLY, 0644)
 			require.NoError(t, err)
 			require.NoError(t, f.Close())
 		}
 
-		dir := &file{db: db, path: "/", isDir: true}
+		dir := &File{db: db, path: "/", isDir: true}
 
 		// Read first 2 entries
 		entries, err := dir.Readdir(2)
@@ -239,7 +239,7 @@ func TestFileSeek(t *testing.T) {
 	})
 
 	t.Run("dir SeekCurrent", func(t *testing.T) {
-		dir := &file{db: db, path: "/", isDir: true}
+		dir := &File{db: db, path: "/", isDir: true}
 
 		// Read 2 entries (position is now 2)
 		_, err := dir.Readdir(2)
@@ -265,7 +265,7 @@ func TestFileSeek(t *testing.T) {
 	})
 
 	t.Run("dir SeekEnd", func(t *testing.T) {
-		dir := &file{db: db, path: "/", isDir: true}
+		dir := &File{db: db, path: "/", isDir: true}
 
 		// Seek to end (should be total count of entries)
 		pos, err := dir.Seek(0, io.SeekEnd)
@@ -289,7 +289,7 @@ func TestFileSeek(t *testing.T) {
 
 	t.Run("empty file seek", func(t *testing.T) {
 		// Test seek on a file with no readFile (empty/newly created)
-		f, err := openFile(ctx, db, blobsDir, "/empty.txt", os.O_CREATE|os.O_RDONLY, 0644)
+		f, err := NewFile(ctx, db, blobsDir, "/empty.txt", os.O_CREATE|os.O_RDONLY, 0644)
 		require.NoError(t, err)
 		defer f.Close()
 
@@ -313,7 +313,7 @@ func TestFileChecksum(t *testing.T) {
 	expectedHash := sha256.Sum256(content)
 	expectedChecksum := hex.EncodeToString(expectedHash[:])
 
-	f, err := openFile(ctx, db, blobsDir, "/checksum.txt", os.O_CREATE|os.O_WRONLY, 0644)
+	f, err := NewFile(ctx, db, blobsDir, "/checksum.txt", os.O_CREATE|os.O_WRONLY, 0644)
 	require.NoError(t, err)
 	_, err = f.Write(content)
 	require.NoError(t, err)
@@ -325,7 +325,7 @@ func TestFileChecksum(t *testing.T) {
 	assert.Equal(t, expectedChecksum, storedChecksum)
 
 	// Checksum is verified on read
-	f, err = openFile(ctx, db, blobsDir, "/checksum.txt", os.O_RDONLY, 0)
+	f, err = NewFile(ctx, db, blobsDir, "/checksum.txt", os.O_RDONLY, 0)
 	require.NoError(t, err)
 	readContent, err := io.ReadAll(f)
 	require.NoError(t, err)
@@ -337,7 +337,7 @@ func TestFileChecksum(t *testing.T) {
 	multiHash := sha256.Sum256(multiContent)
 	multiChecksum := hex.EncodeToString(multiHash[:])
 
-	f, err = openFile(ctx, db, blobsDir, "/multi.txt", os.O_CREATE|os.O_WRONLY, 0644)
+	f, err = NewFile(ctx, db, blobsDir, "/multi.txt", os.O_CREATE|os.O_WRONLY, 0644)
 	require.NoError(t, err)
 	_, err = f.Write([]byte("first chunk"))
 	require.NoError(t, err)
@@ -350,7 +350,7 @@ func TestFileChecksum(t *testing.T) {
 	assert.Equal(t, multiChecksum, storedChecksum)
 
 	// Corrupted file fails checksum verification on open
-	f, err = openFile(ctx, db, blobsDir, "/corrupt.txt", os.O_CREATE|os.O_WRONLY, 0644)
+	f, err = NewFile(ctx, db, blobsDir, "/corrupt.txt", os.O_CREATE|os.O_WRONLY, 0644)
 	require.NoError(t, err)
 	_, err = f.Write([]byte("original content"))
 	require.NoError(t, err)
@@ -360,7 +360,7 @@ func TestFileChecksum(t *testing.T) {
 	blobPath := blobFilePath(blobsDir, blobID)
 	require.NoError(t, os.WriteFile(blobPath, []byte("corrupted content"), 0644))
 
-	_, err = openFile(ctx, db, blobsDir, "/corrupt.txt", os.O_RDONLY, 0)
+	_, err = NewFile(ctx, db, blobsDir, "/corrupt.txt", os.O_RDONLY, 0)
 	assert.Error(t, err)
 	assert.Contains(t, err.Error(), "checksum verification failed")
 }

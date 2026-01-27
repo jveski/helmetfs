@@ -18,7 +18,7 @@ import (
 	"github.com/google/uuid"
 )
 
-type file struct {
+type File struct {
 	db        *sql.DB
 	blobsDir  string
 	path      string
@@ -36,7 +36,7 @@ type file struct {
 	writeHash hash.Hash
 }
 
-func openFile(ctx context.Context, db *sql.DB, blobsDir, name string, flag int, perm os.FileMode) (*file, error) {
+func NewFile(ctx context.Context, db *sql.DB, blobsDir, name string, flag int, perm os.FileMode) (*File, error) {
 	var version int
 	var blobID sql.NullString
 	var isDir bool
@@ -65,7 +65,7 @@ func openFile(ctx context.Context, db *sql.DB, blobsDir, name string, flag int, 
 	}
 
 	if exists {
-		f := &file{
+		f := &File{
 			db:       db,
 			blobsDir: blobsDir,
 			path:     name,
@@ -127,10 +127,10 @@ func openFile(ctx context.Context, db *sql.DB, blobsDir, name string, flag int, 
 		}
 	}
 
-	return &file{db: db, blobsDir: blobsDir, path: name, flag: flag, perm: perm, version: version, modTime: time.Now().Unix(), created: true}, nil
+	return &File{db: db, blobsDir: blobsDir, path: name, flag: flag, perm: perm, version: version, modTime: time.Now().Unix(), created: true}, nil
 }
 
-func (f *file) Read(p []byte) (int, error) {
+func (f *File) Read(p []byte) (int, error) {
 	if f.isDir {
 		return 0, os.ErrInvalid
 	}
@@ -143,7 +143,7 @@ func (f *file) Read(p []byte) (int, error) {
 	return f.readFile.Read(p)
 }
 
-func (f *file) Write(p []byte) (int, error) {
+func (f *File) Write(p []byte) (int, error) {
 	if f.isDir {
 		return 0, os.ErrInvalid // can't write dirs
 	}
@@ -175,7 +175,7 @@ func (f *file) Write(p []byte) (int, error) {
 	return f.writeFile.Write(p)
 }
 
-func (f *file) Seek(offset int64, whence int) (int64, error) {
+func (f *File) Seek(offset int64, whence int) (int64, error) {
 	if f.isDir {
 		var base int
 		switch whence {
@@ -217,7 +217,7 @@ func (f *file) Seek(offset int64, whence int) (int64, error) {
 	return 0, io.EOF
 }
 
-func (f *file) Close() error {
+func (f *File) Close() error {
 	if f.readFile != nil {
 		f.readFile.Close()
 	}
@@ -325,7 +325,7 @@ func (f *file) Close() error {
 	return tx.Commit()
 }
 
-func (f *file) Readdir(count int) ([]os.FileInfo, error) {
+func (f *File) Readdir(count int) ([]os.FileInfo, error) {
 	if !f.isDir {
 		return nil, os.ErrInvalid
 	}
@@ -379,7 +379,7 @@ func (f *file) Readdir(count int) ([]os.FileInfo, error) {
 	return result, nil
 }
 
-func (f *file) Stat() (os.FileInfo, error) {
+func (f *File) Stat() (os.FileInfo, error) {
 	return &fileInfo{
 		name:    path.Base(f.path),
 		size:    f.size,

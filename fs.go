@@ -147,7 +147,7 @@ func (fs *FS) Stat(ctx context.Context, name string) (os.FileInfo, error) {
 func (fs *FS) OpenFile(ctx context.Context, name string, flag int, perm os.FileMode) (webdav.File, error) {
 	name = path.Clean(name)
 	if name == "/" {
-		return &file{db: fs.db, path: name, isDir: true}, nil
+		return &File{db: fs.db, path: name, isDir: true}, nil
 	}
-	return openFile(ctx, fs.db, fs.blobsDir, name, flag, perm)
+	return NewFile(ctx, fs.db, fs.blobsDir, name, flag, perm)
 }

@@ -23,7 +23,7 @@ func TestRcloneSync(t *testing.T) {
 	require.NoError(t, err)
 
 	// Write a test file
-	f, err := openFile(ctx, db, blobsDir, "/test.txt", os.O_CREATE|os.O_WRONLY, 0644)
+	f, err := NewFile(ctx, db, blobsDir, "/test.txt", os.O_CREATE|os.O_WRONLY, 0644)
 	require.NoError(t, err)
 	_, err = f.Write([]byte("hello remote"))
 	require.NoError(t, err)
