@@ -74,293 +74,6 @@ func TestDatabaseBackupRestore(t *testing.T) {
 	assert.Equal(t, "/test.txt", path)
 }
 
-func TestAPIRestore(t *testing.T) {
-	db, blobsDir := initTestState(t)
-	mux := newRouter(db, blobsDir)
-	ts := httptest.NewServer(mux)
-	t.Cleanup(func() { ts.Close() })
-
-	client := &http.Client{CheckRedirect: func(req *http.Request, via []*http.Request) error {
-		return http.ErrUseLastResponse
-	}}
-
-	postForm := func(timestamp string) *http.Response {
-		resp, err := client.Post(ts.URL+"/api/restore", "application/x-www-form-urlencoded", strings.NewReader(url.Values{"timestamp": {timestamp}}.Encode()))
-		require.NoError(t, err)
-		return resp
-	}
-
-	t.Run("restores file content to previous state", func(t *testing.T) {
-		t1 := time.Now().Unix() - 100
-		_, err := db.Exec(`INSERT INTO files (created_at, version, path, mode, mod_time, is_dir, blob_id) VALUES (?, 1, '/doc.txt', 0644, ?, 0, NULL)`, t1, t1)
-		require.NoError(t, err)
-
-		t2 := t1 + 10
-		blobID := uuid.New().String()
-		_, err = db.Exec(`INSERT INTO blobs (id, creation_time, modified_time, local_written) VALUES (?, ?, ?, 1)`, blobID, t2, t2)
-		require.NoError(t, err)
-		_, err = db.Exec(`INSERT INTO files (created_at, version, path, mode, mod_time, is_dir, blob_id) VALUES (?, 2, '/doc.txt', 0644, ?, 0, ?)`, t2, t2, blobID)
-		require.NoError(t, err)
-
-		restoreTime := time.Unix(t1+5, 0).UTC().Format(time.RFC3339)
-		resp := postForm(restoreTime)
-		defer resp.Body.Close()
-		assert.Equal(t, http.StatusSeeOther, resp.StatusCode)
-		assert.Equal(t, "/", resp.Header.Get("Location"))
-
-		var blobIDAfter sql.NullString
-		err = db.QueryRow(`SELECT blob_id FROM files WHERE path = '/doc.txt' ORDER BY version DESC LIMIT 1`).Scan(&blobIDAfter)
-		require.NoError(t, err)
-		assert.False(t, blobIDAfter.Valid)
-	})
-
-	t.Run("restores deleted file", func(t *testing.T) {
-		t1 := time.Now().Unix() - 200
-		_, err := db.Exec(`INSERT INTO files (created_at, version, path, mode, mod_time, is_dir, deleted) VALUES (?, 1, '/deleted.txt', 0644, ?, 0, 0)`, t1, t1)
-		require.NoError(t, err)
-
-		t2 := t1 + 10
-		_, err = db.Exec(`INSERT INTO files (created_at, version, path, mode, mod_time, is_dir, deleted) VALUES (?, 2, '/deleted.txt', 0644, ?, 0, 1)`, t2, t2)
-		require.NoError(t, err)
-
-		restoreTime := time.Unix(t1+5, 0).UTC().Format(time.RFC3339)
-		resp := postForm(restoreTime)
-		defer resp.Body.Close()
-		assert.Equal(t, http.StatusSeeOther, resp.StatusCode)
-
-		var deleted int
-		err = db.QueryRow(`SELECT deleted FROM files WHERE path = '/deleted.txt' ORDER BY version DESC LIMIT 1`).Scan(&deleted)
-		require.NoError(t, err)
-		assert.Equal(t, 0, deleted)
-	})
-
-	t.Run("deletes file that did not exist at timestamp", func(t *testing.T) {
-		t1 := time.Now().Unix() - 300
-		_, err := db.Exec(`INSERT INTO files (created_at, version, path, mode, mod_time, is_dir, deleted) VALUES (?, 1, '/new.txt', 0644, ?, 0, 0)`, t1, t1)
-		require.NoError(t, err)
-
-		restoreTime := time.Unix(t1-10, 0).UTC().Format(time.RFC3339)
-		resp := postForm(restoreTime)
-		defer resp.Body.Close()
-		assert.Equal(t, http.StatusSeeOther, resp.StatusCode)
-
-		var deleted int
-		err = db.QueryRow(`SELECT deleted FROM files WHERE path = '/new.txt' ORDER BY version DESC LIMIT 1`).Scan(&deleted)
-		require.NoError(t, err)
-		assert.Equal(t, 1, deleted)
-	})
-
-	t.Run("no changes when already at target state", func(t *testing.T) {
-		t1 := time.Now().Unix() - 400
-		_, err := db.Exec(`INSERT INTO files (created_at, version, path, mode, mod_time, is_dir, deleted) VALUES (?, 1, '/stable.txt', 0644, ?, 0, 0)`, t1, t1)
-		require.NoError(t, err)
-
-		restoreTime := time.Unix(t1+10, 0).UTC().Format(time.RFC3339)
-		resp := postForm(restoreTime)
-		defer resp.Body.Close()
-		assert.Equal(t, http.StatusSeeOther, resp.StatusCode)
-	})
-
-	t.Run("error on future timestamp", func(t *testing.T) {
-		futureTime := time.Now().Add(time.Hour).UTC().Format(time.RFC3339)
-		resp := postForm(futureTime)
-		defer resp.Body.Close()
-		assert.Equal(t, http.StatusBadRequest, resp.StatusCode)
-
-		body, _ := io.ReadAll(resp.Body)
-		assert.Contains(t, string(body), "cannot restore to a future time")
-	})
-
-	t.Run("error on missing timestamp", func(t *testing.T) {
-		resp := postForm("")
-		defer resp.Body.Close()
-		assert.Equal(t, http.StatusBadRequest, resp.StatusCode)
-
-		body, _ := io.ReadAll(resp.Body)
-		assert.Contains(t, string(body), "timestamp is required")
-	})
-
-	t.Run("error on invalid timestamp format", func(t *testing.T) {
-		resp := postForm("not-a-date")
-		defer resp.Body.Close()
-		assert.Equal(t, http.StatusBadRequest, resp.StatusCode)
-
-		body, _ := io.ReadAll(resp.Body)
-		assert.Contains(t, string(body), "invalid timestamp format")
-	})
-
-	t.Run("error on timestamp beyond retention period", func(t *testing.T) {
-		oldTime := time.Now().Add(-*ttl - time.Hour).UTC().Format(time.RFC3339)
-		resp := postForm(oldTime)
-		defer resp.Body.Close()
-		assert.Equal(t, http.StatusBadRequest, resp.StatusCode)
-
-		body, _ := io.ReadAll(resp.Body)
-		assert.Contains(t, string(body), "cannot restore beyond the retention period")
-	})
-
-	postFormWithPath := func(timestamp, path string) *http.Response {
-		resp, err := client.Post(ts.URL+"/api/restore", "application/x-www-form-urlencoded", strings.NewReader(url.Values{"timestamp": {timestamp}, "path": {path}}.Encode()))
-		require.NoError(t, err)
-		return resp
-	}
-
-	t.Run("restores only specified file path", func(t *testing.T) {
-		t1 := time.Now().Unix() - 500
-		_, err := db.Exec(`INSERT INTO files (created_at, version, path, mode, mod_time, is_dir, deleted) VALUES (?, 1, '/path-test-a.txt', 0644, ?, 0, 0)`, t1, t1)
-		require.NoError(t, err)
-		_, err = db.Exec(`INSERT INTO files (created_at, version, path, mode, mod_time, is_dir, deleted) VALUES (?, 1, '/path-test-b.txt', 0644, ?, 0, 0)`, t1, t1)
-		require.NoError(t, err)
-
-		t2 := t1 + 10
-		_, err = db.Exec(`INSERT INTO files (created_at, version, path, mode, mod_time, is_dir, deleted) VALUES (?, 2, '/path-test-a.txt', 0644, ?, 0, 1)`, t2, t2)
-		require.NoError(t, err)
-		_, err = db.Exec(`INSERT INTO files (created_at, version, path, mode, mod_time, is_dir, deleted) VALUES (?, 2, '/path-test-b.txt', 0644, ?, 0, 1)`, t2, t2)
-		require.NoError(t, err)
-
-		// Get current max versions
-		var maxVersionA, maxVersionB int
-		db.QueryRow(`SELECT MAX(version) FROM files WHERE path = '/path-test-a.txt'`).Scan(&maxVersionA)
-		db.QueryRow(`SELECT MAX(version) FROM files WHERE path = '/path-test-b.txt'`).Scan(&maxVersionB)
-
-		// Restore only path-test-a.txt
-		restoreTime := time.Unix(t1+5, 0).UTC().Format(time.RFC3339)
-		resp := postFormWithPath(restoreTime, "/path-test-a.txt")
-		defer resp.Body.Close()
-		assert.Equal(t, http.StatusSeeOther, resp.StatusCode)
-
-		// path-test-a.txt should be restored (new version, deleted=0)
-		var deletedA int
-		var newVersionA int
-		err = db.QueryRow(`SELECT deleted, version FROM files WHERE path = '/path-test-a.txt' ORDER BY version DESC LIMIT 1`).Scan(&deletedA, &newVersionA)
-		require.NoError(t, err)
-		assert.Equal(t, 0, deletedA, "path-test-a.txt should be restored")
-		assert.Greater(t, newVersionA, maxVersionA, "path-test-a.txt should have a new version")
-
-		// path-test-b.txt should NOT be affected (still deleted)
-		var deletedB int
-		var currentVersionB int
-		err = db.QueryRow(`SELECT deleted, version FROM files WHERE path = '/path-test-b.txt' ORDER BY version DESC LIMIT 1`).Scan(&deletedB, &currentVersionB)
-		require.NoError(t, err)
-		assert.Equal(t, 1, deletedB, "path-test-b.txt should still be deleted")
-		assert.Equal(t, maxVersionB, currentVersionB, "path-test-b.txt should not have a new version")
-	})
-
-	t.Run("restores directory prefix", func(t *testing.T) {
-		t1 := time.Now().Unix() - 600
-		_, err := db.Exec(`INSERT INTO files (created_at, version, path, mode, mod_time, is_dir, deleted) VALUES (?, 1, '/docs/a.txt', 0644, ?, 0, 0)`, t1, t1)
-		require.NoError(t, err)
-		_, err = db.Exec(`INSERT INTO files (created_at, version, path, mode, mod_time, is_dir, deleted) VALUES (?, 1, '/docs/b.txt', 0644, ?, 0, 0)`, t1, t1)
-		require.NoError(t, err)
-		_, err = db.Exec(`INSERT INTO files (created_at, version, path, mode, mod_time, is_dir, deleted) VALUES (?, 1, '/other/c.txt', 0644, ?, 0, 0)`, t1, t1)
-		require.NoError(t, err)
-
-		t2 := t1 + 10
-		_, err = db.Exec(`INSERT INTO files (created_at, version, path, mode, mod_time, is_dir, deleted) VALUES (?, 2, '/docs/a.txt', 0644, ?, 0, 1)`, t2, t2)
-		require.NoError(t, err)
-		_, err = db.Exec(`INSERT INTO files (created_at, version, path, mode, mod_time, is_dir, deleted) VALUES (?, 2, '/docs/b.txt', 0644, ?, 0, 1)`, t2, t2)
-		require.NoError(t, err)
-		_, err = db.Exec(`INSERT INTO files (created_at, version, path, mode, mod_time, is_dir, deleted) VALUES (?, 2, '/other/c.txt', 0644, ?, 0, 1)`, t2, t2)
-		require.NoError(t, err)
-
-		// Get current max versions
-		var maxVersionC int
-		db.QueryRow(`SELECT MAX(version) FROM files WHERE path = '/other/c.txt'`).Scan(&maxVersionC)
-
-		// Restore /docs/ directory
-		restoreTime := time.Unix(t1+5, 0).UTC().Format(time.RFC3339)
-		resp := postFormWithPath(restoreTime, "/docs/")
-		defer resp.Body.Close()
-		assert.Equal(t, http.StatusSeeOther, resp.StatusCode)
-
-		// /docs/a.txt and /docs/b.txt should be restored
-		var deletedA, deletedB int
-		err = db.QueryRow(`SELECT deleted FROM files WHERE path = '/docs/a.txt' ORDER BY version DESC LIMIT 1`).Scan(&deletedA)
-		require.NoError(t, err)
-		assert.Equal(t, 0, deletedA, "/docs/a.txt should be restored")
-
-		err = db.QueryRow(`SELECT deleted FROM files WHERE path = '/docs/b.txt' ORDER BY version DESC LIMIT 1`).Scan(&deletedB)
-		require.NoError(t, err)
-		assert.Equal(t, 0, deletedB, "/docs/b.txt should be restored")
-
-		// /other/c.txt should NOT be affected
-		var deletedC int
-		var currentVersionC int
-		err = db.QueryRow(`SELECT deleted, version FROM files WHERE path = '/other/c.txt' ORDER BY version DESC LIMIT 1`).Scan(&deletedC, &currentVersionC)
-		require.NoError(t, err)
-		assert.Equal(t, 1, deletedC, "/other/c.txt should still be deleted")
-		assert.Equal(t, maxVersionC, currentVersionC, "/other/c.txt should not have a new version")
-	})
-
-	t.Run("path that never existed is a no-op", func(t *testing.T) {
-		// Count files before
-		var countBefore int
-		db.QueryRow(`SELECT COUNT(*) FROM files`).Scan(&countBefore)
-
-		restoreTime := time.Now().Add(-time.Minute).UTC().Format(time.RFC3339)
-		resp := postFormWithPath(restoreTime, "/nonexistent-path-xyz.txt")
-		defer resp.Body.Close()
-		assert.Equal(t, http.StatusSeeOther, resp.StatusCode)
-
-		// Count files after - should be the same
-		var countAfter int
-		db.QueryRow(`SELECT COUNT(*) FROM files`).Scan(&countAfter)
-		assert.Equal(t, countBefore, countAfter, "no new file versions should be created for nonexistent path")
-	})
-
-	t.Run("empty path restores all files", func(t *testing.T) {
-		t1 := time.Now().Unix() - 700
-		_, err := db.Exec(`INSERT INTO files (created_at, version, path, mode, mod_time, is_dir, deleted) VALUES (?, 1, '/all-restore-a.txt', 0644, ?, 0, 0)`, t1, t1)
-		require.NoError(t, err)
-		_, err = db.Exec(`INSERT INTO files (created_at, version, path, mode, mod_time, is_dir, deleted) VALUES (?, 1, '/all-restore-b.txt', 0644, ?, 0, 0)`, t1, t1)
-		require.NoError(t, err)
-
-		t2 := t1 + 10
-		_, err = db.Exec(`INSERT INTO files (created_at, version, path, mode, mod_time, is_dir, deleted) VALUES (?, 2, '/all-restore-a.txt', 0644, ?, 0, 1)`, t2, t2)
-		require.NoError(t, err)
-		_, err = db.Exec(`INSERT INTO files (created_at, version, path, mode, mod_time, is_dir, deleted) VALUES (?, 2, '/all-restore-b.txt', 0644, ?, 0, 1)`, t2, t2)
-		require.NoError(t, err)
-
-		// Restore all with empty path
-		restoreTime := time.Unix(t1+5, 0).UTC().Format(time.RFC3339)
-		resp := postFormWithPath(restoreTime, "")
-		defer resp.Body.Close()
-		assert.Equal(t, http.StatusSeeOther, resp.StatusCode)
-
-		// Both files should be restored
-		var deletedA, deletedB int
-		err = db.QueryRow(`SELECT deleted FROM files WHERE path = '/all-restore-a.txt' ORDER BY version DESC LIMIT 1`).Scan(&deletedA)
-		require.NoError(t, err)
-		assert.Equal(t, 0, deletedA, "/all-restore-a.txt should be restored")
-
-		err = db.QueryRow(`SELECT deleted FROM files WHERE path = '/all-restore-b.txt' ORDER BY version DESC LIMIT 1`).Scan(&deletedB)
-		require.NoError(t, err)
-		assert.Equal(t, 0, deletedB, "/all-restore-b.txt should be restored")
-	})
-
-	t.Run("path without leading slash is normalized", func(t *testing.T) {
-		t1 := time.Now().Unix() - 800
-		_, err := db.Exec(`INSERT INTO files (created_at, version, path, mode, mod_time, is_dir, deleted) VALUES (?, 1, '/normalize-test.txt', 0644, ?, 0, 0)`, t1, t1)
-		require.NoError(t, err)
-
-		t2 := t1 + 10
-		_, err = db.Exec(`INSERT INTO files (created_at, version, path, mode, mod_time, is_dir, deleted) VALUES (?, 2, '/normalize-test.txt', 0644, ?, 0, 1)`, t2, t2)
-		require.NoError(t, err)
-
-		// Restore with path missing leading slash
-		restoreTime := time.Unix(t1+5, 0).UTC().Format(time.RFC3339)
-		resp := postFormWithPath(restoreTime, "normalize-test.txt")
-		defer resp.Body.Close()
-		assert.Equal(t, http.StatusSeeOther, resp.StatusCode)
-
-		// File should be restored
-		var deleted int
-		err = db.QueryRow(`SELECT deleted FROM files WHERE path = '/normalize-test.txt' ORDER BY version DESC LIMIT 1`).Scan(&deleted)
-		require.NoError(t, err)
-		assert.Equal(t, 0, deleted, "file should be restored even with path missing leading slash")
-	})
-}
-
 func TestStatusPage(t *testing.T) {
 	db, blobsDir := initTestState(t)
 	mux := newRouter(db, blobsDir)
@@ -368,7 +81,7 @@ func TestStatusPage(t *testing.T) {
 	t.Cleanup(func() { ts.Close() })
 
 	getStatus := func() (int, string) {
-		resp, err := http.Get(ts.URL + "/")
+		resp, err := http.Get(ts.URL + "/status")
 		require.NoError(t, err)
 		defer resp.Body.Close()
 		body, _ := io.ReadAll(resp.Body)
@@ -376,7 +89,7 @@ func TestStatusPage(t *testing.T) {
 	}
 
 	t.Run("returns HTML with correct content type", func(t *testing.T) {
-		resp, err := http.Get(ts.URL + "/")
+		resp, err := http.Get(ts.URL + "/status")
 		require.NoError(t, err)
 		defer resp.Body.Close()
 		assert.Equal(t, http.StatusOK, resp.StatusCode)
@@ -425,16 +138,6 @@ func TestStatusPage(t *testing.T) {
 		_, body := getStatus()
 		assert.Contains(t, body, "Local Blob Space</div>")
 		assert.Contains(t, body, "Remote Blob Space</div>")
-	})
-
-	t.Run("contains restore form with datetime picker and path input", func(t *testing.T) {
-		_, body := getStatus()
-		assert.Contains(t, body, `<form action="/api/restore" method="POST"`)
-		assert.Contains(t, body, `type="datetime-local"`)
-		assert.Contains(t, body, `name="timestamp"`)
-		assert.Contains(t, body, `name="path"`)
-		assert.Contains(t, body, `placeholder="/path/to/file or /dir/"`)
-		assert.Contains(t, body, `<button type="submit">Restore</button>`)
 	})
 }
 
@@ -881,70 +584,227 @@ func TestFormatBytes(t *testing.T) {
 	}
 }
 
-func TestRestoreAPIInputValidation(t *testing.T) {
+func TestHistoricalBrowse(t *testing.T) {
 	db, blobsDir := initTestState(t)
 	mux := newRouter(db, blobsDir)
 	ts := httptest.NewServer(mux)
 	t.Cleanup(func() { ts.Close() })
 
-	client := &http.Client{CheckRedirect: func(req *http.Request, via []*http.Request) error {
-		return http.ErrUseLastResponse
-	}}
-
-	postForm := func(timestamp, path string) *http.Response {
-		form := url.Values{
-			"timestamp": {timestamp},
-			"path":      {path},
+	getBrowse := func(path, timestamp string) (int, string) {
+		u := ts.URL + "/browse" + path
+		if timestamp != "" {
+			u += "?at=" + url.QueryEscape(timestamp)
 		}
-		resp, err := client.Post(ts.URL+"/api/restore", "application/x-www-form-urlencoded", strings.NewReader(form.Encode()))
+		resp, err := http.Get(u)
 		require.NoError(t, err)
-		return resp
+		defer resp.Body.Close()
+		body, _ := io.ReadAll(resp.Body)
+		return resp.StatusCode, string(body)
 	}
 
-	t.Run("SQL injection in timestamp is rejected", func(t *testing.T) {
-		resp := postForm("'; DROP TABLE files;--", "")
-		defer resp.Body.Close()
-		assert.Equal(t, http.StatusBadRequest, resp.StatusCode)
-	})
-
-	t.Run("SQL injection in path is handled safely", func(t *testing.T) {
-		// Path with SQL injection attempt - should be handled safely
-		// The path is used in a parameterized query, so injection shouldn't work
-		validTimestamp := time.Now().Add(-time.Minute).UTC().Format(time.RFC3339)
-		resp := postForm(validTimestamp, "/'; DELETE FROM blobs;--")
-		defer resp.Body.Close()
-		// Should succeed (path is sanitized/parameterized)
-		assert.Equal(t, http.StatusSeeOther, resp.StatusCode)
-
-		// Verify database is still intact
-		var count int
-		err := db.QueryRow(`SELECT COUNT(*) FROM files`).Scan(&count)
+	t.Run("shows files at historical timestamp", func(t *testing.T) {
+		t1 := time.Now().Unix() - 100
+		_, err := db.Exec(`INSERT INTO files (created_at, version, path, mode, mod_time, is_dir, deleted) VALUES (?, 1, '/hist-test.txt', 0644, ?, 0, 0)`, t1, t1)
 		require.NoError(t, err)
+
+		// Delete file at t2
+		t2 := t1 + 50
+		_, err = db.Exec(`INSERT INTO files (created_at, version, path, mode, mod_time, is_dir, deleted) VALUES (?, 2, '/hist-test.txt', 0644, ?, 0, 1)`, t2, t2)
+		require.NoError(t, err)
+
+		// Browse at t1+25 (before deletion)
+		browseTime := time.Unix(t1+25, 0).UTC().Format(time.RFC3339)
+		code, body := getBrowse("", browseTime)
+		assert.Equal(t, http.StatusOK, code)
+		assert.Contains(t, body, "hist-test.txt")
+		assert.Contains(t, body, "Viewing:")
 	})
 
-	t.Run("Extremely long timestamp is rejected", func(t *testing.T) {
-		resp := postForm(strings.Repeat("2024-01-01T00:00:00Z", 100), "")
-		defer resp.Body.Close()
-		assert.Equal(t, http.StatusBadRequest, resp.StatusCode)
+	t.Run("does not show files created after timestamp", func(t *testing.T) {
+		t1 := time.Now().Unix() - 50
+		_, err := db.Exec(`INSERT INTO files (created_at, version, path, mode, mod_time, is_dir, deleted) VALUES (?, 1, '/future-file.txt', 0644, ?, 0, 0)`, t1, t1)
+		require.NoError(t, err)
+
+		// Browse at a time before the file was created
+		browseTime := time.Unix(t1-100, 0).UTC().Format(time.RFC3339)
+		code, body := getBrowse("", browseTime)
+		assert.Equal(t, http.StatusOK, code)
+		assert.NotContains(t, body, "future-file.txt")
 	})
 
-	t.Run("Negative year is rejected", func(t *testing.T) {
-		resp := postForm("-9999-01-01T00:00:00Z", "")
-		defer resp.Body.Close()
-		assert.Equal(t, http.StatusBadRequest, resp.StatusCode)
+	t.Run("rejects future timestamp", func(t *testing.T) {
+		futureTime := time.Now().Add(time.Hour).UTC().Format(time.RFC3339)
+		code, body := getBrowse("", futureTime)
+		assert.Equal(t, http.StatusBadRequest, code)
+		assert.Contains(t, body, "cannot browse future time")
 	})
 
-	t.Run("Far future date is rejected", func(t *testing.T) {
-		resp := postForm("9999-01-01T00:00:00Z", "")
-		defer resp.Body.Close()
-		assert.Equal(t, http.StatusBadRequest, resp.StatusCode)
+	t.Run("rejects timestamp beyond TTL", func(t *testing.T) {
+		oldTime := time.Now().Add(-*ttl - time.Hour).UTC().Format(time.RFC3339)
+		code, body := getBrowse("", oldTime)
+		assert.Equal(t, http.StatusBadRequest, code)
+		assert.Contains(t, body, "cannot browse beyond retention period")
 	})
 
-	t.Run("Unix epoch is valid but beyond retention", func(t *testing.T) {
-		resp := postForm("1970-01-01T00:00:00Z", "")
+	t.Run("rejects invalid timestamp format", func(t *testing.T) {
+		code, body := getBrowse("", "not-a-date")
+		assert.Equal(t, http.StatusBadRequest, code)
+		assert.Contains(t, body, "invalid timestamp format")
+	})
+
+	t.Run("shows exit time travel link in historical mode", func(t *testing.T) {
+		browseTime := time.Now().Add(-time.Minute).UTC().Format(time.RFC3339)
+		code, body := getBrowse("", browseTime)
+		assert.Equal(t, http.StatusOK, code)
+		assert.Contains(t, body, "Exit Time Travel")
+		assert.NotContains(t, body, "Upload Files")
+	})
+
+	t.Run("shows upload button in normal mode", func(t *testing.T) {
+		code, body := getBrowse("", "")
+		assert.Equal(t, http.StatusOK, code)
+		assert.Contains(t, body, "Upload Files")
+		assert.NotContains(t, body, "Exit Time Travel")
+	})
+}
+
+func TestRestoreFileAPI(t *testing.T) {
+	db, blobsDir := initTestState(t)
+	mux := newRouter(db, blobsDir)
+	ts := httptest.NewServer(mux)
+	t.Cleanup(func() { ts.Close() })
+
+	postRestoreFile := func(timestamp, path string) (int, string) {
+		resp, err := http.Post(ts.URL+"/api/restore-file", "application/x-www-form-urlencoded",
+			strings.NewReader(url.Values{"timestamp": {timestamp}, "path": {path}}.Encode()))
+		require.NoError(t, err)
 		defer resp.Body.Close()
-		assert.Equal(t, http.StatusBadRequest, resp.StatusCode)
 		body, _ := io.ReadAll(resp.Body)
-		assert.Contains(t, string(body), "retention")
+		return resp.StatusCode, string(body)
+	}
+
+	t.Run("restores single deleted file", func(t *testing.T) {
+		t1 := time.Now().Unix() - 100
+		_, err := db.Exec(`INSERT INTO files (created_at, version, path, mode, mod_time, is_dir, deleted) VALUES (?, 1, '/restore-single.txt', 0644, ?, 0, 0)`, t1, t1)
+		require.NoError(t, err)
+
+		t2 := t1 + 10
+		_, err = db.Exec(`INSERT INTO files (created_at, version, path, mode, mod_time, is_dir, deleted) VALUES (?, 2, '/restore-single.txt', 0644, ?, 0, 1)`, t2, t2)
+		require.NoError(t, err)
+
+		restoreTime := time.Unix(t1+5, 0).UTC().Format(time.RFC3339)
+		code, body := postRestoreFile(restoreTime, "/restore-single.txt")
+		assert.Equal(t, http.StatusOK, code)
+		assert.Contains(t, body, "success")
+
+		var deleted int
+		err = db.QueryRow(`SELECT deleted FROM files WHERE path = '/restore-single.txt' ORDER BY version DESC LIMIT 1`).Scan(&deleted)
+		require.NoError(t, err)
+		assert.Equal(t, 0, deleted, "file should be restored")
+	})
+
+	t.Run("requires path parameter", func(t *testing.T) {
+		restoreTime := time.Now().Add(-time.Minute).UTC().Format(time.RFC3339)
+		code, body := postRestoreFile(restoreTime, "")
+		assert.Equal(t, http.StatusBadRequest, code)
+		assert.Contains(t, body, "path is required")
+	})
+
+	t.Run("requires timestamp parameter", func(t *testing.T) {
+		code, body := postRestoreFile("", "/some/path.txt")
+		assert.Equal(t, http.StatusBadRequest, code)
+		assert.Contains(t, body, "timestamp is required")
+	})
+
+	t.Run("rejects future timestamp", func(t *testing.T) {
+		futureTime := time.Now().Add(time.Hour).UTC().Format(time.RFC3339)
+		code, body := postRestoreFile(futureTime, "/some/path.txt")
+		assert.Equal(t, http.StatusBadRequest, code)
+		assert.Contains(t, body, "cannot restore from a future time")
+	})
+
+	t.Run("rejects timestamp beyond TTL", func(t *testing.T) {
+		oldTime := time.Now().Add(-*ttl - time.Hour).UTC().Format(time.RFC3339)
+		code, body := postRestoreFile(oldTime, "/some/path.txt")
+		assert.Equal(t, http.StatusBadRequest, code)
+		assert.Contains(t, body, "cannot restore beyond the retention period")
+	})
+}
+
+func TestDownloadHistoricalAPI(t *testing.T) {
+	db, blobsDir := initTestState(t)
+	mux := newRouter(db, blobsDir)
+	ts := httptest.NewServer(mux)
+	t.Cleanup(func() { ts.Close() })
+
+	getDownloadHistorical := func(path, timestamp string) (int, string, http.Header) {
+		u := ts.URL + "/api/download-historical?path=" + url.QueryEscape(path) + "&at=" + url.QueryEscape(timestamp)
+		resp, err := http.Get(u)
+		require.NoError(t, err)
+		defer resp.Body.Close()
+		body, _ := io.ReadAll(resp.Body)
+		return resp.StatusCode, string(body), resp.Header
+	}
+
+	t.Run("downloads historical file version", func(t *testing.T) {
+		// Create blob with content
+		content := []byte("historical content version 1")
+		blobID := uuid.New().String()
+		now := time.Now().Unix()
+
+		_, err := db.Exec(`INSERT INTO blobs (id, creation_time, modified_time, local_written, size) VALUES (?, ?, ?, 1, ?)`, blobID, now, now, len(content))
+		require.NoError(t, err)
+
+		blobPath := blobFilePath(blobsDir, blobID)
+		require.NoError(t, os.WriteFile(blobPath, content, 0644))
+
+		t1 := time.Now().Unix() - 100
+		_, err = db.Exec(`INSERT INTO files (created_at, version, path, mode, mod_time, is_dir, deleted, blob_id) VALUES (?, 1, '/download-test.txt', 0644, ?, 0, 0, ?)`, t1, t1, blobID)
+		require.NoError(t, err)
+
+		downloadTime := time.Unix(t1+10, 0).UTC().Format(time.RFC3339)
+		code, body, headers := getDownloadHistorical("/download-test.txt", downloadTime)
+		assert.Equal(t, http.StatusOK, code)
+		assert.Equal(t, string(content), body)
+		assert.Contains(t, headers.Get("Content-Disposition"), "download-test.txt")
+	})
+
+	t.Run("returns 404 for file not found at timestamp", func(t *testing.T) {
+		t1 := time.Now().Unix() - 100
+		_, err := db.Exec(`INSERT INTO files (created_at, version, path, mode, mod_time, is_dir, deleted) VALUES (?, 1, '/created-later.txt', 0644, ?, 0, 0)`, t1, t1)
+		require.NoError(t, err)
+
+		// Try to download before file existed
+		downloadTime := time.Unix(t1-50, 0).UTC().Format(time.RFC3339)
+		code, body, _ := getDownloadHistorical("/created-later.txt", downloadTime)
+		assert.Equal(t, http.StatusNotFound, code)
+		assert.Contains(t, body, "file not found at timestamp")
+	})
+
+	t.Run("requires path parameter", func(t *testing.T) {
+		downloadTime := time.Now().Add(-time.Minute).UTC().Format(time.RFC3339)
+		code, body, _ := getDownloadHistorical("", downloadTime)
+		assert.Equal(t, http.StatusBadRequest, code)
+		assert.Contains(t, body, "at and path parameters required")
+	})
+
+	t.Run("requires timestamp parameter", func(t *testing.T) {
+		code, body, _ := getDownloadHistorical("/some/path.txt", "")
+		assert.Equal(t, http.StatusBadRequest, code)
+		assert.Contains(t, body, "at and path parameters required")
+	})
+
+	t.Run("rejects future timestamp", func(t *testing.T) {
+		futureTime := time.Now().Add(time.Hour).UTC().Format(time.RFC3339)
+		code, body, _ := getDownloadHistorical("/some/path.txt", futureTime)
+		assert.Equal(t, http.StatusBadRequest, code)
+		assert.Contains(t, body, "cannot download from future time")
+	})
+
+	t.Run("rejects timestamp beyond TTL", func(t *testing.T) {
+		oldTime := time.Now().Add(-*ttl - time.Hour).UTC().Format(time.RFC3339)
+		code, body, _ := getDownloadHistorical("/some/path.txt", oldTime)
+		assert.Equal(t, http.StatusBadRequest, code)
+		assert.Contains(t, body, "cannot download beyond retention period")
 	})
 }

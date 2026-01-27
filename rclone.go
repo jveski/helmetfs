@@ -3,25 +3,11 @@ package main
 import (
 	"bytes"
 	"database/sql"
+	"io"
 	"log/slog"
 	"os/exec"
 	"strings"
 )
-
-func rcloneCopyFile(src, dst, bwLimit string) error {
-	args := []string{"copyto", src, dst}
-	if bwLimit != "" && bwLimit != "0" {
-		args = append([]string{"--bwlimit", bwLimit}, args...)
-	}
-	cmd := exec.Command("rclone", args...)
-	var stderr bytes.Buffer
-	cmd.Stderr = &stderr
-	if err := cmd.Run(); err != nil {
-		slog.Error("rclone copyto failed", "src", src, "dst", dst, "error", err, "stderr", stderr.String())
-		return err
-	}
-	return nil
-}
 
 func syncRemote(db *sql.DB, blobsDir, remotePath, bwLimit string) (bool, error) {
 	n1, err := rcloneBatchOp(db, blobsDir,
@@ -102,4 +88,31 @@ func rcloneBatchOp(db *sql.DB, blobsDir, selectQuery, updateQuery string, rclone
 	}
 	slog.Info(logMsg, "count", len(blobIDs))
 	return len(blobIDs), nil
+}
+
+func rcloneCopyFile(src, dst, bwLimit string) error {
+	args := []string{"copyto", src, dst}
+	if bwLimit != "" && bwLimit != "0" {
+		args = append([]string{"--bwlimit", bwLimit}, args...)
+	}
+	cmd := exec.Command("rclone", args...)
+	var stderr bytes.Buffer
+	cmd.Stderr = &stderr
+	if err := cmd.Run(); err != nil {
+		slog.Error("rclone copyto failed", "src", src, "dst", dst, "error", err, "stderr", stderr.String())
+		return err
+	}
+	return nil
+}
+
+func rcloneCatFile(src string, w io.Writer) error {
+	cmd := exec.Command("rclone", "cat", src)
+	cmd.Stdout = w
+	var stderr bytes.Buffer
+	cmd.Stderr = &stderr
+	if err := cmd.Run(); err != nil {
+		slog.Error("rclone cat failed", "src", src, "error", err, "stderr", stderr.String())
+		return err
+	}
+	return nil
 }

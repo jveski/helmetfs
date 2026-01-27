@@ -1,0 +1,782 @@
+<!DOCTYPE html>
+<html>
+<head>
+<title>HelmetFS - Browse</title>
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<style>
+:root {
+	--bg-primary: #0d1117;
+	--bg-card: #161b22;
+	--bg-card-hover: #1c2128;
+	--border: #30363d;
+	--text-primary: #e6edf3;
+	--text-secondary: #8b949e;
+	--accent: #58a6ff;
+	--accent-glow: rgba(88, 166, 255, 0.15);
+	--warning: #f85149;
+}
+* { box-sizing: border-box; }
+body {
+	font-family: system-ui, -apple-system, sans-serif;
+	max-width: 700px;
+	margin: 0 auto;
+	padding: 2rem;
+	background: var(--bg-primary);
+	color: var(--text-primary);
+	min-height: 100vh;
+}
+h1 {
+	font-size: 1.75rem;
+	font-weight: 700;
+}
+a {
+	color: var(--accent);
+	text-decoration: none;
+}
+a:hover {
+	text-decoration: underline;
+}
+.breadcrumb {
+	margin-bottom: 1.5rem;
+	color: var(--text-secondary);
+}
+.breadcrumb a {
+	color: var(--text-secondary);
+}
+.breadcrumb a:hover {
+	color: var(--accent);
+}
+.breadcrumb span {
+	margin: 0 0.5rem;
+}
+table {
+	width: 100%;
+	border-collapse: collapse;
+	background: var(--bg-card);
+	border: 1px solid var(--border);
+	border-radius: 8px;
+	overflow: hidden;
+}
+th, td {
+	padding: 0.75rem 1rem;
+	text-align: left;
+}
+th {
+	background: var(--bg-card-hover);
+	color: var(--text-secondary);
+	font-size: 0.85rem;
+	font-weight: 600;
+	text-transform: uppercase;
+	letter-spacing: 0.05em;
+}
+tr:not(:last-child) td {
+	border-bottom: 1px solid var(--border);
+}
+tr:hover td {
+	background: var(--bg-card-hover);
+}
+.icon {
+	width: 1.5rem;
+	text-align: center;
+}
+.size, .modified, .backed-up {
+	color: var(--text-secondary);
+	font-size: 0.9rem;
+}
+.size {
+	text-align: right;
+	width: 6rem;
+}
+.modified {
+	width: 10rem;
+}
+.backed-up {
+	width: 5rem;
+	text-align: center;
+}
+.backed-up-yes {
+	color: #3fb950;
+}
+.backed-up-no {
+	color: #f85149;
+}
+.empty {
+	padding: 2rem;
+	text-align: center;
+	color: var(--text-secondary);
+}
+.back-link {
+	display: inline-block;
+	margin-top: 1.5rem;
+	color: var(--text-secondary);
+}
+.upload-form {
+	display: inline-block;
+}
+.upload-form input[type="file"] {
+	display: none;
+}
+.btn {
+	background: var(--bg-card);
+	color: var(--text-primary);
+	border: 1px solid var(--border);
+	padding: 0.5rem 1rem;
+	border-radius: 6px;
+	cursor: pointer;
+	font-size: 0.9rem;
+}
+.btn:hover {
+	background: var(--bg-card-hover);
+	border-color: var(--accent);
+}
+.btn-delete {
+	background: transparent;
+	border: none;
+	color: var(--text-secondary);
+	cursor: pointer;
+	padding: 0.25rem 0.5rem;
+	font-size: 0.85rem;
+}
+.btn-delete:hover {
+	color: #f85149;
+}
+.delete-col {
+	width: 3rem;
+	text-align: center;
+}
+/* Time travel styles */
+.time-travel-bar {
+	margin-bottom: 1rem;
+	display: flex;
+	align-items: center;
+	gap: 0.5rem;
+}
+.time-travel-bar.active {
+	background: var(--accent-glow);
+	border: 1px solid var(--accent);
+	border-radius: 8px;
+	padding: 0.75rem 1rem;
+}
+.time-travel-indicator {
+	display: flex;
+	align-items: center;
+	gap: 0.5rem;
+	flex: 1;
+	color: var(--accent);
+}
+.time-icon {
+	font-size: 1.2rem;
+}
+.exit-historical {
+	margin-left: auto;
+	color: var(--text-secondary);
+	font-size: 0.9rem;
+}
+.exit-historical:hover {
+	color: var(--warning);
+}
+.time-travel-form {
+	display: flex;
+	align-items: center;
+	gap: 0.5rem;
+}
+.time-travel-form input[type="datetime-local"] {
+	padding: 0.4rem 0.6rem;
+	background: var(--bg-primary);
+	border: 1px solid var(--border);
+	border-radius: 6px;
+	color: var(--text-primary);
+	font-size: 0.9rem;
+}
+.time-travel-form input[type="datetime-local"]:focus {
+	outline: none;
+	border-color: var(--accent);
+}
+/* Restore button styles */
+.btn-restore {
+	background: transparent;
+	border: 1px solid var(--accent);
+	color: var(--accent);
+	cursor: pointer;
+	padding: 0.25rem 0.5rem;
+	font-size: 0.8rem;
+	border-radius: 4px;
+}
+.btn-restore:hover {
+	background: var(--accent);
+	color: var(--bg-primary);
+}
+.restore-col {
+	width: 5rem;
+	text-align: center;
+}
+/* Cloud indicator for remote-only files */
+.cloud-icon {
+	color: var(--text-secondary);
+	font-size: 0.8rem;
+	margin-left: 0.25rem;
+}
+@media (max-width: 480px) {
+	body { padding: 1rem; }
+	.modified { display: none; }
+	.backed-up { display: none; }
+	.size { width: 5rem; }
+}
+.header {
+	display: flex;
+	justify-content: space-between;
+	align-items: center;
+	margin-bottom: 1rem;
+	padding-bottom: 0.75rem;
+	border-bottom: 3px solid var(--accent);
+}
+.header h1 {
+	margin: 0;
+	padding: 0;
+	border: none;
+}
+.toolbar {
+	display: flex;
+	align-items: center;
+	gap: 0.5rem;
+	margin-bottom: 1rem;
+	flex-wrap: wrap;
+}
+.toolbar-group {
+	display: flex;
+	align-items: center;
+	gap: 0.5rem;
+}
+.toolbar-separator {
+	width: 1px;
+	height: 1.5rem;
+	background: var(--border);
+	margin: 0 0.5rem;
+}
+/* Timeline Scrubber Styles */
+.time-scrubber-container {
+	display: none;
+	flex-direction: column;
+	gap: 0.75rem;
+	background: var(--bg-card);
+	border: 1px solid var(--border);
+	border-radius: 8px;
+	padding: 1rem;
+	margin-bottom: 1rem;
+}
+.time-scrubber-container.visible {
+	display: flex;
+}
+.scrubber-header {
+	display: flex;
+	justify-content: space-between;
+	align-items: center;
+	font-size: 0.85rem;
+	color: var(--text-secondary);
+}
+.scrubber-header .ttl-badge {
+	background: var(--accent-glow);
+	border: 1px solid var(--accent);
+	border-radius: 4px;
+	padding: 0.2rem 0.5rem;
+	font-size: 0.75rem;
+	color: var(--accent);
+}
+.scrubber-track {
+	position: relative;
+	height: 48px;
+	background: var(--bg-primary);
+	border-radius: 6px;
+	cursor: pointer;
+	overflow: hidden;
+}
+.scrubber-fill {
+	position: absolute;
+	top: 0;
+	left: 0;
+	height: 100%;
+	background: linear-gradient(90deg, var(--accent-glow) 0%, transparent 100%);
+	pointer-events: none;
+	transition: width 0.05s ease;
+}
+.scrubber-handle {
+	position: absolute;
+	top: 50%;
+	transform: translate(-50%, -50%);
+	width: 4px;
+	height: 32px;
+	background: var(--accent);
+	border-radius: 2px;
+	cursor: grab;
+	box-shadow: 0 0 8px var(--accent);
+	z-index: 10;
+}
+.scrubber-handle:active {
+	cursor: grabbing;
+}
+.scrubber-markers {
+	position: absolute;
+	top: 0;
+	left: 0;
+	right: 0;
+	bottom: 0;
+	pointer-events: none;
+}
+.scrubber-marker {
+	position: absolute;
+	top: 4px;
+	bottom: 4px;
+	width: 2px;
+	background: var(--text-secondary);
+	opacity: 0.4;
+	border-radius: 1px;
+}
+.scrubber-labels {
+	display: flex;
+	justify-content: space-between;
+	font-size: 0.75rem;
+	color: var(--text-secondary);
+	padding-top: 0.25rem;
+}
+.scrubber-time-display {
+	text-align: center;
+	font-size: 1.1rem;
+	font-weight: 600;
+	color: var(--text-primary);
+	padding: 0.5rem;
+	background: var(--bg-primary);
+	border-radius: 4px;
+	border: 1px solid var(--border);
+}
+.scrubber-actions {
+	display: flex;
+	justify-content: flex-end;
+	gap: 0.5rem;
+}
+.scrubber-empty-message {
+	text-align: center;
+	padding: 0.5rem;
+	color: var(--text-secondary);
+	font-size: 0.85rem;
+}
+.scrubber-track:focus {
+	outline: 2px solid var(--accent);
+	outline-offset: 2px;
+}
+@media (max-width: 480px) {
+	.scrubber-track {
+		height: 56px;
+	}
+	.scrubber-handle {
+		width: 6px;
+		height: 40px;
+	}
+	.scrubber-time-display {
+		font-size: 1rem;
+	}
+}
+</style>
+</head>
+<body>
+<div class="header">
+	<h1>HelmetFS</h1>
+	<a href="/status" class="btn">Status</a>
+</div>
+
+<div class="breadcrumb">
+{{range $i, $b := .Breadcrumbs}}{{if $i}}<span>/</span>{{end}}<a href="{{$b.Path}}">{{$b.Name}}</a>{{end}}
+</div>
+
+{{if .HistoricalMode}}
+<div class="time-travel-bar active">
+	<div class="time-travel-indicator">
+		<span class="time-icon">&#128337;</span>
+		Viewing: <strong>{{.FormattedTimestamp}}</strong>
+	</div>
+	<a href="{{if eq .Path "/"}}{{.Path}}{{else}}/browse{{.Path}}{{end}}" class="exit-historical">Exit Time Travel</a>
+</div>
+{{else}}
+<div class="toolbar">
+	<div class="toolbar-group">
+		<form class="upload-form">
+			<label class="btn">Upload Files<input type="file" id="file-input" multiple></label>
+		</form>
+		<button class="btn" onclick="createDirectory()">New Folder</button>
+	</div>
+	<div class="toolbar-separator"></div>
+	<div class="toolbar-group">
+		<button type="button" class="btn" onclick="toggleTimeScrubber()">
+			<span class="time-icon">&#128337;</span> Time Travel
+		</button>
+	</div>
+</div>
+
+<!-- Time Scrubber Panel -->
+<div class="time-scrubber-container" id="time-scrubber">
+	<div class="scrubber-header">
+		<span>Browse file history</span>
+		<span class="ttl-badge">Last {{.TTLHuman}}</span>
+	</div>
+
+	<div class="scrubber-track" id="scrubber-track" tabindex="0"
+		 role="slider" aria-label="Time travel scrubber"
+		 aria-valuemin="0" aria-valuemax="100" aria-valuenow="100">
+		<div class="scrubber-fill" id="scrubber-fill"></div>
+		<div class="scrubber-markers" id="scrubber-markers"></div>
+		<div class="scrubber-handle" id="scrubber-handle"></div>
+	</div>
+
+	<div class="scrubber-labels">
+		<span id="ttl-start-label">Loading...</span>
+		<span id="ttl-end-label">Now</span>
+	</div>
+
+	<div class="scrubber-time-display" id="scrubber-time-display">
+		Select a point in time
+	</div>
+
+	<div class="scrubber-empty-message" id="scrubber-empty" style="display: none;">
+		No file changes in the last {{.TTLHuman}}
+	</div>
+
+	<div class="scrubber-actions">
+		<button type="button" class="btn" onclick="cancelTimeScrubber()">Cancel</button>
+		<button type="button" class="btn" id="scrubber-go-btn" onclick="goToSelectedTime()" disabled>
+			Go to Selected Time
+		</button>
+	</div>
+
+</div>
+{{end}}
+
+{{if .Files}}
+<table>
+<tr>
+<th class="icon"></th>
+<th>Name</th>
+<th class="size">Size</th>
+<th class="modified">Modified</th>
+{{if .HistoricalMode}}
+<th class="restore-col">Restore</th>
+{{else}}
+<th class="backed-up">Backed Up</th>
+<th class="delete-col"></th>
+{{end}}
+</tr>
+{{range .Files}}
+<tr>
+<td class="icon">{{if .IsDir}}&#128193;{{else}}&#128196;{{end}}</td>
+<td>
+	<a href="{{.Link}}">{{.Name}}</a>
+	{{if and (not .IsDir) (not .LocalCached)}}<span class="cloud-icon" title="Remote only">&#9729;</span>{{end}}
+</td>
+<td class="size">{{if .IsDir}}&mdash;{{else}}{{.Size}}{{end}}</td>
+<td class="modified">{{.ModTime}}</td>
+{{if $.HistoricalMode}}
+<td class="restore-col"><button class="btn-restore" onclick="restoreItem('{{.FilePath}}', {{.IsDir}})" title="Restore to current">Restore</button></td>
+{{else}}
+<td class="backed-up">{{if .IsDir}}&mdash;{{else if .BackedUp}}<span class="backed-up-yes">Yes</span>{{else}}<span class="backed-up-no">No</span>{{end}}</td>
+<td class="delete-col"><button class="btn-delete" onclick="deleteItem('{{.FilePath}}', {{.IsDir}})" title="Delete">&#128465;</button></td>
+{{end}}
+</tr>
+{{end}}
+</table>
+{{else}}
+<div class="empty">{{if .HistoricalMode}}This directory was empty at this time{{else}}This directory is empty{{end}}</div>
+{{end}}
+
+<script>
+const currentPath = {{.Path}};
+const historicalMode = {{.HistoricalMode}};
+const timestamp = {{if .Timestamp}}{{.Timestamp}}{{else}}""{{end}};
+const ttlSeconds = {{.TTLSeconds}};
+
+// Scrubber state
+let scrubberData = null;
+let selectedTimestamp = null;
+let isDragging = false;
+
+function toggleTimeScrubber() {
+	const container = document.getElementById('time-scrubber');
+	if (container.classList.contains('visible')) {
+		container.classList.remove('visible');
+	} else {
+		container.classList.add('visible');
+		loadActivityTimeline();
+	}
+}
+
+function cancelTimeScrubber() {
+	document.getElementById('time-scrubber').classList.remove('visible');
+	selectedTimestamp = null;
+}
+
+async function loadActivityTimeline() {
+	try {
+		const resp = await fetch('/api/activity-timeline?path=' + encodeURIComponent(currentPath));
+		if (!resp.ok) throw new Error('Failed to load timeline');
+		scrubberData = await resp.json();
+		initializeScrubber();
+	} catch (err) {
+		console.error('Timeline error:', err);
+		document.getElementById('scrubber-empty').style.display = 'block';
+		document.getElementById('scrubber-track').style.display = 'none';
+	}
+}
+
+function initializeScrubber() {
+	const { timestamps, ttl_start, ttl_end } = scrubberData;
+
+	// Update labels
+	document.getElementById('ttl-start-label').textContent = formatDateTime(ttl_start * 1000);
+	document.getElementById('ttl-end-label').textContent = 'Now';
+
+	// Show/hide empty message
+	const emptyMsg = document.getElementById('scrubber-empty');
+	const track = document.getElementById('scrubber-track');
+
+	if (timestamps.length === 0) {
+		emptyMsg.style.display = 'block';
+		track.style.opacity = '0.5';
+	} else {
+		emptyMsg.style.display = 'none';
+		track.style.opacity = '1';
+		renderMarkers(timestamps, ttl_start, ttl_end);
+	}
+
+	// Initialize handle position at "now" (right edge)
+	setHandlePosition(100);
+	updateTimeDisplay(ttl_end);
+
+	// Set up event listeners
+	setupScrubberEvents();
+}
+
+function renderMarkers(timestamps, ttlStart, ttlEnd) {
+	const container = document.getElementById('scrubber-markers');
+	container.innerHTML = '';
+
+	const range = ttlEnd - ttlStart;
+
+	timestamps.forEach(ts => {
+		const percent = ((ts - ttlStart) / range) * 100;
+		const marker = document.createElement('div');
+		marker.className = 'scrubber-marker';
+		marker.style.left = percent + '%';
+		marker.title = formatDateTime(ts * 1000);
+		container.appendChild(marker);
+	});
+}
+
+function setupScrubberEvents() {
+	const track = document.getElementById('scrubber-track');
+
+	// Mouse events
+	track.addEventListener('mousedown', startDrag);
+	track.addEventListener('click', handleTrackClick);
+	document.addEventListener('mousemove', onDrag);
+	document.addEventListener('mouseup', endDrag);
+
+	// Touch events for mobile
+	track.addEventListener('touchstart', startDrag, { passive: false });
+	document.addEventListener('touchmove', onDrag, { passive: false });
+	document.addEventListener('touchend', endDrag);
+
+	// Keyboard events for accessibility
+	track.addEventListener('keydown', handleKeyboard);
+}
+
+function startDrag(e) {
+	if (e.target.id === 'scrubber-handle' || e.target.id === 'scrubber-track') {
+		isDragging = true;
+		e.preventDefault();
+		updateFromEvent(e);
+	}
+}
+
+function onDrag(e) {
+	if (!isDragging) return;
+	e.preventDefault();
+	updateFromEvent(e);
+}
+
+function endDrag() {
+	isDragging = false;
+}
+
+function handleTrackClick(e) {
+	updateFromEvent(e);
+}
+
+function updateFromEvent(e) {
+	const track = document.getElementById('scrubber-track');
+	const rect = track.getBoundingClientRect();
+
+	let clientX;
+	if (e.touches) {
+		clientX = e.touches[0].clientX;
+	} else {
+		clientX = e.clientX;
+	}
+
+	let percent = ((clientX - rect.left) / rect.width) * 100;
+	percent = Math.max(0, Math.min(100, percent));
+
+	setHandlePosition(percent);
+
+	const { ttl_start, ttl_end } = scrubberData;
+	const range = ttl_end - ttl_start;
+	const ts = ttl_start + (range * percent / 100);
+
+	updateTimeDisplay(Math.floor(ts));
+}
+
+function handleKeyboard(e) {
+	const handle = document.getElementById('scrubber-handle');
+	const currentPercent = parseFloat(handle.style.left) || 100;
+	let newPercent = currentPercent;
+
+	switch(e.key) {
+		case 'ArrowLeft':
+		case 'ArrowDown':
+			newPercent = Math.max(0, currentPercent - 1);
+			e.preventDefault();
+			break;
+		case 'ArrowRight':
+		case 'ArrowUp':
+			newPercent = Math.min(100, currentPercent + 1);
+			e.preventDefault();
+			break;
+		case 'Home':
+			newPercent = 0;
+			e.preventDefault();
+			break;
+		case 'End':
+			newPercent = 100;
+			e.preventDefault();
+			break;
+		default:
+			return;
+	}
+
+	setHandlePosition(newPercent);
+
+	const { ttl_start, ttl_end } = scrubberData;
+	const range = ttl_end - ttl_start;
+	const ts = ttl_start + (range * newPercent / 100);
+	updateTimeDisplay(Math.floor(ts));
+}
+
+function setHandlePosition(percent) {
+	const handle = document.getElementById('scrubber-handle');
+	const fill = document.getElementById('scrubber-fill');
+	handle.style.left = percent + '%';
+	fill.style.width = percent + '%';
+
+	// Update ARIA
+	document.getElementById('scrubber-track').setAttribute('aria-valuenow', Math.round(percent));
+}
+
+function updateTimeDisplay(unixTimestamp) {
+	selectedTimestamp = unixTimestamp;
+	const display = document.getElementById('scrubber-time-display');
+	const goBtn = document.getElementById('scrubber-go-btn');
+
+	const now = Math.floor(Date.now() / 1000);
+	const diff = now - unixTimestamp;
+
+	if (diff < 60) {
+		display.textContent = 'Now (current state)';
+		goBtn.disabled = true;
+	} else {
+		const dateStr = formatDateTime(unixTimestamp * 1000);
+		const relativeStr = formatRelativeTime(diff);
+		display.textContent = dateStr + ' (' + relativeStr + ')';
+		goBtn.disabled = false;
+	}
+}
+
+function formatDateTime(ms) {
+	return new Date(ms).toLocaleString(undefined, {
+		month: 'short',
+		day: 'numeric',
+		hour: 'numeric',
+		minute: '2-digit'
+	});
+}
+
+function formatRelativeTime(seconds) {
+	if (seconds < 3600) {
+		const mins = Math.floor(seconds / 60);
+		return mins + ' minute' + (mins !== 1 ? 's' : '') + ' ago';
+	} else if (seconds < 86400) {
+		const hours = Math.floor(seconds / 3600);
+		return hours + ' hour' + (hours !== 1 ? 's' : '') + ' ago';
+	} else {
+		const days = Math.floor(seconds / 86400);
+		return days + ' day' + (days !== 1 ? 's' : '') + ' ago';
+	}
+}
+
+function goToSelectedTime() {
+	if (!selectedTimestamp) return;
+	const ts = new Date(selectedTimestamp * 1000).toISOString();
+	const url = new URL(window.location);
+	url.searchParams.set('at', ts);
+	window.location = url.toString();
+}
+
+// Existing functions for file operations
+async function restoreItem(path, isDir) {
+	const type = isDir ? 'directory' : 'file';
+	const formattedTime = new Date(timestamp).toLocaleString();
+	if (!confirm('Restore this ' + type + ' from ' + formattedTime + '?\n\nThis will restore the ' + type + ' to its state at that time.')) return;
+
+	const resp = await fetch('/api/restore-file', {
+		method: 'POST',
+		headers: {'Content-Type': 'application/x-www-form-urlencoded'},
+		body: new URLSearchParams({timestamp: timestamp, path: path})
+	});
+
+	if (!resp.ok) {
+		const text = await resp.text();
+		alert('Restore failed: ' + text);
+		return;
+	}
+
+	const parentPath = path.substring(0, path.lastIndexOf('/')) || '/';
+	window.location = parentPath === '/' ? '/' : '/browse' + parentPath;
+}
+
+if (!historicalMode) {
+	document.getElementById('file-input').addEventListener('change', async function(e) {
+		const files = e.target.files;
+		for (const file of files) {
+			const path = (currentPath === '/' ? '/' : currentPath + '/') + file.name;
+			await fetch(path, {method: 'PUT', body: file});
+		}
+		location.reload();
+	});
+}
+
+async function deleteItem(path, isDir) {
+	const type = isDir ? 'directory' : 'file';
+	if (!confirm('Delete this ' + type + '?')) return;
+	await fetch(path, {method: 'DELETE'});
+	location.reload();
+}
+
+async function createDirectory() {
+	const name = prompt('Enter folder name:');
+	if (!name) return;
+	const path = (currentPath === '/' ? '/' : currentPath + '/') + name;
+	const resp = await fetch(path, {method: 'MKCOL'});
+	if (!resp.ok) {
+		alert('Failed to create folder: ' + resp.statusText);
+		return;
+	}
+	location.reload();
+}
+</script>
+</body>
+</html>
