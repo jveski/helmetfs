@@ -12,6 +12,7 @@ import (
 	"math/rand/v2"
 	"net/http"
 	"os"
+	"syscall"
 	"time"
 
 	_ "github.com/mattn/go-sqlite3"
@@ -144,6 +145,64 @@ func takeOutTheTrash(db *sql.DB) (bool, error) {
 		slog.Info("compacted old file versions", "count", n)
 	}
 	return false, nil
+}
+
+func deleteLocalBlobs(db *sql.DB, blobsDir string) (bool, error) {
+	rows, err := db.Query(`SELECT id FROM blobs WHERE local_deleting = 1 AND local_deleted = 0 ORDER BY RANDOM() LIMIT 100`)
+	if err != nil {
+		return false, err
+	}
+	var blobIDs []string
+	for rows.Next() {
+		var blobID string
+		if err := rows.Scan(&blobID); err != nil {
+			rows.Close()
+			return false, err
+		}
+		blobIDs = append(blobIDs, blobID)
+	}
+	rows.Close()
+	if err := rows.Err(); err != nil {
+		return false, err
+	}
+
+	for _, blobID := range blobIDs {
+		blobPath := blobFilePath(blobsDir, blobID)
+		deleted, err := tryDeleteBlob(blobPath)
+		if err != nil {
+			slog.Error("failed to delete local blob", "blob_id", blobID, "path", blobPath, "error", err)
+			continue
+		}
+		if !deleted {
+			continue
+		}
+		if _, err := db.Exec(`UPDATE blobs SET local_deleted = 1 WHERE id = ?`, blobID); err != nil {
+			return false, err
+		}
+	}
+	return len(blobIDs) > 0, nil
+}
+
+func tryDeleteBlob(path string) (bool, error) {
+	f, err := os.OpenFile(path, os.O_RDWR, 0)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return true, nil
+		}
+		return false, err
+	}
+	err = syscall.Flock(int(f.Fd()), syscall.LOCK_EX|syscall.LOCK_NB)
+	if err != nil {
+		f.Close()
+		slog.Warn("blob file is locked, skipping deletion", "path", path)
+		return false, nil
+	}
+	err = os.Remove(path)
+	f.Close()
+	if err != nil {
+		return false, err
+	}
+	return true, nil
 }
 
 func checkFileIntegrity(db *sql.DB, blobsDir string, checkInterval time.Duration) (bool, error) {
