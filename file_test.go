@@ -76,6 +76,46 @@ func TestFile(t *testing.T) {
 	require.Len(t, entries, 2)
 	assert.Equal(t, "aaa.txt", entries[0].Name())
 	assert.Equal(t, "bbb.txt", entries[1].Name())
+
+	// Readdir on a non-directory should return ErrInvalid
+	_, err = f.Readdir(-1)
+	assert.ErrorIs(t, err, os.ErrInvalid)
+
+	// Readdir on subdirectory (tests prefix != "/" branch)
+	_, err = db.Exec(`INSERT INTO files (created_at, version, path, mode, mod_time, is_dir) VALUES (1, 1, ?, ?, 0, 1)`,
+		"/subdir", 0755)
+	require.NoError(t, err)
+
+	f, err = openFile(ctx, db, blobsDir, "/subdir/child1.txt", os.O_CREATE|os.O_WRONLY, 0644)
+	require.NoError(t, err)
+	require.NoError(t, f.Close())
+
+	f, err = openFile(ctx, db, blobsDir, "/subdir/child2.txt", os.O_CREATE|os.O_WRONLY, 0644)
+	require.NoError(t, err)
+	require.NoError(t, f.Close())
+
+	// Create nested dir and file (should NOT appear in subdir's Readdir)
+	_, err = db.Exec(`INSERT INTO files (created_at, version, path, mode, mod_time, is_dir) VALUES (1, 1, ?, ?, 0, 1)`,
+		"/subdir/nested", 0755)
+	require.NoError(t, err)
+
+	f, err = openFile(ctx, db, blobsDir, "/subdir/nested/deep.txt", os.O_CREATE|os.O_WRONLY, 0644)
+	require.NoError(t, err)
+	require.NoError(t, f.Close())
+
+	subdir := &file{db: db, path: "/subdir", isDir: true}
+	entries, err = subdir.Readdir(-1)
+	require.NoError(t, err)
+	require.Len(t, entries, 3) // child1.txt, child2.txt, nested (but not nested/deep.txt)
+
+	names := make([]string, len(entries))
+	for i, e := range entries {
+		names[i] = e.Name()
+	}
+	assert.Contains(t, names, "child1.txt")
+	assert.Contains(t, names, "child2.txt")
+	assert.Contains(t, names, "nested")
+	assert.NotContains(t, names, "deep.txt")
 }
 
 func TestFileChecksum(t *testing.T) {
