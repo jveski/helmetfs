@@ -1,0 +1,220 @@
+name: Linux Smoke Test (davfs2)
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  mount-test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: 'go.mod'
+
+      - name: Install davfs2
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y davfs2
+
+      - name: Configure davfs2
+        run: |
+          # Create user davfs2 config directory
+          mkdir -p ~/.davfs2
+
+          # Allow mounting without credentials (empty username/password)
+          echo "http://localhost:8080/ \"\" \"\"" >> ~/.davfs2/secrets
+          chmod 600 ~/.davfs2/secrets
+
+          # Configure davfs2 options for better compatibility
+          cat > ~/.davfs2/davfs2.conf << 'EOF'
+          use_locks 0
+          delay_upload 0
+          EOF
+
+          # Add user to davfs2 group (allows user mounts)
+          sudo usermod -aG davfs2 $USER
+
+      - name: Build HelmetFS
+        run: go build -o helmetfs .
+
+      - name: Start HelmetFS
+        run: |
+          ./helmetfs -addr :8080 &
+          sleep 2
+
+      - name: Mount WebDAV share
+        run: |
+          sudo mkdir -p /mnt/helmetfs
+          sudo mount -t davfs -o uid=$(id -u),gid=$(id -g) http://localhost:8080/ /mnt/helmetfs
+
+      - name: Run CRUD tests
+        run: |
+          MOUNT=/mnt/helmetfs
+
+          # Test 1: Create and read a file
+          echo "hello world" > "$MOUNT/test.txt"
+          content=$(cat "$MOUNT/test.txt")
+          [ "$content" = "hello world" ] || { echo "FAIL: Create/Read test"; exit 1; }
+          echo "PASS: Create/Read test"
+
+          # Test 2: Update file
+          echo "updated content" > "$MOUNT/test.txt"
+          content=$(cat "$MOUNT/test.txt")
+          [ "$content" = "updated content" ] || { echo "FAIL: Update test"; exit 1; }
+          echo "PASS: Update test"
+
+          # Test 3: Delete file
+          rm "$MOUNT/test.txt"
+          [ ! -f "$MOUNT/test.txt" ] || { echo "FAIL: Delete test"; exit 1; }
+          echo "PASS: Delete test"
+
+          # Test 4: Directory operations
+          mkdir "$MOUNT/testdir"
+          [ -d "$MOUNT/testdir" ] || { echo "FAIL: Mkdir test"; exit 1; }
+          echo "PASS: Mkdir test"
+
+          echo "file in dir" > "$MOUNT/testdir/nested.txt"
+          content=$(cat "$MOUNT/testdir/nested.txt")
+          [ "$content" = "file in dir" ] || { echo "FAIL: Nested file test"; exit 1; }
+          echo "PASS: Nested file test"
+
+          rm -r "$MOUNT/testdir"
+          [ ! -d "$MOUNT/testdir" ] || { echo "FAIL: Rmdir test"; exit 1; }
+          echo "PASS: Rmdir test"
+
+          # Test 5: Larger file (100KB to test blob handling)
+          dd if=/dev/urandom bs=1024 count=100 2>/dev/null | base64 > "$MOUNT/large.txt"
+          [ -s "$MOUNT/large.txt" ] || { echo "FAIL: Large file create test"; exit 1; }
+          rm "$MOUNT/large.txt"
+          [ ! -f "$MOUNT/large.txt" ] || { echo "FAIL: Large file delete test"; exit 1; }
+          echo "PASS: Large file test"
+
+          # Test 6: Filename with spaces
+          echo "special" > "$MOUNT/file with spaces.txt"
+          content=$(cat "$MOUNT/file with spaces.txt")
+          [ "$content" = "special" ] || { echo "FAIL: Filename with spaces test"; exit 1; }
+          rm "$MOUNT/file with spaces.txt"
+          echo "PASS: Filename with spaces test"
+
+          echo "All CRUD tests passed!"
+
+      - name: Large directory upload test
+        run: |
+          MOUNT=/mnt/helmetfs
+          TESTDIR="$MOUNT/bulk-test"
+          SRCDIR="/tmp/bulk-source"
+          FILE_COUNT=200
+          FILE_SIZE_KB=512  # ~0.5MB per file
+
+          echo "Creating source directory with $FILE_COUNT files of ${FILE_SIZE_KB}KB each..."
+          mkdir -p "$SRCDIR"
+          for i in $(seq 1 $FILE_COUNT); do
+            dd if=/dev/urandom of="$SRCDIR/file_$(printf '%03d' $i).bin" bs=1024 count=$FILE_SIZE_KB 2>/dev/null
+          done
+
+          echo "Computing source checksums..."
+          (cd "$SRCDIR" && sha256sum *.bin | sort) > /tmp/source_checksums.txt
+
+          echo "Uploading $FILE_COUNT files to WebDAV mount..."
+          UPLOAD_START=$(date +%s)
+          mkdir -p "$TESTDIR"
+          cp -r "$SRCDIR"/* "$TESTDIR/"
+          sync
+          UPLOAD_END=$(date +%s)
+          UPLOAD_DURATION=$((UPLOAD_END - UPLOAD_START))
+          echo "Upload completed in ${UPLOAD_DURATION}s"
+
+          # Verify file count
+          UPLOADED_COUNT=$(ls -1 "$TESTDIR" | wc -l | tr -d ' ')
+          if [ "$UPLOADED_COUNT" -ne "$FILE_COUNT" ]; then
+            echo "FAIL: Expected $FILE_COUNT files, found $UPLOADED_COUNT"
+            exit 1
+          fi
+          echo "PASS: Uploaded $FILE_COUNT files"
+
+          echo "Computing uploaded file checksums..."
+          (cd "$TESTDIR" && sha256sum *.bin | sort) > /tmp/uploaded_checksums.txt
+
+          if ! diff /tmp/source_checksums.txt /tmp/uploaded_checksums.txt; then
+            echo "FAIL: Checksum mismatch after upload"
+            exit 1
+          fi
+          echo "PASS: Upload checksums verified"
+
+      - name: Large directory download test
+        run: |
+          MOUNT=/mnt/helmetfs
+          TESTDIR="$MOUNT/bulk-test"
+          DLDIR="/tmp/bulk-download"
+          FILE_COUNT=200
+
+          echo "Downloading files from WebDAV mount..."
+          mkdir -p "$DLDIR"
+          DOWNLOAD_START=$(date +%s)
+          cp -r "$TESTDIR"/* "$DLDIR/"
+          DOWNLOAD_END=$(date +%s)
+          DOWNLOAD_DURATION=$((DOWNLOAD_END - DOWNLOAD_START))
+          echo "Download completed in ${DOWNLOAD_DURATION}s"
+
+          # Verify file count
+          DOWNLOADED_COUNT=$(ls -1 "$DLDIR" | wc -l | tr -d ' ')
+          if [ "$DOWNLOADED_COUNT" -ne "$FILE_COUNT" ]; then
+            echo "FAIL: Expected $FILE_COUNT files, found $DOWNLOADED_COUNT"
+            exit 1
+          fi
+          echo "PASS: Downloaded $FILE_COUNT files"
+
+          echo "Computing downloaded file checksums..."
+          (cd "$DLDIR" && sha256sum *.bin | sort) > /tmp/downloaded_checksums.txt
+
+          if ! diff /tmp/source_checksums.txt /tmp/downloaded_checksums.txt; then
+            echo "FAIL: Checksum mismatch after download"
+            exit 1
+          fi
+          echo "PASS: Download checksums verified"
+
+          echo "Cleaning up test directory from mount..."
+          rm -r "$TESTDIR"
+          [ ! -d "$TESTDIR" ] || { echo "FAIL: Bulk test directory not deleted"; exit 1; }
+          echo "PASS: Bulk test directory cleaned up"
+
+          echo "Large directory upload/download test passed!"
+
+      - name: Unmount WebDAV share
+        run: |
+          echo "Unmounting WebDAV share..."
+          if ! sudo umount /mnt/helmetfs; then
+            echo "FAIL: umount failed"
+            exit 1
+          fi
+          echo "Unmount command succeeded"
+
+          # Verify mount is gone
+          sleep 1
+          if mount | grep -q "/mnt/helmetfs"; then
+            echo "FAIL: Mount still appears in mount table"
+            exit 1
+          fi
+          echo "PASS: Mount no longer in mount table"
+
+          # Verify mount point is not accessible as a mount
+          if [ -d /mnt/helmetfs ] && ls /mnt/helmetfs 2>/dev/null | grep -q .; then
+            echo "FAIL: Mount point still has contents"
+            exit 1
+          fi
+          echo "PASS: Mount point is empty or inaccessible"
+
+          echo "Unmount verification complete!"
+
+      - name: Cleanup
+        if: always()
+        run: |
+          sudo umount /mnt/helmetfs 2>/dev/null || true
+          pkill helmetfs || true
+          rm -rf /tmp/bulk-source /tmp/bulk-download /tmp/*_checksums.txt || true
