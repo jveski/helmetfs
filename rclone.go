@@ -2,6 +2,7 @@ package main
 
 import (
 	"bytes"
+	"context"
 	"database/sql"
 	"io"
 	"log/slog"
@@ -9,35 +10,46 @@ import (
 	"strings"
 )
 
-func syncRemote(db *sql.DB, blobsDir, remotePath, bwLimit string) (bool, error) {
-	n1, err := rcloneBatchOp(db, blobsDir,
+type Rclone struct {
+	remotePath    string
+	bwLimit       string
+	downloadLimit chan struct{}
+}
+
+func NewRclone(remotePath, bwLimit string, historicalDownloadConcurrency int) *Rclone {
+	return &Rclone{
+		remotePath:    remotePath,
+		bwLimit:       bwLimit,
+		downloadLimit: make(chan struct{}, historicalDownloadConcurrency),
+	}
+}
+
+func (r *Rclone) Sync(db *sql.DB, blobsDir string) (bool, error) {
+	n1, err := r.batchOp(db, blobsDir,
 		`SELECT id FROM blobs WHERE remote_written = 1 AND remote_deleting = 1 AND remote_deleted = 0 LIMIT 100`,
 		`UPDATE blobs SET remote_deleted = 1 WHERE id = ?`,
-		[]string{"delete", "--files-from-raw", "-", remotePath},
-		bwLimit,
+		[]string{"delete", "--files-from-raw", "-", r.remotePath},
 		"deleted blobs from remote")
 	if err != nil {
 		return false, err
 	}
-	n2, err := rcloneBatchOp(db, blobsDir,
+	n2, err := r.batchOp(db, blobsDir,
 		`SELECT id FROM blobs WHERE local_written = 1 AND remote_written = 0 AND local_deleting = 0 LIMIT 100`,
 		`UPDATE blobs SET remote_written = 1 WHERE id = ?`,
-		[]string{"copy", "--no-update-dir-modtime", "--files-from-raw", "-", blobsDir, remotePath},
-		bwLimit,
+		[]string{"copy", "--no-update-dir-modtime", "--files-from-raw", "-", blobsDir, r.remotePath},
 		"uploaded blobs to remote")
 	if err != nil {
 		return false, err
 	}
-	n3, err := rcloneBatchOp(db, blobsDir,
+	n3, err := r.batchOp(db, blobsDir,
 		`SELECT id FROM blobs WHERE local_written = 0 AND remote_written = 1 AND remote_deleted = 0 LIMIT 100`,
 		`UPDATE blobs SET local_written = 1 WHERE id = ?`,
-		[]string{"copy", "--no-update-dir-modtime", "--files-from-raw", "-", remotePath, blobsDir},
-		bwLimit,
+		[]string{"copy", "--no-update-dir-modtime", "--files-from-raw", "-", r.remotePath, blobsDir},
 		"downloaded blobs from remote")
 	return n1+n2+n3 > 0, err
 }
 
-func rcloneBatchOp(db *sql.DB, blobsDir, selectQuery, updateQuery string, rcloneArgs []string, bwLimit, logMsg string) (int, error) {
+func (r *Rclone) batchOp(db *sql.DB, blobsDir, selectQuery, updateQuery string, rcloneArgs []string, logMsg string) (int, error) {
 	rows, err := db.Query(selectQuery)
 	if err != nil {
 		return 0, err
@@ -69,8 +81,8 @@ func rcloneBatchOp(db *sql.DB, blobsDir, selectQuery, updateQuery string, rclone
 	}
 
 	args := rcloneArgs
-	if bwLimit != "" && bwLimit != "0" {
-		args = append([]string{"--bwlimit", bwLimit}, args...)
+	if r.bwLimit != "" && r.bwLimit != "0" {
+		args = append([]string{"--bwlimit", r.bwLimit}, args...)
 	}
 	cmd := exec.Command("rclone", args...)
 	cmd.Stdin = strings.NewReader(fileList.String())
@@ -90,10 +102,15 @@ func rcloneBatchOp(db *sql.DB, blobsDir, selectQuery, updateQuery string, rclone
 	return len(blobIDs), nil
 }
 
-func rcloneCopyFile(src, dst, bwLimit string) error {
+func (r *Rclone) CopyFile(src, dst string, toRemote bool) error {
+	if toRemote {
+		dst = r.remotePath + "/" + dst
+	} else {
+		src = r.remotePath + "/" + src
+	}
 	args := []string{"copyto", src, dst}
-	if bwLimit != "" && bwLimit != "0" {
-		args = append([]string{"--bwlimit", bwLimit}, args...)
+	if r.bwLimit != "" && r.bwLimit != "0" {
+		args = append([]string{"--bwlimit", r.bwLimit}, args...)
 	}
 	cmd := exec.Command("rclone", args...)
 	var stderr bytes.Buffer
@@ -105,7 +122,15 @@ func rcloneCopyFile(src, dst, bwLimit string) error {
 	return nil
 }
 
-func rcloneCatFile(src string, w io.Writer) error {
+func (r *Rclone) CatBlob(ctx context.Context, blobID string, w io.Writer) error {
+	select {
+	case r.downloadLimit <- struct{}{}:
+		defer func() { <-r.downloadLimit }()
+	case <-ctx.Done():
+		return ctx.Err()
+	}
+
+	src := r.remotePath + "/" + blobID[:2] + "/" + blobID[2:]
 	cmd := exec.Command("rclone", "cat", src)
 	cmd.Stdout = w
 	var stderr bytes.Buffer

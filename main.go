@@ -34,8 +34,6 @@ const (
 	dbBackupPath = "meta.db.backup"
 )
 
-var historicalDownloadSem chan struct{}
-
 //go:embed assets/status.html
 var statusHTML string
 
@@ -65,9 +63,12 @@ func run() error {
 	}
 	slog.SetDefault(slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: logLevel})))
 
-	historicalDownloadSem = make(chan struct{}, *historicalDownloadConcurrency)
+	var rc *Rclone
+	if *rcloneRemote != "" {
+		rc = NewRclone(*rcloneRemote, *rcloneBwLimit, *historicalDownloadConcurrency)
+	}
 
-	if err := restoreDatabase(dbPath, dbBackupPath, *rcloneRemote, *rcloneBwLimit); err != nil {
+	if err := restoreDatabase(dbPath, dbBackupPath, rc); err != nil {
 		return err
 	}
 
@@ -90,7 +91,7 @@ func run() error {
 		return err
 	}
 
-	server := NewServer(db, blobsDir)
+	server := NewServer(db, blobsDir, rc)
 	handler := logRequests(server)
 
 	runLoop(10*time.Second, "garbage collection", func() (bool, error) {
@@ -102,14 +103,14 @@ func run() error {
 	runLoop(time.Second, "integrity check", func() (bool, error) {
 		return checkFileIntegrity(db, blobsDir, *integrityCheckInterval)
 	})
-	if *rcloneRemote != "" {
+	if rc != nil {
 		runLoop(time.Second, "remote sync", func() (bool, error) {
-			return syncRemote(db, blobsDir, *rcloneRemote, *rcloneBwLimit)
+			return rc.Sync(db, blobsDir)
 		})
 	}
-	if *backupInterval > 0 && *rcloneRemote != "" {
+	if *backupInterval > 0 && rc != nil {
 		runLoop(*backupInterval, "database backup", func() (bool, error) {
-			return false, backupDatabase(db, dbBackupPath, *rcloneRemote, *rcloneBwLimit)
+			return false, backupDatabase(db, dbBackupPath, rc)
 		})
 	}
 
@@ -193,7 +194,7 @@ func checkFileIntegrity(db *sql.DB, blobsDir string, checkInterval time.Duration
 	return err == nil, err
 }
 
-func backupDatabase(db *sql.DB, backupPath, remotePath, bwLimit string) error {
+func backupDatabase(db *sql.DB, backupPath string, rc *Rclone) error {
 	tmpPath := backupPath + ".tmp"
 	_, err := db.Exec(`VACUUM INTO ?`, tmpPath)
 	if err != nil {
@@ -203,8 +204,7 @@ func backupDatabase(db *sql.DB, backupPath, remotePath, bwLimit string) error {
 		return err
 	}
 
-	err = rcloneCopyFile(backupPath, remotePath+"/meta.db.backup", bwLimit)
-	if err != nil {
+	if err := rc.CopyFile(backupPath, "meta.db.backup", true); err != nil {
 		return err
 	}
 
@@ -212,15 +212,15 @@ func backupDatabase(db *sql.DB, backupPath, remotePath, bwLimit string) error {
 	return nil
 }
 
-func restoreDatabase(dbPath, backupPath, remotePath, bwLimit string) error {
-	if _, err := os.Stat(dbPath); !os.IsNotExist(err) || remotePath == "" {
-		return nil // db still exists
+func restoreDatabase(dbPath, backupPath string, rc *Rclone) error {
+	if _, err := os.Stat(dbPath); !os.IsNotExist(err) || rc == nil {
+		return nil // db still exists or no remote configured
 	}
 
 	if _, err := os.Stat(backupPath); err != nil {
 		tmpPath := backupPath + ".tmp"
 		slog.Info("local backup missing, attempting to download from remote")
-		if err := rcloneCopyFile(remotePath+"/meta.db.backup", tmpPath, bwLimit); err != nil {
+		if err := rc.CopyFile("meta.db.backup", tmpPath, false); err != nil {
 			return err
 		}
 

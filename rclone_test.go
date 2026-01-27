@@ -30,6 +30,8 @@ func TestSyncRemote(t *testing.T) {
 	require.NoError(t, os.WriteFile(configPath, []byte("[testremote]\ntype = local\n"), 0644))
 	t.Setenv("RCLONE_CONFIG", configPath)
 
+	rc := NewRclone("testremote:"+remoteDir, "0", 0)
+
 	// Write a test file
 	f, err := openFile(ctx, db, blobsDir, "/test.txt", os.O_CREATE|os.O_WRONLY, 0644)
 	require.NoError(t, err)
@@ -39,11 +41,11 @@ func TestSyncRemote(t *testing.T) {
 	blobID := f.blobID
 
 	// Sync once to upload the blob
-	_, err = syncRemote(db, blobsDir, "testremote:"+remoteDir, "0")
+	_, err = rc.Sync(db, blobsDir)
 	require.NoError(t, err)
 
 	// Idempotence check
-	_, err = syncRemote(db, blobsDir, "testremote:"+remoteDir, "0")
+	_, err = rc.Sync(db, blobsDir)
 	require.NoError(t, err)
 
 	// Prove the remote blob was created with relative path structure (not nested under blobsDir)
@@ -70,7 +72,7 @@ func TestSyncRemote(t *testing.T) {
 	require.NoError(t, err)
 
 	// Sync should download the blob from remote
-	_, err = syncRemote(db, blobsDir, "testremote:"+remoteDir, "0")
+	_, err = rc.Sync(db, blobsDir)
 	require.NoError(t, err)
 
 	// Prove the local blob was restored
@@ -88,7 +90,7 @@ func TestSyncRemote(t *testing.T) {
 	require.NoError(t, err)
 
 	// Delete blob from remote
-	_, err = syncRemote(db, blobsDir, "testremote:"+remoteDir, "0")
+	_, err = rc.Sync(db, blobsDir)
 	require.NoError(t, err)
 
 	// Prove the remote blob was deleted

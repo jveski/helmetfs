@@ -21,14 +21,16 @@ import (
 type Server struct {
 	db       *sql.DB
 	blobsDir string
+	rclone   *Rclone
 	dav      *webdav.Handler
 }
 
 // NewServer creates a new Server with the given database and blob directory.
-func NewServer(db *sql.DB, blobsDir string) *Server {
+func NewServer(db *sql.DB, blobsDir string, rc *Rclone) *Server {
 	s := &Server{
 		db:       db,
 		blobsDir: blobsDir,
+		rclone:   rc,
 	}
 	s.dav = &webdav.Handler{
 		FileSystem: &FS{db: db, blobsDir: blobsDir},
@@ -206,25 +208,16 @@ func (s *Server) handleDownloadHistorical(w http.ResponseWriter, r *http.Request
 	}
 
 	// If blob is only on remote, stream directly without downloading locally
-	if remoteWritten && *rcloneRemote != "" {
-		remoteSrc := *rcloneRemote + "/" + blobID[:2] + "/" + blobID[2:]
+	if remoteWritten && s.rclone != nil {
 		w.Header().Set("Content-Disposition", "attachment; filename=\""+path.Base(filePath)+"\"")
 		w.Header().Set("Content-Type", "application/octet-stream")
 		if size > 0 {
 			w.Header().Set("Content-Length", strconv.FormatInt(size, 10))
 		}
 
-		// Acquire semaphore - throttle concurrent historical downloads
-		// Headers sent first so client knows download is starting
-		select {
-		case historicalDownloadSem <- struct{}{}:
-			defer func() { <-historicalDownloadSem }()
-		case <-r.Context().Done():
-			return
-		}
-
 		// Stream without bandwidth limit - historical downloads should be fast
-		if err := rcloneCatFile(remoteSrc, w); err != nil {
+		// CatBlob handles semaphore acquisition internally
+		if err := s.rclone.CatBlob(r.Context(), blobID, w); err != nil {
 			// Headers already sent, can't send error response
 			slog.Error("failed to stream historical file from remote", "path", filePath, "blob_id", blobID, "error", err)
 		}

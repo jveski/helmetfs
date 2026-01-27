@@ -39,6 +39,8 @@ func TestDatabaseBackupRestore(t *testing.T) {
 	backupPath := filepath.Join(tmpDir, "test.db.backup")
 	remotePath := "testremote:" + remoteDir
 
+	rc := NewRclone(remotePath, "0", 0)
+
 	db, err := sql.Open("sqlite3", "file:"+dbPath+"?_txlock=immediate")
 	require.NoError(t, err)
 	_, err = db.Exec(schema)
@@ -46,7 +48,7 @@ func TestDatabaseBackupRestore(t *testing.T) {
 	_, err = db.Exec(`INSERT INTO files (created_at, version, path, mode, mod_time, is_dir) VALUES (1, 1, '/test.txt', 0644, 1, 0)`)
 	require.NoError(t, err)
 
-	err = backupDatabase(db, backupPath, remotePath, "0")
+	err = backupDatabase(db, backupPath, rc)
 	require.NoError(t, err)
 	db.Close()
 
@@ -58,7 +60,7 @@ func TestDatabaseBackupRestore(t *testing.T) {
 	require.NoError(t, os.Remove(dbPath))
 	require.NoError(t, os.Remove(backupPath))
 
-	err = restoreDatabase(dbPath, backupPath, remotePath, "0")
+	err = restoreDatabase(dbPath, backupPath, rc)
 	require.NoError(t, err)
 
 	_, err = os.Stat(backupPath)
@@ -76,7 +78,7 @@ func TestDatabaseBackupRestore(t *testing.T) {
 
 func TestStatusPage(t *testing.T) {
 	db, blobsDir := initTestState(t)
-	server := NewServer(db, blobsDir)
+	server := NewServer(db, blobsDir, nil)
 	ts := httptest.NewServer(server)
 	t.Cleanup(func() { ts.Close() })
 
@@ -586,7 +588,7 @@ func TestFormatBytes(t *testing.T) {
 
 func TestHistoricalBrowse(t *testing.T) {
 	db, blobsDir := initTestState(t)
-	server := NewServer(db, blobsDir)
+	server := NewServer(db, blobsDir, nil)
 	ts := httptest.NewServer(server)
 	t.Cleanup(func() { ts.Close() })
 
@@ -670,7 +672,7 @@ func TestHistoricalBrowse(t *testing.T) {
 
 func TestRestoreFileAPI(t *testing.T) {
 	db, blobsDir := initTestState(t)
-	server := NewServer(db, blobsDir)
+	server := NewServer(db, blobsDir, nil)
 	ts := httptest.NewServer(server)
 	t.Cleanup(func() { ts.Close() })
 
@@ -733,7 +735,7 @@ func TestRestoreFileAPI(t *testing.T) {
 
 func TestDownloadHistoricalAPI(t *testing.T) {
 	db, blobsDir := initTestState(t)
-	server := NewServer(db, blobsDir)
+	server := NewServer(db, blobsDir, nil)
 	ts := httptest.NewServer(server)
 	t.Cleanup(func() { ts.Close() })
 
