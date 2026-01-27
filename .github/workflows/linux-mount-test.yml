@@ -30,17 +30,26 @@ jobs:
 
           # Configure davfs2 options for better compatibility
           sudo tee -a /etc/davfs2/davfs2.conf << 'EOF'
-          use_locks 0
-          delay_upload 0
-          EOF
+use_locks 0
+delay_upload 0
+EOF
 
       - name: Build HelmetFS
         run: go build -o helmetfs .
 
       - name: Start HelmetFS
         run: |
-          ./helmetfs -addr :8080 &
+          ./helmetfs -addr :8080 -debug &
           sleep 2
+
+      - name: Test WebDAV responses
+        run: |
+          echo "=== OPTIONS request ==="
+          curl -s -i -X OPTIONS http://localhost:8080/
+          echo ""
+          echo "=== PROPFIND request ==="
+          curl -s -i -X PROPFIND http://localhost:8080/ -H "Depth: 0"
+          echo ""
 
       - name: Mount WebDAV share
         run: |
