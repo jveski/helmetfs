@@ -810,3 +810,59 @@ func TestDownloadHistoricalAPI(t *testing.T) {
 		assert.Contains(t, body, "cannot download beyond retention period")
 	})
 }
+
+func TestDeleteLocalBlobs(t *testing.T) {
+	db, blobsDir := initTestState(t)
+
+	// Deletes blob file and marks as deleted
+	now := time.Now().Unix()
+	blobID := uuid.New().String()
+	_, err := db.Exec(`INSERT INTO blobs (id, creation_time, modified_time, local_written, local_deleting) VALUES (?, ?, ?, 1, 1)`, blobID, now, now)
+	require.NoError(t, err)
+
+	blobPath := blobFilePath(blobsDir, blobID)
+	require.NoError(t, os.WriteFile(blobPath, []byte("test content"), 0644))
+
+	_, err = deleteLocalBlobs(db, blobsDir)
+	require.NoError(t, err)
+
+	_, err = os.Stat(blobPath)
+	assert.True(t, os.IsNotExist(err))
+
+	var localDeleted int
+	require.NoError(t, db.QueryRow(`SELECT local_deleted FROM blobs WHERE id = ?`, blobID).Scan(&localDeleted))
+	assert.Equal(t, 1, localDeleted)
+
+	// Skips blobs with active readers
+	blobID = uuid.New().String()
+	_, err = db.Exec(`INSERT INTO blobs (id, creation_time, modified_time, local_written, local_deleting) VALUES (?, ?, ?, 1, 1)`, blobID, now, now)
+	require.NoError(t, err)
+
+	blobPath = blobFilePath(blobsDir, blobID)
+	require.NoError(t, os.WriteFile(blobPath, []byte("test content"), 0644))
+
+	reader, err := open(blobPath, os.O_RDONLY, 0)
+	require.NoError(t, err)
+
+	_, err = deleteLocalBlobs(db, blobsDir)
+	require.NoError(t, err)
+
+	_, err = os.Stat(blobPath)
+	assert.NoError(t, err)
+
+	require.NoError(t, db.QueryRow(`SELECT local_deleted FROM blobs WHERE id = ?`, blobID).Scan(&localDeleted))
+	assert.Equal(t, 0, localDeleted)
+
+	reader.Close()
+
+	// Handles missing file gracefully
+	blobID = uuid.New().String()
+	_, err = db.Exec(`INSERT INTO blobs (id, creation_time, modified_time, local_written, local_deleting) VALUES (?, ?, ?, 1, 1)`, blobID, now, now)
+	require.NoError(t, err)
+
+	_, err = deleteLocalBlobs(db, blobsDir)
+	require.NoError(t, err)
+
+	require.NoError(t, db.QueryRow(`SELECT local_deleted FROM blobs WHERE id = ?`, blobID).Scan(&localDeleted))
+	assert.Equal(t, 1, localDeleted)
+}
