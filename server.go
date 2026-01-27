@@ -19,18 +19,16 @@ import (
 
 // Server handles HTTP requests for the HelmetFS WebDAV server.
 type Server struct {
-	db       *sql.DB
-	blobsDir string
-	rclone   *Rclone
-	dav      *webdav.Handler
+	db     *sql.DB
+	rclone *Rclone
+	dav    *webdav.Handler
 }
 
 // NewServer creates a new Server with the given database and blob directory.
 func NewServer(db *sql.DB, blobsDir string, rc *Rclone) *Server {
 	s := &Server{
-		db:       db,
-		blobsDir: blobsDir,
-		rclone:   rc,
+		db:     db,
+		rclone: rc,
 	}
 	s.dav = &webdav.Handler{
 		FileSystem: &FS{db: db, blobsDir: blobsDir},
@@ -178,16 +176,16 @@ func (s *Server) handleDownloadHistorical(w http.ResponseWriter, r *http.Request
 
 	// Look up blob_id at historical timestamp
 	var blobID string
-	var localWritten, remoteWritten bool
+	var remoteWritten bool
 	var size int64
 	err = s.db.QueryRowContext(r.Context(), `
-		SELECT f.blob_id, b.local_written, b.remote_written, b.size
+		SELECT f.blob_id, b.remote_written, b.size
 		FROM files f
 		JOIN blobs b ON f.blob_id = b.id
 		WHERE f.path = ? AND f.is_dir = 0 AND f.deleted = 0
 		AND f.created_at <= ?
 		AND f.version = (SELECT MAX(version) FROM files WHERE path = ? AND created_at <= ?)
-	`, filePath, tsUnix, filePath, tsUnix).Scan(&blobID, &localWritten, &remoteWritten, &size)
+	`, filePath, tsUnix, filePath, tsUnix).Scan(&blobID, &remoteWritten, &size)
 
 	if err == sql.ErrNoRows {
 		http.Error(w, "file not found at timestamp", http.StatusNotFound)
@@ -198,16 +196,7 @@ func (s *Server) handleDownloadHistorical(w http.ResponseWriter, r *http.Request
 		return
 	}
 
-	blobPath := blobFilePath(s.blobsDir, blobID)
-
-	// If blob is local, serve from disk
-	if localWritten {
-		w.Header().Set("Content-Disposition", "attachment; filename=\""+path.Base(filePath)+"\"")
-		http.ServeFile(w, r, blobPath)
-		return
-	}
-
-	// If blob is only on remote, stream directly without downloading locally
+	// Stream from remote storage
 	if remoteWritten && s.rclone != nil {
 		w.Header().Set("Content-Disposition", "attachment; filename=\""+path.Base(filePath)+"\"")
 		w.Header().Set("Content-Type", "application/octet-stream")
