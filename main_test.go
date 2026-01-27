@@ -748,8 +748,8 @@ func TestDownloadHistoricalAPI(t *testing.T) {
 		return resp.StatusCode, string(body), resp.Header
 	}
 
-	t.Run("downloads historical file version", func(t *testing.T) {
-		// Create blob with content
+	t.Run("returns unavailable when no remote configured", func(t *testing.T) {
+		// Create blob with content (local only, no remote)
 		content := []byte("historical content version 1")
 		blobID := uuid.New().String()
 		now := time.Now().Unix()
@@ -764,11 +764,11 @@ func TestDownloadHistoricalAPI(t *testing.T) {
 		_, err = db.Exec(`INSERT INTO files (created_at, version, path, mode, mod_time, is_dir, deleted, blob_id) VALUES (?, 1, '/download-test.txt', 0644, ?, 0, 0, ?)`, t1, t1, blobID)
 		require.NoError(t, err)
 
+		// Historical downloads require remote storage; without rclone configured, content is unavailable
 		downloadTime := time.Unix(t1+10, 0).UTC().Format(time.RFC3339)
-		code, body, headers := getDownloadHistorical("/download-test.txt", downloadTime)
-		assert.Equal(t, http.StatusOK, code)
-		assert.Equal(t, string(content), body)
-		assert.Contains(t, headers.Get("Content-Disposition"), "download-test.txt")
+		code, body, _ := getDownloadHistorical("/download-test.txt", downloadTime)
+		assert.Equal(t, http.StatusNotFound, code)
+		assert.Contains(t, body, "file content not available")
 	})
 
 	t.Run("returns 404 for file not found at timestamp", func(t *testing.T) {

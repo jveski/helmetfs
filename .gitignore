@@ -2,3 +2,4 @@ helmetfs
 meta.d*
 blobs
 soaktest/soaktest
+coverage.out
