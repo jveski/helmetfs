@@ -24,21 +24,15 @@ jobs:
 
       - name: Configure davfs2
         run: |
-          # Create user davfs2 config directory
-          mkdir -p ~/.davfs2
-
-          # Allow mounting without credentials (empty username/password)
-          echo "http://localhost:8080/ \"\" \"\"" >> ~/.davfs2/secrets
-          chmod 600 ~/.davfs2/secrets
+          # Configure system-level davfs2 secrets (used by sudo mount)
+          echo "http://localhost:8080/ \"\" \"\"" | sudo tee -a /etc/davfs2/secrets
+          sudo chmod 600 /etc/davfs2/secrets
 
           # Configure davfs2 options for better compatibility
-          cat > ~/.davfs2/davfs2.conf << 'EOF'
+          sudo tee -a /etc/davfs2/davfs2.conf << 'EOF'
           use_locks 0
           delay_upload 0
           EOF
-
-          # Add user to davfs2 group (allows user mounts)
-          sudo usermod -aG davfs2 $USER
 
       - name: Build HelmetFS
         run: go build -o helmetfs .
