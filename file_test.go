@@ -118,6 +118,192 @@ func TestFile(t *testing.T) {
 	assert.NotContains(t, names, "deep.txt")
 }
 
+func TestFileSeek(t *testing.T) {
+	db, blobsDir := initTestState(t)
+	ctx := t.Context()
+
+	// Create a file with known content
+	content := []byte("0123456789")
+	f, err := openFile(ctx, db, blobsDir, "/seek.txt", os.O_CREATE|os.O_WRONLY, 0644)
+	require.NoError(t, err)
+	_, err = f.Write(content)
+	require.NoError(t, err)
+	require.NoError(t, f.Close())
+
+	t.Run("file SeekStart", func(t *testing.T) {
+		f, err := openFile(ctx, db, blobsDir, "/seek.txt", os.O_RDONLY, 0)
+		require.NoError(t, err)
+		defer f.Close()
+
+		pos, err := f.Seek(3, io.SeekStart)
+		require.NoError(t, err)
+		assert.Equal(t, int64(3), pos)
+
+		buf := make([]byte, 3)
+		n, err := f.Read(buf)
+		require.NoError(t, err)
+		assert.Equal(t, 3, n)
+		assert.Equal(t, "345", string(buf))
+	})
+
+	t.Run("file SeekCurrent", func(t *testing.T) {
+		f, err := openFile(ctx, db, blobsDir, "/seek.txt", os.O_RDONLY, 0)
+		require.NoError(t, err)
+		defer f.Close()
+
+		// Read 3 bytes to advance position
+		buf := make([]byte, 3)
+		_, err = f.Read(buf)
+		require.NoError(t, err)
+		assert.Equal(t, "012", string(buf))
+
+		// Seek 2 forward from current position (now at 3, seek to 5)
+		pos, err := f.Seek(2, io.SeekCurrent)
+		require.NoError(t, err)
+		assert.Equal(t, int64(5), pos)
+
+		buf = make([]byte, 3)
+		n, err := f.Read(buf)
+		require.NoError(t, err)
+		assert.Equal(t, 3, n)
+		assert.Equal(t, "567", string(buf))
+
+		// Seek backward from current position
+		pos, err = f.Seek(-5, io.SeekCurrent)
+		require.NoError(t, err)
+		assert.Equal(t, int64(3), pos)
+
+		buf = make([]byte, 2)
+		n, err = f.Read(buf)
+		require.NoError(t, err)
+		assert.Equal(t, 2, n)
+		assert.Equal(t, "34", string(buf))
+	})
+
+	t.Run("file SeekEnd", func(t *testing.T) {
+		f, err := openFile(ctx, db, blobsDir, "/seek.txt", os.O_RDONLY, 0)
+		require.NoError(t, err)
+		defer f.Close()
+
+		// Seek to 3 bytes before end
+		pos, err := f.Seek(-3, io.SeekEnd)
+		require.NoError(t, err)
+		assert.Equal(t, int64(7), pos)
+
+		buf := make([]byte, 3)
+		n, err := f.Read(buf)
+		require.NoError(t, err)
+		assert.Equal(t, 3, n)
+		assert.Equal(t, "789", string(buf))
+
+		// Seek to end
+		pos, err = f.Seek(0, io.SeekEnd)
+		require.NoError(t, err)
+		assert.Equal(t, int64(10), pos)
+	})
+
+	t.Run("dir SeekStart", func(t *testing.T) {
+		// Create directory entries
+		for _, name := range []string{"a.txt", "b.txt", "c.txt", "d.txt"} {
+			f, err := openFile(ctx, db, blobsDir, "/"+name, os.O_CREATE|os.O_WRONLY, 0644)
+			require.NoError(t, err)
+			require.NoError(t, f.Close())
+		}
+
+		dir := &file{db: db, path: "/", isDir: true}
+
+		// Read first 2 entries
+		entries, err := dir.Readdir(2)
+		require.NoError(t, err)
+		require.Len(t, entries, 2)
+
+		// Seek back to start
+		pos, err := dir.Seek(0, io.SeekStart)
+		require.NoError(t, err)
+		assert.Equal(t, int64(0), pos)
+
+		// Read again from beginning
+		entries, err = dir.Readdir(2)
+		require.NoError(t, err)
+		require.Len(t, entries, 2)
+		assert.Equal(t, "a.txt", entries[0].Name())
+
+		// Seek to position 2
+		pos, err = dir.Seek(2, io.SeekStart)
+		require.NoError(t, err)
+		assert.Equal(t, int64(2), pos)
+
+		entries, err = dir.Readdir(1)
+		require.NoError(t, err)
+		assert.Equal(t, "c.txt", entries[0].Name())
+	})
+
+	t.Run("dir SeekCurrent", func(t *testing.T) {
+		dir := &file{db: db, path: "/", isDir: true}
+
+		// Read 2 entries (position is now 2)
+		_, err := dir.Readdir(2)
+		require.NoError(t, err)
+
+		// Seek 1 forward from current position (now at 3)
+		pos, err := dir.Seek(1, io.SeekCurrent)
+		require.NoError(t, err)
+		assert.Equal(t, int64(3), pos)
+
+		entries, err := dir.Readdir(1)
+		require.NoError(t, err)
+		assert.Equal(t, "d.txt", entries[0].Name())
+
+		// Seek backward from current position
+		pos, err = dir.Seek(-3, io.SeekCurrent)
+		require.NoError(t, err)
+		assert.Equal(t, int64(1), pos)
+
+		entries, err = dir.Readdir(1)
+		require.NoError(t, err)
+		assert.Equal(t, "b.txt", entries[0].Name())
+	})
+
+	t.Run("dir SeekEnd", func(t *testing.T) {
+		dir := &file{db: db, path: "/", isDir: true}
+
+		// Seek to end (should be total count of entries)
+		pos, err := dir.Seek(0, io.SeekEnd)
+		require.NoError(t, err)
+		// There are 5 files in root: seek.txt, a.txt, b.txt, c.txt, d.txt
+		assert.Equal(t, int64(5), pos)
+
+		// Reading should return EOF
+		_, err = dir.Readdir(1)
+		assert.ErrorIs(t, err, io.EOF)
+
+		// Seek 2 back from end
+		pos, err = dir.Seek(-2, io.SeekEnd)
+		require.NoError(t, err)
+		assert.Equal(t, int64(3), pos)
+
+		entries, err := dir.Readdir(1)
+		require.NoError(t, err)
+		assert.Equal(t, "d.txt", entries[0].Name())
+	})
+
+	t.Run("empty file seek", func(t *testing.T) {
+		// Test seek on a file with no readFile (empty/newly created)
+		f, err := openFile(ctx, db, blobsDir, "/empty.txt", os.O_CREATE|os.O_RDONLY, 0644)
+		require.NoError(t, err)
+		defer f.Close()
+
+		// Seek(0, SeekStart) should succeed on empty file
+		pos, err := f.Seek(0, io.SeekStart)
+		require.NoError(t, err)
+		assert.Equal(t, int64(0), pos)
+
+		// Non-zero seek on empty file returns EOF
+		pos, err = f.Seek(5, io.SeekStart)
+		assert.ErrorIs(t, err, io.EOF)
+	})
+}
+
 func TestFileChecksum(t *testing.T) {
 	db, blobsDir := initTestState(t)
 	ctx := t.Context()
