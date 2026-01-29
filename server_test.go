@@ -171,8 +171,8 @@ func TestDownloadHistoricalAPI(t *testing.T) {
 	ts := httptest.NewServer(server)
 	t.Cleanup(func() { ts.Close() })
 
-	getDownloadHistorical := func(filePath, timestamp string) (int, string, http.Header) {
-		u := ts.URL + filePath + "?at=" + url.QueryEscape(timestamp)
+	getDownloadHistorical := func(path, timestamp string) (int, string, http.Header) {
+		u := ts.URL + "/api/download-historical?path=" + url.QueryEscape(path) + "&at=" + url.QueryEscape(timestamp)
 		resp, err := http.Get(u)
 		require.NoError(t, err)
 		defer resp.Body.Close()
@@ -215,13 +215,17 @@ func TestDownloadHistoricalAPI(t *testing.T) {
 		assert.Contains(t, body, "file not found at timestamp")
 	})
 
+	t.Run("requires path parameter", func(t *testing.T) {
+		downloadTime := time.Now().Add(-time.Minute).UTC().Format(time.RFC3339)
+		code, body, _ := getDownloadHistorical("", downloadTime)
+		assert.Equal(t, http.StatusBadRequest, code)
+		assert.Contains(t, body, "at and path parameters required")
+	})
+
 	t.Run("requires timestamp parameter", func(t *testing.T) {
-		resp, err := http.Get(ts.URL + "/some/path.txt")
-		require.NoError(t, err)
-		defer resp.Body.Close()
-		// Without ?at parameter, this goes to WebDAV, not historical download
-		// WebDAV returns 404 for non-existent file
-		assert.Equal(t, http.StatusNotFound, resp.StatusCode)
+		code, body, _ := getDownloadHistorical("/some/path.txt", "")
+		assert.Equal(t, http.StatusBadRequest, code)
+		assert.Contains(t, body, "at and path parameters required")
 	})
 
 	t.Run("rejects future timestamp", func(t *testing.T) {
@@ -266,7 +270,7 @@ func TestDownloadHistoricalAPI(t *testing.T) {
 
 		// Download historical file
 		downloadTime := time.Unix(t1+10, 0).UTC().Format(time.RFC3339)
-		u := ts2.URL + "/remote-file.txt?at=" + url.QueryEscape(downloadTime)
+		u := ts2.URL + "/api/download-historical?path=" + url.QueryEscape("/remote-file.txt") + "&at=" + url.QueryEscape(downloadTime)
 		resp, err := http.Get(u)
 		require.NoError(t, err)
 		defer resp.Body.Close()

@@ -59,17 +59,16 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		s.handleRestoreFile(w, r)
 		return
 	}
+	if r.URL.Path == "/api/download-historical" && r.Method == "GET" {
+		s.handleDownloadHistorical(w, r)
+		return
+	}
 	if r.URL.Path == "/api/activity-timeline" && r.Method == "GET" {
 		s.handleActivityTimeline(w, r)
 		return
 	}
 	if strings.HasPrefix(r.URL.Path, "/browse") && r.Method == "GET" {
 		s.handleBrowse(w, r)
-		return
-	}
-	// Handle historical downloads: any file path with ?at=<timestamp>
-	if r.URL.Query().Get("at") != "" && r.Method == "GET" {
-		s.handleDownloadHistorical(w, r)
 		return
 	}
 	s.dav.ServeHTTP(w, r)
@@ -152,10 +151,10 @@ func (s *Server) handleRestoreFile(w http.ResponseWriter, r *http.Request) {
 
 func (s *Server) handleDownloadHistorical(w http.ResponseWriter, r *http.Request) {
 	atParam := r.URL.Query().Get("at")
-	filePath := path.Clean(r.URL.Path)
+	filePath := r.URL.Query().Get("path")
 
-	if atParam == "" {
-		http.Error(w, "at parameter required", http.StatusBadRequest)
+	if atParam == "" || filePath == "" {
+		http.Error(w, "at and path parameters required", http.StatusBadRequest)
 		return
 	}
 
@@ -378,7 +377,7 @@ func (s *Server) handleBrowse(w http.ResponseWriter, r *http.Request) {
 		if isDir {
 			entry.Link = "/browse" + filePath + atSuffix
 		} else if atTime != nil {
-			entry.Link = filePath + "?at=" + url.QueryEscape(timestamp)
+			entry.Link = "/api/download-historical?path=" + url.QueryEscape(filePath) + "&at=" + url.QueryEscape(timestamp)
 			entry.Size = formatBytes(size)
 		} else {
 			entry.Link = filePath
