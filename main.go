@@ -177,7 +177,7 @@ func deleteLocalBlobs(db *sql.DB, blobsDir string) (bool, error) {
 		if !deleted {
 			continue
 		}
-		if _, err := db.Exec(`UPDATE blobs SET local_deleted = 1 WHERE id = ?`, blobID); err != nil {
+		if _, err := db.Exec(`UPDATE blobs SET local_written = 0, local_deleted = 1 WHERE id = ?`, blobID); err != nil {
 			return false, err
 		}
 	}

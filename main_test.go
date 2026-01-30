@@ -223,10 +223,11 @@ func TestDeleteLocalBlobsExtended(t *testing.T) {
 		assert.True(t, os.IsNotExist(err), "blob file should be deleted")
 
 		// Verify database is updated
-		var localDeleted int
-		err = db.QueryRow(`SELECT local_deleted FROM blobs WHERE id = ?`, blobID).Scan(&localDeleted)
+		var localDeleted, localWritten int
+		err = db.QueryRow(`SELECT local_deleted, local_written FROM blobs WHERE id = ?`, blobID).Scan(&localDeleted, &localWritten)
 		require.NoError(t, err)
 		assert.Equal(t, 1, localDeleted, "blob should be marked as locally deleted")
+		assert.Equal(t, 0, localWritten, "local_written should be cleared to allow re-download")
 	})
 
 	t.Run("handles already deleted blob files", func(t *testing.T) {
@@ -243,10 +244,11 @@ func TestDeleteLocalBlobsExtended(t *testing.T) {
 		require.NoError(t, err)
 
 		// Verify database is updated
-		var localDeleted int
-		err = db.QueryRow(`SELECT local_deleted FROM blobs WHERE id = ?`, blobID).Scan(&localDeleted)
+		var localDeleted, localWritten int
+		err = db.QueryRow(`SELECT local_deleted, local_written FROM blobs WHERE id = ?`, blobID).Scan(&localDeleted, &localWritten)
 		require.NoError(t, err)
 		assert.Equal(t, 1, localDeleted, "blob should be marked as locally deleted even if file was already gone")
+		assert.Equal(t, 0, localWritten, "local_written should be cleared to allow re-download")
 	})
 
 	t.Run("does not delete blobs not marked for deletion", func(t *testing.T) {
@@ -481,6 +483,84 @@ func TestBlobUnreferencedTrigger(t *testing.T) {
 		require.NoError(t, err)
 		assert.Equal(t, 0, localDeleting, "referenced blob should not be marked for deletion")
 	})
+
+	t.Run("deleted blob can be re-downloaded after restore", func(t *testing.T) {
+		// This test verifies the fix for a bug where deleting a file would mark the blob
+		// as deleted locally without clearing local_written, causing restores to fail
+		// because the blob would never be re-downloaded from remote storage.
+
+		fs := &FS{db: db, blobsDir: blobsDir}
+
+		// Create a file with content
+		f, err := NewFile(ctx, db, blobsDir, "/restore-test.txt", os.O_CREATE|os.O_WRONLY, 0644)
+		require.NoError(t, err)
+		_, err = f.Write([]byte("restore me please"))
+		require.NoError(t, err)
+		require.NoError(t, f.Close())
+		blobID := f.blobID
+
+		// Mark blob as uploaded to remote (simulates rclone sync completion)
+		_, err = db.Exec(`UPDATE blobs SET remote_written = 1 WHERE id = ?`, blobID)
+		require.NoError(t, err)
+
+		// Verify initial state: blob is written locally and remotely
+		var localWritten, remoteWritten int
+		err = db.QueryRow(`SELECT local_written, remote_written FROM blobs WHERE id = ?`, blobID).Scan(&localWritten, &remoteWritten)
+		require.NoError(t, err)
+		assert.Equal(t, 1, localWritten, "blob should be marked as locally written")
+		assert.Equal(t, 1, remoteWritten, "blob should be marked as remotely written")
+
+		// Delete the file (this triggers blobs_mark_unreferenced which sets local_deleting=1)
+		err = fs.RemoveAll(ctx, "/restore-test.txt")
+		require.NoError(t, err)
+
+		// Verify blob is marked for local deletion
+		var localDeleting int
+		err = db.QueryRow(`SELECT local_deleting FROM blobs WHERE id = ?`, blobID).Scan(&localDeleting)
+		require.NoError(t, err)
+		assert.Equal(t, 1, localDeleting, "blob should be marked for local deletion after file delete")
+
+		// Run local blob deletion (simulates background cleanup)
+		_, err = deleteLocalBlobs(db, blobsDir)
+		require.NoError(t, err)
+
+		// Verify blob file is deleted from disk
+		blobPath := blobFilePath(blobsDir, blobID)
+		_, err = os.Stat(blobPath)
+		assert.True(t, os.IsNotExist(err), "blob file should be physically deleted")
+
+		// THE KEY CHECK: verify local_written is cleared so blob can be re-downloaded
+		var localWrittenAfterDelete, localDeletedAfterDelete int
+		err = db.QueryRow(`SELECT local_written, local_deleted FROM blobs WHERE id = ?`, blobID).Scan(&localWrittenAfterDelete, &localDeletedAfterDelete)
+		require.NoError(t, err)
+		assert.Equal(t, 0, localWrittenAfterDelete, "local_written must be cleared to allow re-download")
+		assert.Equal(t, 1, localDeletedAfterDelete, "local_deleted should be set")
+
+		// Simulate restore by creating a new file version pointing to the same blob_id
+		// (this is what handleRestoreFile does)
+		now := time.Now().Unix()
+		_, err = db.Exec(`
+			INSERT INTO files (created_at, version, path, mode, mod_time, is_dir, deleted, blob_id)
+			SELECT ?, version + 1, path, mode, mod_time, is_dir, 0, blob_id
+			FROM files WHERE path = '/restore-test.txt'
+			ORDER BY version DESC LIMIT 1`, now)
+		require.NoError(t, err)
+
+		// Verify the file is now pointing to the blob and is not deleted
+		var restoredBlobID string
+		var deleted int
+		err = db.QueryRow(`SELECT blob_id, deleted FROM files WHERE path = '/restore-test.txt' ORDER BY version DESC LIMIT 1`).Scan(&restoredBlobID, &deleted)
+		require.NoError(t, err)
+		assert.Equal(t, blobID, restoredBlobID, "restored file should point to original blob")
+		assert.Equal(t, 0, deleted, "restored file should not be deleted")
+
+		// Verify blob is now eligible for download from remote
+		// The download query is: SELECT id FROM blobs WHERE local_written = 0 AND remote_written = 1 AND remote_deleted = 0
+		var pendingDownloadCount int
+		err = db.QueryRow(`SELECT COUNT(*) FROM blobs WHERE id = ? AND local_written = 0 AND remote_written = 1 AND remote_deleted = 0`, blobID).Scan(&pendingDownloadCount)
+		require.NoError(t, err)
+		assert.Equal(t, 1, pendingDownloadCount, "blob should be eligible for re-download from remote")
+	})
 }
 
 func TestDeleteLocalBlobs(t *testing.T) {
@@ -501,9 +581,10 @@ func TestDeleteLocalBlobs(t *testing.T) {
 	_, err = os.Stat(blobPath)
 	assert.True(t, os.IsNotExist(err))
 
-	var localDeleted int
-	require.NoError(t, db.QueryRow(`SELECT local_deleted FROM blobs WHERE id = ?`, blobID).Scan(&localDeleted))
+	var localDeleted, localWritten int
+	require.NoError(t, db.QueryRow(`SELECT local_deleted, local_written FROM blobs WHERE id = ?`, blobID).Scan(&localDeleted, &localWritten))
 	assert.Equal(t, 1, localDeleted)
+	assert.Equal(t, 0, localWritten, "local_written should be cleared to allow re-download")
 
 	// Skips blobs with active readers
 	blobID = uuid.New().String()
@@ -535,6 +616,7 @@ func TestDeleteLocalBlobs(t *testing.T) {
 	_, err = deleteLocalBlobs(db, blobsDir)
 	require.NoError(t, err)
 
-	require.NoError(t, db.QueryRow(`SELECT local_deleted FROM blobs WHERE id = ?`, blobID).Scan(&localDeleted))
+	require.NoError(t, db.QueryRow(`SELECT local_deleted, local_written FROM blobs WHERE id = ?`, blobID).Scan(&localDeleted, &localWritten))
 	assert.Equal(t, 1, localDeleted)
+	assert.Equal(t, 0, localWritten, "local_written should be cleared to allow re-download")
 }
