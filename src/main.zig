@@ -2122,7 +2122,11 @@ fn doMount(allocator: std.mem.Allocator, args: CliArgs) !void {
     log.info("mounted, serving requests", .{});
 
     // Run FUSE main loop (multi-threaded)
-    const ret = c.fuse_loop_mt(fuse_instance, 0);
+    var loop_cfg = c.struct_fuse_loop_config{
+        .clone_fd = 0,
+        .max_idle_threads = 10,
+    };
+    const ret = c.fuse_loop_mt(fuse_instance, &loop_cfg);
 
     log.info("FUSE loop exited with {d}", .{ret});
 
