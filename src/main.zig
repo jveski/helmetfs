@@ -1155,7 +1155,7 @@ fn scrubFile(state: *FsState, rel_path: []const u8, corruptions: *u64, repairs_c
     };
 
     if (!std.mem.eql(u8, &replica_computed, replica_hex)) {
-        log.err("scrub: replica also corrupt for {s}, cannot repair", .{rel_path});
+        log.warn("scrub: replica also corrupt for {s}, cannot repair", .{rel_path});
         return;
     }
 
