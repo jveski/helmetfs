@@ -34,10 +34,6 @@ jobs:
       - name: Build helmetfs
         run: zig build
 
-      - name: Run unit tests
-        run: zig build test
-
       - name: Run E2E tests
         run: |
-          chmod +x tests/e2e.sh
           tests/e2e.sh
