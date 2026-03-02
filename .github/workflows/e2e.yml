@@ -1,0 +1,43 @@
+name: E2E Tests
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  e2e:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install system dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libfuse3-dev fuse3
+
+      - name: Enable FUSE for unprivileged users
+        run: |
+          # Allow non-root users to mount FUSE filesystems
+          sudo sed -i 's/#user_allow_other/user_allow_other/' /etc/fuse.conf
+          # Load the FUSE kernel module
+          sudo modprobe fuse
+
+      - name: Install Zig
+        uses: mlugg/setup-zig@v2
+        with:
+          version: 0.14.1
+
+      - name: Build helmetfs
+        run: zig build
+
+      - name: Run unit tests
+        run: zig build test
+
+      - name: Run E2E tests
+        run: |
+          chmod +x tests/e2e.sh
+          tests/e2e.sh
