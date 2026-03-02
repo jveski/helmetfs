@@ -356,7 +356,7 @@ const ReplLog = struct {
         var self = ReplLog{
             .allocator = allocator,
             .backing_dir = backing_dir,
-            .entries = .{},
+            .entries = .empty,
         };
         self.last_truncate_time = std.time.timestamp();
         // Load existing log entries from disk
@@ -1231,23 +1231,29 @@ fn fuseErr(e: posix.E) c_int {
 }
 
 fn posixErr(err: anytype) c_int {
-    return switch (err) {
-        error.FileNotFound => fuseErr(.NOENT),
-        error.AccessDenied => fuseErr(.ACCES),
-        error.NameTooLong => fuseErr(.NAMETOOLONG),
-        error.SymLinkLoop => fuseErr(.LOOP),
-        error.NotDir => fuseErr(.NOTDIR),
-        error.FileTooBig => fuseErr(.FBIG),
-        error.NoSpaceLeft => fuseErr(.NOSPC),
-        error.IsDir => fuseErr(.ISDIR),
-        error.ReadOnlyFileSystem => fuseErr(.ROFS),
-        error.DiskQuota => fuseErr(.DQUOT),
-        error.FileBusy => fuseErr(.BUSY),
-        error.PathAlreadyExists => fuseErr(.EXIST),
-        error.InvalidArgument => fuseErr(.INVAL),
-        error.NotOpenForWriting => fuseErr(.BADF),
-        else => fuseErr(.IO),
+    const name = @errorName(err);
+    const map = .{
+        .{ "FileNotFound", posix.E.NOENT },
+        .{ "AccessDenied", posix.E.ACCES },
+        .{ "NameTooLong", posix.E.NAMETOOLONG },
+        .{ "SymLinkLoop", posix.E.LOOP },
+        .{ "NotDir", posix.E.NOTDIR },
+        .{ "FileTooBig", posix.E.FBIG },
+        .{ "NoSpaceLeft", posix.E.NOSPC },
+        .{ "IsDir", posix.E.ISDIR },
+        .{ "ReadOnlyFileSystem", posix.E.ROFS },
+        .{ "DiskQuota", posix.E.DQUOT },
+        .{ "FileBusy", posix.E.BUSY },
+        .{ "PathAlreadyExists", posix.E.EXIST },
+        .{ "InvalidArgument", posix.E.INVAL },
+        .{ "NotOpenForWriting", posix.E.BADF },
     };
+    inline for (map) |entry| {
+        if (std.mem.eql(u8, name, entry[0])) {
+            return fuseErr(entry[1]);
+        }
+    }
+    return fuseErr(.IO);
 }
 
 // --- FUSE callback implementations ---
@@ -1702,9 +1708,9 @@ fn fuse_utimens(path: [*c]const u8, tv: [*c]const c.struct_timespec, fi: ?*c.str
             .{ .sec = times[1].tv_sec, .nsec = times[1].tv_nsec },
         };
         const ret = posix.system.utimensat(posix.AT.FDCWD, backing.ptr, &ts, 0);
-        const signed: isize = @bitCast(ret);
+        const signed: c_int = @bitCast(ret);
         if (signed < 0) {
-            return @as(c_int, @intCast(signed));
+            return signed;
         }
     }
 
