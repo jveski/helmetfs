@@ -11,9 +11,17 @@ const c = @cImport({
     if (builtin.os.tag == .macos) {
         @cDefine("FUSE_DARWIN_ENABLE_EXTENSIONS", "0");
     }
+    if (builtin.os.tag == .linux) {
+        @cDefine("_GNU_SOURCE", "");
+    }
     @cInclude("fuse3/fuse.h");
     @cInclude("unistd.h");
     @cInclude("time.h");
+    @cInclude("stdlib.h");
+    if (builtin.os.tag == .linux) {
+        @cInclude("sys/file.h");
+        @cInclude("fcntl.h");
+    }
 });
 
 const log = std.log.scoped(.helmetfs);
@@ -75,13 +83,17 @@ const LibfuseVersion = extern struct {
 // Wrapper for fuse_new that calls _fuse_new_31 directly, bypassing the
 // static inline fuse_new_fn that Zig cannot link.
 fn fuseNew(args: [*c]c.struct_fuse_args, ops: [*c]const c.struct_fuse_operations, op_size: usize, user_data: ?*anyopaque) ?*c.struct_fuse {
-    var version = LibfuseVersion{
-        .major = 3,
-        .minor = 17,
-        .hotfix = 0,
-        .flags = 0, // darwin_extensions_enabled = 0
-    };
-    return c._fuse_new_31(args, ops, op_size, @ptrCast(&version), user_data);
+    if (comptime builtin.os.tag == .macos) {
+        var version = LibfuseVersion{
+            .major = 3,
+            .minor = 17,
+            .hotfix = 0,
+            .flags = 0, // darwin_extensions_enabled = 0
+        };
+        return c._fuse_new_31(args, ops, op_size, @ptrCast(&version), user_data);
+    } else {
+        return c.fuse_new(args, ops, op_size, user_data);
+    }
 }
 
 // ============================================================================
