@@ -2097,8 +2097,6 @@ fn doMount(allocator: std.mem.Allocator, args: CliArgs) !void {
 
     var fuse_argv = [_][*:0]const u8{
         "helmetfs",
-        mount_z.ptr,
-        "-f", // foreground
     };
     var fuse_args = c.fuse_args{
         .argc = @intCast(fuse_argv.len),
@@ -2124,7 +2122,11 @@ fn doMount(allocator: std.mem.Allocator, args: CliArgs) !void {
     log.info("mounted, serving requests", .{});
 
     // Run FUSE main loop (multi-threaded)
-    const ret = c.fuse_loop_mt(fuse_instance, 0);
+    var loop_cfg = c.struct_fuse_loop_config{
+        .clone_fd = 0,
+        .max_idle_threads = 10,
+    };
+    const ret = c.fuse_loop_mt(fuse_instance, &loop_cfg);
 
     log.info("FUSE loop exited with {d}", .{ret});
 
