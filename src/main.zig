@@ -202,7 +202,7 @@ const FsState = struct {
     fn flushDirtyFiles(self: *FsState) void {
         self.path_state.rwlock.lockShared();
         // Collect dirty paths
-        var dirty_paths: std.ArrayList([]const u8) = .empty;
+        var dirty_paths: std.ArrayList([]const u8) = .{};
         defer dirty_paths.deinit(self.allocator);
         var it = self.path_state.map.iterator();
         while (it.next()) |entry| {
@@ -356,7 +356,7 @@ const ReplLog = struct {
         var self = ReplLog{
             .allocator = allocator,
             .backing_dir = backing_dir,
-            .entries = .empty,
+            .entries = .{},
         };
         self.last_truncate_time = std.time.timestamp();
         // Load existing log entries from disk
@@ -585,7 +585,7 @@ const ReplLog = struct {
         if (!should_truncate) return;
 
         // Collect remaining entries
-        var remaining: std.ArrayList(ReplEntry) = .empty;
+        var remaining: std.ArrayList(ReplEntry) = .{};
         for (self.entries.items) |entry| {
             if (!entry.completed) {
                 remaining.append(self.allocator, entry) catch continue;
