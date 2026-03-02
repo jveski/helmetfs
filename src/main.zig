@@ -2097,8 +2097,6 @@ fn doMount(allocator: std.mem.Allocator, args: CliArgs) !void {
 
     var fuse_argv = [_][*:0]const u8{
         "helmetfs",
-        mount_z.ptr,
-        "-f", // foreground
     };
     var fuse_args = c.fuse_args{
         .argc = @intCast(fuse_argv.len),
