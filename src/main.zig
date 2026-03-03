@@ -945,10 +945,40 @@ fn copyFileWithSync(src_path: []const u8, dst_path: []const u8) !void {
     const src = try std.fs.openFileAbsolute(src_path, .{});
     defer src.close();
 
+    // Write to a temporary file next to the destination, then atomically rename.
+    // This prevents readers from seeing a partially-written file.
+    var tmp_path_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const tmp_path = std.fmt.bufPrint(&tmp_path_buf, "{s}.tmp", .{dst_path}) catch return error.NameTooLong;
+
+    const dst = std.fs.createFileAbsolute(tmp_path, .{}) catch {
+        // Fall back to direct write if we can't create the temp file
+        return copyFileDirectWithSync(src, dst_path);
+    };
+    errdefer {
+        dst.close();
+        std.fs.deleteFileAbsolute(tmp_path) catch {};
+    }
+
+    var buf: [1024 * 1024]u8 = undefined; // 1 MB copy buffer
+    while (true) {
+        const n = try src.read(&buf);
+        if (n == 0) break;
+        try dst.writeAll(buf[0..n]);
+    }
+    try dst.sync();
+    dst.close();
+
+    std.fs.renameAbsolute(tmp_path, dst_path) catch |err| {
+        std.fs.deleteFileAbsolute(tmp_path) catch {};
+        return err;
+    };
+}
+
+fn copyFileDirectWithSync(src: std.fs.File, dst_path: []const u8) !void {
     const dst = try std.fs.createFileAbsolute(dst_path, .{});
     defer dst.close();
 
-    var buf: [1024 * 1024]u8 = undefined; // 1 MB copy buffer
+    var buf: [1024 * 1024]u8 = undefined;
     while (true) {
         const n = try src.read(&buf);
         if (n == 0) break;
