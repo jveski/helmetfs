@@ -33,7 +33,7 @@ jobs:
           version: 0.15.2
 
       - name: Build helmetfs
-        run: zig build -Doptimize=ReleaseSafe
+        run: zig build -Doptimize=ReleaseSafe -Dcpu=baseline
 
       - name: Upload binary to release
         uses: actions/upload-release-asset@v1
