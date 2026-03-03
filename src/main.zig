@@ -952,11 +952,16 @@ fn copyFileWithSync(src_path: []const u8, dst_path: []const u8) !void {
 
     const dst = std.fs.createFileAbsolute(tmp_path, .{}) catch {
         // Fall back to direct write if we can't create the temp file
+        src.seekTo(0) catch {};
         return copyFileDirectWithSync(src, dst_path);
     };
-    errdefer {
-        dst.close();
-        std.fs.deleteFileAbsolute(tmp_path) catch {};
+
+    var ok = false;
+    defer {
+        if (!ok) {
+            dst.close();
+            std.fs.deleteFileAbsolute(tmp_path) catch {};
+        }
     }
 
     var buf: [1024 * 1024]u8 = undefined; // 1 MB copy buffer
@@ -967,6 +972,7 @@ fn copyFileWithSync(src_path: []const u8, dst_path: []const u8) !void {
     }
     try dst.sync();
     dst.close();
+    ok = true;
 
     std.fs.renameAbsolute(tmp_path, dst_path) catch |err| {
         std.fs.deleteFileAbsolute(tmp_path) catch {};
