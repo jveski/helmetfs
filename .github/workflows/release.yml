@@ -9,7 +9,14 @@ permissions:
 
 jobs:
   build-and-upload:
-    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        include:
+          - runner: ubuntu-latest
+            asset_name: helmetfs-linux-amd64
+          - runner: ubuntu-24.04-arm
+            asset_name: helmetfs-linux-arm64
+    runs-on: ${{ matrix.runner }}
     timeout-minutes: 15
 
     steps:
@@ -35,5 +42,5 @@ jobs:
         with:
           upload_url: ${{ github.event.release.upload_url }}
           asset_path: zig-out/bin/helmetfs
-          asset_name: helmetfs-linux-amd64
+          asset_name: ${{ matrix.asset_name }}
           asset_content_type: application/octet-stream
