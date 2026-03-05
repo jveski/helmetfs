@@ -663,6 +663,11 @@ const ReplLog = struct {
 
         // Rename over the original
         try std.fs.renameAbsolute(tmp_path, log_path);
+
+        // Fsync parent directory to persist the rename
+        if (std.fs.path.dirname(log_path)) |dir_path| {
+            fsyncDir(dir_path);
+        }
     }
 };
 
@@ -1005,6 +1010,11 @@ fn copyFileWithSync(src_path: []const u8, dst_path: []const u8) !void {
         std.fs.deleteFileAbsolute(tmp_path) catch {};
         return err;
     };
+
+    // Fsync parent directory to persist the rename
+    if (std.fs.path.dirname(dst_path)) |dir_path| {
+        fsyncDir(dir_path);
+    }
 }
 
 fn copyFileDirectWithSync(src: std.fs.File, dst_path: []const u8) !void {
@@ -1018,6 +1028,12 @@ fn copyFileDirectWithSync(src: std.fs.File, dst_path: []const u8) !void {
         try dst.writeAll(buf[0..n]);
     }
     try dst.sync();
+}
+
+fn fsyncDir(dir_path: []const u8) void {
+    var dir = std.fs.openDirAbsolute(dir_path, .{}) catch return;
+    defer dir.close();
+    posix.fsync(dir.fd) catch {};
 }
 
 fn ensureParentDir(path: []const u8) !void {
