@@ -1535,20 +1535,22 @@ fn fuse_release(path: [*c]const u8, fi: ?*c.struct_fuse_file_info) callconv(.c) 
     const state = g_state;
     const rel = fuseRelPath(path);
 
-    // If dirty, compute checksum and enqueue replication
-    if (rel.len > 0 and state.path_state.isDirty(rel)) {
-        checksumAndEnqueue(state, rel) catch |err| {
-            log.err("release checksum failed for {s}: {}", .{ rel, err });
-        };
-    }
-
-    // Decrement write refcount if opened for writing, and close fd
+    // Decrement write refcount BEFORE checksumming — checksumAndEnqueue skips
+    // files that still have open write descriptors (hasWriteRef), so the
+    // refcount must be decremented first to allow the checksum to proceed.
     if (castFi(fi)) |f| {
         const decoded = decodeFh(f.fh);
         if (decoded.opened_for_write) {
             state.path_state.decWriteRef(rel);
         }
         posix.close(decoded.fd);
+    }
+
+    // If dirty, compute checksum and enqueue replication
+    if (rel.len > 0 and state.path_state.isDirty(rel)) {
+        checksumAndEnqueue(state, rel) catch |err| {
+            log.err("release checksum failed for {s}: {}", .{ rel, err });
+        };
     }
 
     return 0;
