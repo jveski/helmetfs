@@ -1343,6 +1343,12 @@ fn posixErr(err: anytype) c_int {
         .{ "PathAlreadyExists", posix.E.EXIST },
         .{ "InvalidArgument", posix.E.INVAL },
         .{ "NotOpenForWriting", posix.E.BADF },
+        .{ "OperationNotSupported", posix.E.OPNOTSUPP },
+        .{ "BrokenPipe", posix.E.PIPE },
+        .{ "ProcessFdQuotaExceeded", posix.E.MFILE },
+        .{ "SystemFdQuotaExceeded", posix.E.NFILE },
+        .{ "WouldBlock", posix.E.AGAIN },
+        .{ "Unexpected", posix.E.IO },
     };
     inline for (map) |entry| {
         if (std.mem.eql(u8, name, entry[0])) {
