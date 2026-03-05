@@ -1753,9 +1753,9 @@ fn fuse_chmod(path: [*c]const u8, mode: c.mode_t, fi: ?*c.struct_fuse_file_info)
         return fuseErr(.IO);
     };
 
-    // Mark dirty
+    // Enqueue replication for metadata change
     if (rel.len > 0) {
-        state.path_state.setDirty(rel);
+        state.repl_log.enqueue(.put, rel);
     }
 
     return 0;
@@ -1776,9 +1776,9 @@ fn fuse_chown(path: [*c]const u8, uid: c.uid_t, gid: c.gid_t, fi: ?*c.struct_fus
         return -@as(c_int, @intCast(err_val));
     }
 
-    // Mark dirty
+    // Enqueue replication for metadata change
     if (rel.len > 0) {
-        state.path_state.setDirty(rel);
+        state.repl_log.enqueue(.put, rel);
     }
 
     return 0;
@@ -1837,9 +1837,9 @@ fn fuse_utimens(path: [*c]const u8, tv: [*c]const c.struct_timespec, fi: ?*c.str
             }
             return signed;
         }
-        // Mark dirty only when times were actually updated
+        // Enqueue replication for metadata change
         if (rel.len > 0) {
-            state.path_state.setDirty(rel);
+            state.repl_log.enqueue(.put, rel);
         }
     }
 
