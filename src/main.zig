@@ -1567,10 +1567,35 @@ fn fuse_unlink(path: [*c]const u8) callconv(.c) c_int {
 }
 
 fn fuse_rename(from: [*c]const u8, to: [*c]const u8, flags: c_uint) callconv(.c) c_int {
-    _ = flags;
     const state = g_state;
     const rel_from = fuseRelPath(from);
     const rel_to = fuseRelPath(to);
+
+    // Handle rename flags (RENAME_NOREPLACE, RENAME_EXCHANGE, etc.)
+    if (comptime builtin.os.tag == .linux) {
+        const RENAME_NOREPLACE = 1;
+        const RENAME_EXCHANGE = 2;
+        // Reject any unsupported flags (RENAME_EXCHANGE, RENAME_WHITEOUT, etc.)
+        if (flags & ~@as(c_uint, RENAME_NOREPLACE) != 0) {
+            if (flags & RENAME_EXCHANGE != 0) {
+                return fuseErr(.OPNOTSUPP);
+            }
+            return fuseErr(.INVAL);
+        }
+        if (flags & RENAME_NOREPLACE != 0) {
+            // RENAME_NOREPLACE: fail if destination already exists
+            const backing_to_check = backingPath(state.allocator, state, rel_to) catch return fuseErr(.NOMEM);
+            defer state.allocator.free(backing_to_check);
+            if (posix.fstatat(posix.AT.FDCWD, backing_to_check, posix.AT.SYMLINK_NOFOLLOW)) |_| {
+                return fuseErr(.EXIST);
+            } else |_| {}
+        }
+    } else {
+        // macOS FUSE does not use rename flags
+        if (flags != 0) {
+            return fuseErr(.OPNOTSUPP);
+        }
+    }
 
     // Check hidden paths
     if (rel_from.len > 0 and isHiddenPath(state, rel_from)) {
