@@ -196,8 +196,24 @@ const FsState = struct {
     fn startWorkers(self: *FsState) !void {
         // Start replication workers
         self.repl_threads = try self.allocator.alloc(std.Thread, self.repl_workers);
+        var started: usize = 0;
+        errdefer {
+            // On failure, signal shutdown and join already-started threads
+            self.shutdown.store(true, .release);
+            {
+                self.repl_log.mutex.lock();
+                defer self.repl_log.mutex.unlock();
+                self.repl_log.cond.broadcast();
+            }
+            for (self.repl_threads[0..started]) |t| {
+                t.join();
+            }
+            self.allocator.free(self.repl_threads);
+            self.repl_threads = &.{};
+        }
         for (self.repl_threads) |*t| {
             t.* = try std.Thread.spawn(.{}, replWorkerLoop, .{self});
+            started += 1;
         }
         // Start scrub thread
         self.scrub_thread = try std.Thread.spawn(.{}, scrubLoop, .{self});
