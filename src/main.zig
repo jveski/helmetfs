@@ -224,7 +224,7 @@ const FsState = struct {
         defer dirty_paths.deinit(self.allocator);
         var it = self.path_state.map.iterator();
         while (it.next()) |entry| {
-            if (entry.value_ptr.dirty) {
+            if (entry.value_ptr.dirty_gen > entry.value_ptr.clean_gen) {
                 const path_copy = self.allocator.dupe(u8, entry.key_ptr.*) catch continue;
                 dirty_paths.append(self.allocator, path_copy) catch {
                     self.allocator.free(path_copy);
@@ -248,7 +248,8 @@ const FsState = struct {
 // ============================================================================
 
 const PathInfo = struct {
-    dirty: bool = false,
+    dirty_gen: u64 = 0,
+    clean_gen: u64 = 0,
     write_refcount: u32 = 0,
     last_verify_time: i64 = 0,
 };
@@ -275,9 +276,9 @@ const PathStateMap = struct {
         };
         if (gop.found_existing) {
             self.allocator.free(key_copy);
-            gop.value_ptr.dirty = true;
+            gop.value_ptr.dirty_gen += 1;
         } else {
-            gop.value_ptr.* = .{ .dirty = true };
+            gop.value_ptr.* = .{ .dirty_gen = 1 };
         }
     }
 
@@ -310,7 +311,7 @@ const PathStateMap = struct {
     fn isDirty(self: *PathStateMap, rel_path: []const u8) bool {
         self.rwlock.lockShared();
         defer self.rwlock.unlockShared();
-        if (self.map.get(rel_path)) |info| return info.dirty;
+        if (self.map.get(rel_path)) |info| return info.dirty_gen > info.clean_gen;
         return false;
     }
 
@@ -351,7 +352,30 @@ const PathStateMap = struct {
         self.rwlock.lock();
         defer self.rwlock.unlock();
         if (self.map.getPtr(rel_path)) |info| {
-            info.dirty = false;
+            info.clean_gen = info.dirty_gen;
+        }
+    }
+
+    /// Snapshot the current dirty generation for a path.  The caller
+    /// computes the checksum and then calls clearDirtyIfGen to
+    /// conditionally clear only if no new writes arrived in between.
+    fn getDirtyGen(self: *PathStateMap, rel_path: []const u8) u64 {
+        self.rwlock.lockShared();
+        defer self.rwlock.unlockShared();
+        if (self.map.get(rel_path)) |info| return info.dirty_gen;
+        return 0;
+    }
+
+    /// Clear the dirty flag only if the dirty generation has not advanced
+    /// past `gen` since we snapshotted it.  This prevents a concurrent
+    /// setDirty from being silently discarded.
+    fn clearDirtyIfGen(self: *PathStateMap, rel_path: []const u8, gen: u64) void {
+        self.rwlock.lock();
+        defer self.rwlock.unlock();
+        if (self.map.getPtr(rel_path)) |info| {
+            if (info.dirty_gen == gen) {
+                info.clean_gen = gen;
+            }
         }
     }
 };
@@ -869,6 +893,12 @@ fn checksumAndEnqueue(state: *FsState, rel_path: []const u8) !void {
 /// fuse_fsync where the caller has already flushed data to disk and
 /// wants to trigger replication even though the file is still open.
 fn checksumAndEnqueueForced(state: *FsState, rel_path: []const u8) !void {
+    // Snapshot the dirty generation before computing the checksum.
+    // If a concurrent write bumps the generation while we're hashing,
+    // clearDirtyIfGen will leave the dirty flag set so a subsequent
+    // release/fsync picks it up.
+    const gen = state.path_state.getDirtyGen(rel_path);
+
     const backing_path = try std.fs.path.join(state.allocator, &.{ state.backing_dir, rel_path });
     defer state.allocator.free(backing_path);
     const sum_path = try std.fmt.allocPrint(state.allocator, "{s}.sum", .{backing_path});
@@ -879,7 +909,7 @@ fn checksumAndEnqueueForced(state: *FsState, rel_path: []const u8) !void {
     try writeSumFile(sum_path, &hex_digest);
 
     state.repl_log.enqueue(.put, rel_path);
-    state.path_state.clearDirty(rel_path);
+    state.path_state.clearDirtyIfGen(rel_path, gen);
 }
 
 // ============================================================================
