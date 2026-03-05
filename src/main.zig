@@ -856,6 +856,13 @@ fn checksumAndEnqueue(state: *FsState, rel_path: []const u8) !void {
     // stays set so that release() will retry once the last writer closes.
     if (state.path_state.hasWriteRef(rel_path)) return;
 
+    try checksumAndEnqueueForced(state, rel_path);
+}
+
+/// Like checksumAndEnqueue but bypasses the write-ref check.  Used by
+/// fuse_fsync where the caller has already flushed data to disk and
+/// wants to trigger replication even though the file is still open.
+fn checksumAndEnqueueForced(state: *FsState, rel_path: []const u8) !void {
     const backing_path = try std.fs.path.join(state.allocator, &.{ state.backing_dir, rel_path });
     defer state.allocator.free(backing_path);
     const sum_path = try std.fmt.allocPrint(state.allocator, "{s}.sum", .{backing_path});
@@ -1520,9 +1527,11 @@ fn fuse_fsync(path: [*c]const u8, datasync: c_int, fi: ?*c.struct_fuse_file_info
         }
     }
 
-    // If dirty, compute checksum and enqueue replication
+    // If dirty, compute checksum and enqueue replication.
+    // Use the forced variant because the file is still open (hasWriteRef is
+    // true) but the data has been fsync'd to disk, so the checksum is valid.
     if (rel.len > 0 and state.path_state.isDirty(rel)) {
-        checksumAndEnqueue(state, rel) catch |err| {
+        checksumAndEnqueueForced(state, rel) catch |err| {
             log.err("fsync checksum failed for {s}: {}", .{ rel, err });
             return fuseErr(.IO);
         };
