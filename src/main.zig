@@ -425,6 +425,16 @@ const PathStateMap = struct {
             }
         }
     }
+
+    /// Remove a path's state entirely.  Used when a file is deleted
+    /// to prevent unbounded growth of the map.
+    fn remove(self: *PathStateMap, rel_path: []const u8) void {
+        self.rwlock.lock();
+        defer self.rwlock.unlock();
+        if (self.map.fetchRemove(rel_path)) |kv| {
+            self.allocator.free(kv.key);
+        }
+    }
 };
 
 // ============================================================================
@@ -1783,6 +1793,9 @@ fn fuse_unlink(path: [*c]const u8) callconv(.c) c_int {
         };
     }
 
+    // Remove stale path state so the map doesn't grow unboundedly.
+    state.path_state.remove(rel);
+
     return 0;
 }
 
@@ -1846,6 +1859,10 @@ fn fuse_rename(from: [*c]const u8, to: [*c]const u8, flags: c_uint) callconv(.c)
     if (rel_from.len > 0 and rel_to.len > 0) {
         state.repl_log.enqueuePair(.delete, rel_from, .put, rel_to);
     }
+
+    // Remove stale path state for the old name so the map doesn't grow
+    // unboundedly.  (The new name will get fresh state on next access.)
+    state.path_state.remove(rel_from);
 
     return 0;
 }
