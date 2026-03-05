@@ -392,6 +392,10 @@ const ReplEntry = struct {
     path: []const u8,
     completed: bool = false,
     in_flight: bool = false,
+    /// If set, this entry must not be dequeued until the entry with
+    /// this ID has been completed.  Used by enqueuePair to enforce
+    /// ordering (e.g. delete-before-put for renames).
+    depends_on: ?u64 = null,
 };
 
 const ReplLog = struct {
@@ -526,7 +530,7 @@ const ReplLog = struct {
             self.allocator.free(p2);
             return;
         };
-        self.entries.append(self.allocator, .{ .id = id2, .op = op2, .path = p2 }) catch {
+        self.entries.append(self.allocator, .{ .id = id2, .op = op2, .path = p2, .depends_on = id1 }) catch {
             // Roll back the first append
             _ = self.entries.pop();
             self.allocator.free(p1);
@@ -598,6 +602,14 @@ const ReplLog = struct {
                         self.completed_count += 1;
                         continue;
                     }
+                }
+
+                // Enforce depends_on ordering: skip if dependency not yet completed
+                if (entry.depends_on) |dep_id| {
+                    const dep_done = for (self.entries.items) |*dep| {
+                        if (dep.id == dep_id) break dep.completed;
+                    } else true; // dependency already truncated → treat as done
+                    if (!dep_done) continue;
                 }
 
                 entry.in_flight = true;
