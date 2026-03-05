@@ -696,7 +696,7 @@ const Metrics = struct {
     scrub_corruptions: std.atomic.Value(u64) = std.atomic.Value(u64).init(0),
     scrub_repairs: std.atomic.Value(u64) = std.atomic.Value(u64).init(0),
     scrub_last_completed: std.atomic.Value(i64) = std.atomic.Value(i64).init(0),
-    scrub_duration_secs: std.atomic.Value(u64) = std.atomic.Value(u64).init(0),
+    scrub_duration_ms: std.atomic.Value(u64) = std.atomic.Value(u64).init(0),
 };
 
 fn metricsServerLoop(state: *FsState) void {
@@ -757,7 +757,7 @@ fn handleMetricsConn(state: *FsState, stream: std.net.Stream) !void {
 
 fn formatMetrics(state: *FsState) ![]const u8 {
     const m = &state.metrics;
-    const duration_ms = m.scrub_duration_secs.load(.acquire);
+    const duration_ms = m.scrub_duration_ms.load(.acquire);
     const duration: f64 = @as(f64, @floatFromInt(duration_ms)) / 1000.0;
 
     return try std.fmt.allocPrint(state.allocator,
@@ -1164,7 +1164,7 @@ fn runScrub(state: *FsState) void {
     _ = state.metrics.scrub_corruptions.fetchAdd(corruptions_found, .release);
     _ = state.metrics.scrub_repairs.fetchAdd(repairs, .release);
     state.metrics.scrub_last_completed.store(end, .release);
-    state.metrics.scrub_duration_secs.store(duration_ms, .release);
+    state.metrics.scrub_duration_ms.store(duration_ms, .release);
 
     // Write scrub timestamp
     writeScrubTimestamp(state, end);
