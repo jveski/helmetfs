@@ -186,8 +186,14 @@ const FsState = struct {
 
     fn stopWorkers(self: *FsState) void {
         self.shutdown.store(true, .release);
-        // Signal the replication log condition to wake waiting workers
-        self.repl_log.cond.broadcast();
+        // Wake waiting workers while holding the mutex to prevent lost wakeups.
+        // A worker could be between checking shutdown (false) and calling
+        // cond.wait; broadcasting without the mutex would miss that worker.
+        {
+            self.repl_log.mutex.lock();
+            defer self.repl_log.mutex.unlock();
+            self.repl_log.cond.broadcast();
+        }
         // Join replication workers
         for (self.repl_threads) |t| {
             t.join();
