@@ -2153,9 +2153,25 @@ fn doUnmount(mountpoint: []const u8) void {
         std.debug.print("Failed to wait for {s}: {}\n", .{ cmd, err });
         std.process.exit(1);
     };
-    if (result.Exited != 0) {
-        std.debug.print("{s} exited with code {d}\n", .{ cmd, result.Exited });
-        std.process.exit(1);
+    switch (result) {
+        .Exited => |code| {
+            if (code != 0) {
+                std.debug.print("{s} exited with code {d}\n", .{ cmd, code });
+                std.process.exit(1);
+            }
+        },
+        .Signal => |sig| {
+            std.debug.print("{s} was killed by signal {d}\n", .{ cmd, sig });
+            std.process.exit(1);
+        },
+        .Stopped => |sig| {
+            std.debug.print("{s} was stopped by signal {d}\n", .{ cmd, sig });
+            std.process.exit(1);
+        },
+        .Unknown => |val| {
+            std.debug.print("{s} terminated with unknown status {d}\n", .{ cmd, val });
+            std.process.exit(1);
+        },
     }
 }
 
