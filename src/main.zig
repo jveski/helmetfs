@@ -828,10 +828,18 @@ fn metricsServerLoop(state: *FsState) void {
 fn handleMetricsConn(state: *FsState, stream: std.net.Stream) !void {
     defer stream.close();
 
-    // Read the HTTP request
+    // Read the HTTP request, looping until we see the end-of-headers
+    // marker (\r\n\r\n) or the buffer is full.
     var buf: [4096]u8 = undefined;
-    const n = stream.read(&buf) catch return;
-    const request = buf[0..n];
+    var total: usize = 0;
+    while (total < buf.len) {
+        const n = stream.read(buf[total..]) catch return;
+        if (n == 0) break; // client closed connection
+        total += n;
+        // Check for end of HTTP headers
+        if (std.mem.indexOf(u8, buf[0..total], "\r\n\r\n") != null) break;
+    }
+    const request = buf[0..total];
 
     if (std.mem.startsWith(u8, request, "GET /metrics ") or std.mem.startsWith(u8, request, "GET /metrics\r")) {
         const body = formatMetrics(state) catch return;
