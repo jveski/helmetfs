@@ -1411,7 +1411,7 @@ fn fuse_open(path: [*c]const u8, fi: ?*c.struct_fuse_file_info) callconv(.c) c_i
         const raw_flags = @as(u32, @bitCast(flags));
         const acc_mode = raw_flags & 0o3;
         const has_trunc = (raw_flags & @as(u32, c.O_TRUNC)) != 0;
-        const is_write = (acc_mode == 1 or acc_mode == 2); // O_WRONLY, O_RDWR
+        const is_write = (acc_mode == 1 or acc_mode == 2 or has_trunc); // O_WRONLY, O_RDWR, or O_TRUNC
         f.fh = encodeFh(fd, is_write);
         if (is_write) {
             state.path_state.incWriteRef(rel);
