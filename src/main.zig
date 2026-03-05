@@ -269,9 +269,13 @@ const PathStateMap = struct {
     fn setDirty(self: *PathStateMap, rel_path: []const u8) void {
         self.rwlock.lock();
         defer self.rwlock.unlock();
-        const key_copy = self.allocator.dupe(u8, rel_path) catch return;
+        const key_copy = self.allocator.dupe(u8, rel_path) catch {
+            log.err("OOM in setDirty for path: {s}", .{rel_path});
+            return;
+        };
         const gop = self.map.getOrPut(key_copy) catch {
             self.allocator.free(key_copy);
+            log.err("OOM in setDirty map insert for path: {s}", .{rel_path});
             return;
         };
         if (gop.found_existing) {
@@ -285,9 +289,13 @@ const PathStateMap = struct {
     fn incWriteRef(self: *PathStateMap, rel_path: []const u8) void {
         self.rwlock.lock();
         defer self.rwlock.unlock();
-        const key_copy = self.allocator.dupe(u8, rel_path) catch return;
+        const key_copy = self.allocator.dupe(u8, rel_path) catch {
+            log.err("OOM in incWriteRef for path: {s}", .{rel_path});
+            return;
+        };
         const gop = self.map.getOrPut(key_copy) catch {
             self.allocator.free(key_copy);
+            log.err("OOM in incWriteRef map insert for path: {s}", .{rel_path});
             return;
         };
         if (!gop.found_existing) {
@@ -491,11 +499,15 @@ const ReplLog = struct {
         self.mutex.lock();
         defer self.mutex.unlock();
 
-        const path_copy = self.allocator.dupe(u8, rel_path) catch return;
+        const path_copy = self.allocator.dupe(u8, rel_path) catch {
+            log.err("OOM in enqueue for path: {s}", .{rel_path});
+            return;
+        };
         const id = self.next_id;
         self.next_id += 1;
         self.entries.append(self.allocator, .{ .id = id, .op = op, .path = path_copy }) catch {
             self.allocator.free(path_copy);
+            log.err("OOM in enqueue append for path: {s}", .{rel_path});
             return;
         };
 
@@ -514,9 +526,13 @@ const ReplLog = struct {
         self.mutex.lock();
         defer self.mutex.unlock();
 
-        const p1 = self.allocator.dupe(u8, path1) catch return;
+        const p1 = self.allocator.dupe(u8, path1) catch {
+            log.err("OOM in enqueuePair for path: {s}", .{path1});
+            return;
+        };
         const p2 = self.allocator.dupe(u8, path2) catch {
             self.allocator.free(p1);
+            log.err("OOM in enqueuePair for path: {s}", .{path2});
             return;
         };
 
@@ -528,6 +544,7 @@ const ReplLog = struct {
         self.entries.append(self.allocator, .{ .id = id1, .op = op1, .path = p1 }) catch {
             self.allocator.free(p1);
             self.allocator.free(p2);
+            log.err("OOM in enqueuePair append for path: {s}", .{path1});
             return;
         };
         self.entries.append(self.allocator, .{ .id = id2, .op = op2, .path = p2, .depends_on = id1 }) catch {
@@ -535,6 +552,7 @@ const ReplLog = struct {
             _ = self.entries.pop();
             self.allocator.free(p1);
             self.allocator.free(p2);
+            log.err("OOM in enqueuePair append for path: {s}", .{path2});
             return;
         };
 
