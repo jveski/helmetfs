@@ -1812,11 +1812,10 @@ fn fuse_utimens(path: [*c]const u8, tv: [*c]const c.struct_timespec, fi: ?*c.str
         if (signed < 0) {
             return signed;
         }
-    }
-
-    // Mark dirty
-    if (rel.len > 0) {
-        state.path_state.setDirty(rel);
+        // Mark dirty only when times were actually updated
+        if (rel.len > 0) {
+            state.path_state.setDirty(rel);
+        }
     }
 
     return 0;
