@@ -170,6 +170,29 @@ const FsState = struct {
         return self;
     }
 
+    /// Free resources owned by FsState.  Workers must already be stopped.
+    fn deinit(self: *FsState) void {
+        // Free replication log entries
+        for (self.repl_log.entries.items) |entry| {
+            self.allocator.free(entry.path);
+        }
+        self.repl_log.entries.deinit(self.allocator);
+
+        // Free path-state map keys
+        var it = self.path_state.map.iterator();
+        while (it.next()) |entry| {
+            self.allocator.free(entry.key_ptr.*);
+        }
+        self.path_state.map.deinit();
+
+        // Free thread handle array (only if it was heap-allocated by startWorkers)
+        if (self.repl_threads.len > 0) {
+            self.allocator.free(self.repl_threads);
+        }
+
+        self.allocator.destroy(self);
+    }
+
     fn startWorkers(self: *FsState) !void {
         // Start replication workers
         self.repl_threads = try self.allocator.alloc(std.Thread, self.repl_workers);
@@ -2396,6 +2419,8 @@ fn doMount(allocator: std.mem.Allocator, args: CliArgs) !void {
     c.fuse_unmount(fuse_instance);
     c.fuse_destroy(fuse_instance);
 
+    g_state.deinit();
+
     log.info("helmetfs shutdown complete", .{});
 }
 
@@ -2446,25 +2471,12 @@ const TestHarness = struct {
     }
 
     fn deinit(self: *TestHarness) void {
-        // Free ReplLog entries (path strings + array list)
-        for (self.state.repl_log.entries.items) |entry| {
-            self.allocator.free(entry.path);
-        }
-        self.state.repl_log.entries.deinit(self.allocator);
-
-        // Free PathStateMap keys
-        var it = self.state.path_state.map.iterator();
-        while (it.next()) |entry| {
-            self.allocator.free(entry.key_ptr.*);
-        }
-        self.state.path_state.map.deinit();
-
         // Recursively remove temp dir
         std.fs.deleteTreeAbsolute(self.tmp_dir_path) catch {};
         self.allocator.free(self.backing_dir);
         self.allocator.free(self.replica_dir);
         self.allocator.free(self.tmp_dir_path);
-        self.allocator.destroy(self.state);
+        self.state.deinit();
     }
 
     /// Create a file in the backing directory with the given contents.
