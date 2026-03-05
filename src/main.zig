@@ -889,7 +889,7 @@ fn readSumFile(allocator: std.mem.Allocator, sum_path: []const u8) ![]const u8 {
     const file = std.fs.openFileAbsolute(sum_path, .{}) catch |err| return err;
     defer file.close();
     var buf: [128]u8 = undefined;
-    const n = try file.read(&buf);
+    const n = try file.readAll(&buf);
     const content = buf[0..n];
     const trimmed = std.mem.trimRight(u8, content, "\n\r ");
     return try allocator.dupe(u8, trimmed);
