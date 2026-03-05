@@ -484,6 +484,7 @@ const ReplLog = struct {
 
     fn parseLine(self: *ReplLog, line: []const u8) !void {
         // Format: <crc32-hex> <operation> <relative-path>
+        // Or:     <crc32-hex> <operation> dep:<id> <relative-path>
         const first_space = std.mem.indexOfScalar(u8, line, ' ') orelse return error.InvalidFormat;
         const crc_hex = line[0..first_space];
         const remainder = line[first_space..]; // includes leading space
@@ -496,11 +497,11 @@ const ReplLog = struct {
             return error.CrcMismatch;
         }
 
-        // Parse operation and path
+        // Parse operation and path (with optional dep:<id>)
         const after_crc = line[first_space + 1 ..];
         const second_space = std.mem.indexOfScalar(u8, after_crc, ' ') orelse return error.InvalidFormat;
         const op_str = after_crc[0..second_space];
-        const rel_path = after_crc[second_space + 1 ..];
+        const after_op = after_crc[second_space + 1 ..];
 
         const op: ReplOp = if (std.mem.eql(u8, op_str, "put"))
             .put
@@ -509,12 +510,23 @@ const ReplLog = struct {
         else
             return error.InvalidOp;
 
+        // Check for optional dep:<id> field
+        var depends_on: ?u64 = null;
+        var rel_path: []const u8 = after_op;
+        if (std.mem.startsWith(u8, after_op, "dep:")) {
+            const dep_end = std.mem.indexOfScalar(u8, after_op, ' ') orelse return error.InvalidFormat;
+            const dep_str = after_op[4..dep_end]; // skip "dep:"
+            depends_on = std.fmt.parseUnsigned(u64, dep_str, 10) catch return error.InvalidFormat;
+            rel_path = after_op[dep_end + 1 ..];
+        }
+
         const id = self.next_id;
         self.next_id += 1;
         try self.entries.append(self.allocator, .{
             .id = id,
             .op = op,
             .path = try self.allocator.dupe(u8, rel_path),
+            .depends_on = depends_on,
         });
     }
 
@@ -576,7 +588,7 @@ const ReplLog = struct {
         };
 
         // Write both entries to disk with a single fsync
-        self.appendPairToDisk(op1, path1, op2, path2) catch |err| {
+        self.appendPairToDisk(op1, path1, id1, op2, path2) catch |err| {
             log.err("failed to append pair to replication log: {}", .{err});
         };
 
@@ -592,13 +604,13 @@ const ReplLog = struct {
         defer file.close();
         try file.seekFromEnd(0);
 
-        const line = try formatLogEntry(self.allocator, op, rel_path);
+        const line = try formatLogEntry(self.allocator, op, rel_path, null);
         defer self.allocator.free(line);
         try file.writeAll(line);
         try file.sync();
     }
 
-    fn appendPairToDisk(self: *ReplLog, op1: ReplOp, path1: []const u8, op2: ReplOp, path2: []const u8) !void {
+    fn appendPairToDisk(self: *ReplLog, op1: ReplOp, path1: []const u8, id1: u64, op2: ReplOp, path2: []const u8) !void {
         const path = try self.logPath();
         defer self.allocator.free(path);
 
@@ -606,9 +618,9 @@ const ReplLog = struct {
         defer file.close();
         try file.seekFromEnd(0);
 
-        const line1 = try formatLogEntry(self.allocator, op1, path1);
+        const line1 = try formatLogEntry(self.allocator, op1, path1, null);
         defer self.allocator.free(line1);
-        const line2 = try formatLogEntry(self.allocator, op2, path2);
+        const line2 = try formatLogEntry(self.allocator, op2, path2, id1);
         defer self.allocator.free(line2);
         try file.writeAll(line1);
         try file.writeAll(line2);
@@ -767,7 +779,7 @@ const ReplLog = struct {
         defer tmp_file.close();
 
         for (self.entries.items) |entry| {
-            const line = try formatLogEntry(self.allocator, entry.op, entry.path);
+            const line = try formatLogEntry(self.allocator, entry.op, entry.path, entry.depends_on);
             defer self.allocator.free(line);
             try tmp_file.writeAll(line);
         }
@@ -783,13 +795,16 @@ const ReplLog = struct {
     }
 };
 
-fn formatLogEntry(allocator: std.mem.Allocator, op: ReplOp, rel_path: []const u8) ![]const u8 {
+fn formatLogEntry(allocator: std.mem.Allocator, op: ReplOp, rel_path: []const u8, depends_on: ?u64) ![]const u8 {
     const op_str = switch (op) {
         .put => "put",
         .delete => "delete",
     };
-    // Remainder is " <op> <path>"
-    const remainder = try std.fmt.allocPrint(allocator, " {s} {s}", .{ op_str, rel_path });
+    // Remainder is " <op> [dep:<id> ]<path>"
+    const remainder = if (depends_on) |dep_id|
+        try std.fmt.allocPrint(allocator, " {s} dep:{d} {s}", .{ op_str, dep_id, rel_path })
+    else
+        try std.fmt.allocPrint(allocator, " {s} {s}", .{ op_str, rel_path });
     defer allocator.free(remainder);
 
     const crc_val = std.hash.crc.Crc32IsoHdlc.hash(remainder);
@@ -2529,7 +2544,7 @@ const TestHarness = struct {
 
 test "formatLogEntry produces valid CRC-protected line" {
     const allocator = testing.allocator;
-    const line = try formatLogEntry(allocator, .put, "foo/bar.txt");
+    const line = try formatLogEntry(allocator, .put, "foo/bar.txt", null);
     defer allocator.free(line);
 
     // Should end with newline
@@ -2543,7 +2558,7 @@ test "formatLogEntry/parseLine round-trip for put" {
     var h = try TestHarness.init();
     defer h.deinit();
 
-    const line = try formatLogEntry(h.allocator, .put, "hello/world.txt");
+    const line = try formatLogEntry(h.allocator, .put, "hello/world.txt", null);
     defer h.allocator.free(line);
 
     // Strip trailing newline for parseLine
@@ -2564,7 +2579,7 @@ test "formatLogEntry/parseLine round-trip for delete" {
     var h = try TestHarness.init();
     defer h.deinit();
 
-    const line = try formatLogEntry(h.allocator, .delete, "gone.txt");
+    const line = try formatLogEntry(h.allocator, .delete, "gone.txt", null);
     defer h.allocator.free(line);
 
     const trimmed = std.mem.trimRight(u8, line, "\n");
@@ -2579,7 +2594,7 @@ test "parseLine rejects corrupted CRC" {
     var h = try TestHarness.init();
     defer h.deinit();
 
-    const line = try formatLogEntry(h.allocator, .put, "test.txt");
+    const line = try formatLogEntry(h.allocator, .put, "test.txt", null);
     defer h.allocator.free(line);
     const trimmed = std.mem.trimRight(u8, line, "\n");
 
@@ -3260,7 +3275,7 @@ test "ReplLog loadFromDisk gracefully skips corrupted lines" {
     const log_path = try std.fs.path.join(h.allocator, &.{ h.backing_dir, ".helmetfs", "repl.log" });
     defer h.allocator.free(log_path);
 
-    const valid_line = try formatLogEntry(h.allocator, .put, "good.txt");
+    const valid_line = try formatLogEntry(h.allocator, .put, "good.txt", null);
     defer h.allocator.free(valid_line);
 
     {
