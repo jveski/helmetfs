@@ -391,6 +391,7 @@ const ReplEntry = struct {
     op: ReplOp,
     path: []const u8,
     completed: bool = false,
+    in_flight: bool = false,
 };
 
 const ReplLog = struct {
@@ -578,9 +579,9 @@ const ReplLog = struct {
         defer self.mutex.unlock();
 
         while (!g_state.shutdown.load(.acquire)) {
-            // Find next non-completed entry
+            // Find next non-completed, non-in-flight entry
             for (self.entries.items, 0..) |*entry, i| {
-                if (entry.completed) continue;
+                if (entry.completed or entry.in_flight) continue;
 
                 // For put entries, check if there's a newer put for the same path
                 if (entry.op == .put) {
@@ -599,6 +600,7 @@ const ReplLog = struct {
                     }
                 }
 
+                entry.in_flight = true;
                 return .{ .id = entry.id, .op = entry.op, .path = entry.path };
             }
 
@@ -615,6 +617,7 @@ const ReplLog = struct {
         for (self.entries.items) |*entry| {
             if (entry.id == id) {
                 entry.completed = true;
+                entry.in_flight = false;
                 self.completed_count += 1;
                 break;
             }
