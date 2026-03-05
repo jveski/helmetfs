@@ -219,12 +219,17 @@ const FsState = struct {
         var it = self.path_state.map.iterator();
         while (it.next()) |entry| {
             if (entry.value_ptr.dirty) {
-                dirty_paths.append(self.allocator, entry.key_ptr.*) catch continue;
+                const path_copy = self.allocator.dupe(u8, entry.key_ptr.*) catch continue;
+                dirty_paths.append(self.allocator, path_copy) catch {
+                    self.allocator.free(path_copy);
+                    continue;
+                };
             }
         }
         self.path_state.rwlock.unlockShared();
 
         for (dirty_paths.items) |rel_path| {
+            defer self.allocator.free(rel_path);
             checksumAndEnqueue(self, rel_path) catch |err| {
                 log.err("failed to flush dirty file {s}: {}", .{ rel_path, err });
             };
