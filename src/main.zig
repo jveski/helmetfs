@@ -820,7 +820,7 @@ fn computeBlake3(backing_path: []const u8) ![64]u8 {
     var hasher = std.crypto.hash.Blake3.init(.{});
     var buf: [1024 * 1024]u8 = undefined; // 1 MB buffer
     while (true) {
-        const n = try file.read(&buf);
+        const n = try file.readAll(&buf);
         if (n == 0) break;
         hasher.update(buf[0..n]);
     }
