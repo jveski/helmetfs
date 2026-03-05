@@ -659,6 +659,23 @@ const ReplLog = struct {
         self.maybeTruncate();
     }
 
+    /// Mark all pending entries for `rel_path` as completed.
+    /// Used in tests to simulate the worker completing replication.
+    fn markCompletedByPath(self: *ReplLog, rel_path: []const u8) void {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+
+        for (self.entries.items) |*entry| {
+            if (!entry.completed and std.mem.eql(u8, entry.path, rel_path)) {
+                entry.completed = true;
+                entry.in_flight = false;
+                self.completed_count += 1;
+            }
+        }
+
+        g_state.metrics.repl_pending.store(self.pendingCountLocked(), .release);
+    }
+
     fn pendingCountLocked(self: *ReplLog) u64 {
         var count: u64 = 0;
         for (self.entries.items) |entry| {
@@ -1334,10 +1351,10 @@ fn scrubFile(state: *FsState, rel_path: []const u8, corruptions: *u64, repairs_c
 
     // Repair from replica
     if (has_pending) {
-        log.warn("scrub: repairing {s} from potentially stale replica (pending replication exists)", .{rel_path});
-    } else {
-        log.info("scrub: repairing {s} from replica", .{rel_path});
+        log.warn("scrub: skipping repair of {s} — pending replication means replica is stale", .{rel_path});
+        return;
     }
+    log.info("scrub: repairing {s} from replica", .{rel_path});
 
     copyFileWithSync(replica_path, backing_path) catch |err| {
         log.err("scrub: failed to repair {s}: {}", .{ rel_path, err });
@@ -2900,6 +2917,7 @@ test "scrubFile detects corruption and repairs from replica" {
 
     // Replicate to replica so we have a good copy
     try replicatePut(h.state, "important.txt");
+    h.state.repl_log.markCompletedByPath("important.txt");
 
     // Now corrupt the backing file
     try h.createBackingFile("important.txt", "CORRUPTED DATA");
@@ -3163,6 +3181,7 @@ test "end-to-end: file goes through checksum, replication, corruption, and scrub
 
     // Step 3: Replicate to replica
     try replicatePut(h.state, "e2e.txt");
+    h.state.repl_log.markCompletedByPath("e2e.txt");
     try testing.expect(h.replicaFileExists("e2e.txt"));
 
     // Verify replica contents match
@@ -3406,6 +3425,7 @@ test "end-to-end: scrub handles mix of clean, untracked, and corrupt files" {
     try h.createBackingFile("clean.txt", "all good");
     try checksumAndEnqueue(h.state, "clean.txt");
     try replicatePut(h.state, "clean.txt");
+    h.state.repl_log.markCompletedByPath("clean.txt");
 
     // File B: untracked (no .sum)
     try h.createBackingFile("untracked.txt", "new arrival");
@@ -3414,6 +3434,7 @@ test "end-to-end: scrub handles mix of clean, untracked, and corrupt files" {
     try h.createBackingFile("corrupt.txt", "original");
     try checksumAndEnqueue(h.state, "corrupt.txt");
     try replicatePut(h.state, "corrupt.txt");
+    h.state.repl_log.markCompletedByPath("corrupt.txt");
     try h.createBackingFile("corrupt.txt", "DAMAGED");
 
     var corruptions: u64 = 0;
