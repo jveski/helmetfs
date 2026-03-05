@@ -849,6 +849,11 @@ fn readSumFile(allocator: std.mem.Allocator, sum_path: []const u8) ![]const u8 {
 }
 
 fn checksumAndEnqueue(state: *FsState, rel_path: []const u8) !void {
+    // Skip if the file still has open write descriptors — checksumming a
+    // partially-written file would produce a wrong digest.  The dirty flag
+    // stays set so that release() will retry once the last writer closes.
+    if (state.path_state.hasWriteRef(rel_path)) return;
+
     const backing_path = try std.fs.path.join(state.allocator, &.{ state.backing_dir, rel_path });
     defer state.allocator.free(backing_path);
     const sum_path = try std.fmt.allocPrint(state.allocator, "{s}.sum", .{backing_path});
