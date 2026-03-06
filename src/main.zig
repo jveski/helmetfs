@@ -1114,6 +1114,20 @@ fn replicatePut(state: *FsState, rel_path: []const u8) !void {
     const sum_replica = try std.fmt.allocPrint(state.allocator, "{s}.sum", .{replica_path});
     defer state.allocator.free(sum_replica);
 
+    // Verify backing file integrity before replicating.  If the file was
+    // modified after the log entry was created (e.g. corruption between
+    // enqueue and replication, or a stale entry replayed after remount),
+    // skip replication so we don't overwrite a good replica with bad data.
+    if (readSumFile(state.allocator, sum_backing)) |stored_hex| {
+        defer state.allocator.free(stored_hex);
+        if (computeBlake3(backing_path)) |computed_hex| {
+            if (!std.mem.eql(u8, &computed_hex, stored_hex)) {
+                log.warn("replication: skipping {s} — backing file does not match .sum (possible corruption)", .{rel_path});
+                return;
+            }
+        } else |_| {}
+    } else |_| {}
+
     // Copy file content
     try ensureParentDir(replica_path);
     try copyFileWithSync(backing_path, replica_path);
@@ -1212,7 +1226,9 @@ fn copyFileDirectWithSync(src: std.fs.File, dst_path: []const u8) !void {
 fn fsyncDir(dir_path: []const u8) void {
     var dir = std.fs.openDirAbsolute(dir_path, .{}) catch return;
     defer dir.close();
-    posix.fsync(dir.fd) catch {};
+    // Use the raw syscall instead of posix.fsync to avoid unreachable panics
+    // on filesystems (e.g. tmpfs) that return EINVAL for directory fsync.
+    _ = std.posix.system.fsync(dir.fd);
 }
 
 fn ensureParentDir(path: []const u8) !void {
