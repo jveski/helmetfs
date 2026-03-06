@@ -1212,7 +1212,9 @@ fn copyFileDirectWithSync(src: std.fs.File, dst_path: []const u8) !void {
 fn fsyncDir(dir_path: []const u8) void {
     var dir = std.fs.openDirAbsolute(dir_path, .{}) catch return;
     defer dir.close();
-    posix.fsync(dir.fd) catch {};
+    // Use the raw syscall instead of posix.fsync to avoid unreachable panics
+    // on filesystems (e.g. tmpfs) that return EINVAL for directory fsync.
+    _ = std.posix.system.fsync(dir.fd);
 }
 
 fn ensureParentDir(path: []const u8) !void {
