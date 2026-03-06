@@ -1,0 +1,40 @@
+name: TLA+ Model Checking
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  tla:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+
+    strategy:
+      fail-fast: false
+      matrix:
+        spec: [PathState, ReplLog, Integration]
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Java
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: 21
+
+      - name: Download TLA+ tools
+        run: |
+          wget -q https://github.com/tlaplus/tlaplus/releases/download/v1.8.0/tla2tools.jar \
+            -O tla2tools.jar
+
+      - name: Run TLC on ${{ matrix.spec }}
+        run: |
+          java -XX:+UseParallelGC \
+            -cp tla2tools.jar tlc2.TLC \
+            -config tla/${{ matrix.spec }}.cfg \
+            -workers auto \
+            -deadlock \
+            tla/${{ matrix.spec }}.tla
