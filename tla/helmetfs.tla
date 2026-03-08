@@ -32,8 +32,7 @@
 EXTENDS Integers, Sequences, FiniteSets, TLC
 
 CONSTANTS
-    Writers,          \* Set of writer process IDs, e.g. {w1, w2}
-    NumReplWorkers    \* Number of replication workers (e.g. 1 or 2)
+    Writers           \* Set of writer process IDs, e.g. {w1, w2}
 
 (* ---- State variables ---- *)
 VARIABLES
@@ -351,5 +350,15 @@ EventuallyClean ==
 EventuallyReplicated ==
     [](AllWritersClosed /\ backing_version > 0
        => <>(replicated_ver = backing_version))
+
+(* ==== Model checking helpers ==== *)
+
+\* Symmetry set: writers are interchangeable, halving the state space.
+WriterSymmetry == Permutations(Writers)
+
+\* Bound counters so TLC explores a finite state space.
+\* dirty_gen <= 3 allows two concurrent writers to each perform multiple
+\* writes and still exercise all generation-comparison branches.
+StateConstraint == dirty_gen <= 3
 
 ========================================================================
