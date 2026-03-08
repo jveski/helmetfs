@@ -1,6 +1,5 @@
 // helmetfs - FUSE passthrough filesystem with async replication and self-healing
 //
-// See DESIGN.md for architecture details.
 
 const std = @import("std");
 const builtin = @import("builtin");
@@ -20,7 +19,6 @@ const c = @cImport({
     @cInclude("stdlib.h");
     if (builtin.os.tag == .linux) {
         @cInclude("sys/file.h");
-        @cInclude("fcntl.h");
     }
 });
 
@@ -106,10 +104,8 @@ const FsState = struct {
     allocator: std.mem.Allocator,
     backing_dir: []const u8,
     replica_dir: []const u8,
-    verify_reads: bool,
     scrub_hour: u8,
     scrub_minute: u8,
-    metrics_addr: ?[]const u8,
     repl_workers: u32,
 
     // Per-path state (dirty flag + write-descriptor refcount)
@@ -118,9 +114,6 @@ const FsState = struct {
     // Replication log
     repl_log: ReplLog,
 
-    // Metrics
-    metrics: Metrics,
-
     // Shutdown flag
     shutdown: std.atomic.Value(bool),
 
@@ -128,17 +121,13 @@ const FsState = struct {
     scrub_thread: ?std.Thread,
     // Replication worker threads
     repl_threads: []std.Thread,
-    // Metrics server thread
-    metrics_thread: ?std.Thread,
 
     fn init(
         allocator: std.mem.Allocator,
         backing_dir: []const u8,
         replica_dir: []const u8,
-        verify_reads: bool,
         scrub_hour: u8,
         scrub_minute: u8,
-        metrics_addr: ?[]const u8,
         repl_workers: u32,
     ) !*FsState {
         const self = try allocator.create(FsState);
@@ -146,18 +135,14 @@ const FsState = struct {
             .allocator = allocator,
             .backing_dir = backing_dir,
             .replica_dir = replica_dir,
-            .verify_reads = verify_reads,
             .scrub_hour = scrub_hour,
             .scrub_minute = scrub_minute,
-            .metrics_addr = metrics_addr,
             .repl_workers = repl_workers,
             .path_state = PathStateMap.init(allocator),
             .repl_log = undefined,
-            .metrics = Metrics{},
             .shutdown = std.atomic.Value(bool).init(false),
             .scrub_thread = null,
             .repl_threads = &.{},
-            .metrics_thread = null,
         };
         // Create .helmetfs directory
         const helmetfs_dir = try std.fs.path.join(allocator, &.{ backing_dir, ".helmetfs" });
@@ -217,10 +202,6 @@ const FsState = struct {
         }
         // Start scrub thread
         self.scrub_thread = try std.Thread.spawn(.{}, scrubLoop, .{self});
-        // Start metrics server if configured
-        if (self.metrics_addr != null) {
-            self.metrics_thread = try std.Thread.spawn(.{}, metricsServerLoop, .{self});
-        }
     }
 
     fn stopWorkers(self: *FsState) void {
@@ -239,18 +220,6 @@ const FsState = struct {
         }
         // Join scrub thread
         if (self.scrub_thread) |t| {
-            t.join();
-        }
-        // Metrics thread will also see shutdown — unblock accept with a self-connect
-        if (self.metrics_thread) |t| {
-            if (self.metrics_addr) |addr_str| {
-                if (parseMetricsAddr(addr_str)) |port| {
-                    if (std.net.Address.parseIp4("127.0.0.1", port)) |a| {
-                        const stream = std.net.tcpConnectToAddress(a) catch null;
-                        if (stream) |s| s.close();
-                    } else |_| {}
-                } else |_| {}
-            }
             t.join();
         }
     }
@@ -290,7 +259,6 @@ const PathInfo = struct {
     dirty_gen: u64 = 0,
     clean_gen: u64 = 0,
     write_refcount: u32 = 0,
-    last_verify_time: i64 = 0,
 };
 
 const PathStateMap = struct {
@@ -369,32 +337,6 @@ const PathStateMap = struct {
         return false;
     }
 
-    fn shouldVerify(self: *PathStateMap, rel_path: []const u8) bool {
-        const now = std.time.timestamp();
-        self.rwlock.lock();
-        defer self.rwlock.unlock();
-        if (self.map.getPtr(rel_path)) |info| {
-            if (now - info.last_verify_time < 60) return false;
-            info.last_verify_time = now;
-            return true;
-        }
-        // Path not in map — no state, allow verification
-        // (but we need to create an entry to track it)
-        const key_copy = self.allocator.dupe(u8, rel_path) catch return true;
-        const gop = self.map.getOrPut(key_copy) catch {
-            self.allocator.free(key_copy);
-            return true;
-        };
-        if (gop.found_existing) {
-            self.allocator.free(key_copy);
-            if (now - gop.value_ptr.last_verify_time < 60) return false;
-            gop.value_ptr.last_verify_time = now;
-        } else {
-            gop.value_ptr.* = .{ .last_verify_time = now };
-        }
-        return true;
-    }
-
     fn clearDirty(self: *PathStateMap, rel_path: []const u8) void {
         self.rwlock.lock();
         defer self.rwlock.unlock();
@@ -449,10 +391,6 @@ const ReplEntry = struct {
     path: []const u8,
     completed: bool = false,
     in_flight: bool = false,
-    /// If set, this entry must not be dequeued until the entry with
-    /// this ID has been completed.  Used by enqueuePair to enforce
-    /// ordering (e.g. delete-before-put for renames).
-    depends_on: ?u64 = null,
 };
 
 const ReplLog = struct {
@@ -509,25 +447,10 @@ const ReplLog = struct {
     }
 
     fn parseLine(self: *ReplLog, line: []const u8) !void {
-        // Format: <crc32-hex> <operation> <relative-path>
-        // Or:     <crc32-hex> <operation> dep:<id> <relative-path>
+        // Format: <operation> <relative-path>
         const first_space = std.mem.indexOfScalar(u8, line, ' ') orelse return error.InvalidFormat;
-        const crc_hex = line[0..first_space];
-        const remainder = line[first_space..]; // includes leading space
-
-        // Verify CRC32
-        const expected_crc = std.fmt.parseUnsigned(u32, crc_hex, 16) catch return error.InvalidCrc;
-        const computed_crc = std.hash.crc.Crc32IsoHdlc.hash(remainder);
-        if (expected_crc != computed_crc) {
-            log.warn("discarding log entry with CRC mismatch: {s}", .{line});
-            return error.CrcMismatch;
-        }
-
-        // Parse operation and path (with optional dep:<id>)
-        const after_crc = line[first_space + 1 ..];
-        const second_space = std.mem.indexOfScalar(u8, after_crc, ' ') orelse return error.InvalidFormat;
-        const op_str = after_crc[0..second_space];
-        const after_op = after_crc[second_space + 1 ..];
+        const op_str = line[0..first_space];
+        const rel_path = line[first_space + 1 ..];
 
         const op: ReplOp = if (std.mem.eql(u8, op_str, "put"))
             .put
@@ -536,23 +459,12 @@ const ReplLog = struct {
         else
             return error.InvalidOp;
 
-        // Check for optional dep:<id> field
-        var depends_on: ?u64 = null;
-        var rel_path: []const u8 = after_op;
-        if (std.mem.startsWith(u8, after_op, "dep:")) {
-            const dep_end = std.mem.indexOfScalar(u8, after_op, ' ') orelse return error.InvalidFormat;
-            const dep_str = after_op[4..dep_end]; // skip "dep:"
-            depends_on = std.fmt.parseUnsigned(u64, dep_str, 10) catch return error.InvalidFormat;
-            rel_path = after_op[dep_end + 1 ..];
-        }
-
         const id = self.next_id;
         self.next_id += 1;
         try self.entries.append(self.allocator, .{
             .id = id,
             .op = op,
             .path = try self.allocator.dupe(u8, rel_path),
-            .depends_on = depends_on,
         });
     }
 
@@ -573,53 +485,7 @@ const ReplLog = struct {
             log.err("failed to append to replication log: {}", .{err});
         };
 
-        // Update pending metric
-        g_state.metrics.repl_pending.store(self.pendingCountLocked(), .release);
-
         self.cond.signal();
-    }
-
-    fn enqueuePair(self: *ReplLog, op1: ReplOp, path1: []const u8, op2: ReplOp, path2: []const u8) void {
-        self.mutex.lock();
-        defer self.mutex.unlock();
-
-        const p1 = self.allocator.dupe(u8, path1) catch {
-            log.err("OOM in enqueuePair for path: {s}", .{path1});
-            return;
-        };
-        const p2 = self.allocator.dupe(u8, path2) catch {
-            self.allocator.free(p1);
-            log.err("OOM in enqueuePair for path: {s}", .{path2});
-            return;
-        };
-
-        const id1 = self.next_id;
-        self.next_id += 1;
-        const id2 = self.next_id;
-        self.next_id += 1;
-
-        self.entries.append(self.allocator, .{ .id = id1, .op = op1, .path = p1 }) catch {
-            self.allocator.free(p1);
-            self.allocator.free(p2);
-            log.err("OOM in enqueuePair append for path: {s}", .{path1});
-            return;
-        };
-        self.entries.append(self.allocator, .{ .id = id2, .op = op2, .path = p2, .depends_on = id1 }) catch {
-            // Roll back the first append
-            _ = self.entries.pop();
-            self.allocator.free(p1);
-            self.allocator.free(p2);
-            log.err("OOM in enqueuePair append for path: {s}", .{path2});
-            return;
-        };
-
-        // Write both entries to disk with a single fsync
-        self.appendPairToDisk(op1, path1, id1, op2, path2) catch |err| {
-            log.err("failed to append pair to replication log: {}", .{err});
-        };
-
-        g_state.metrics.repl_pending.store(self.pendingCountLocked(), .release);
-        self.cond.broadcast();
     }
 
     fn appendToDisk(self: *ReplLog, op: ReplOp, rel_path: []const u8) !void {
@@ -630,26 +496,9 @@ const ReplLog = struct {
         defer file.close();
         try file.seekFromEnd(0);
 
-        const line = try formatLogEntry(self.allocator, op, rel_path, null);
+        const line = try formatLogEntry(self.allocator, op, rel_path);
         defer self.allocator.free(line);
         try file.writeAll(line);
-        try file.sync();
-    }
-
-    fn appendPairToDisk(self: *ReplLog, op1: ReplOp, path1: []const u8, id1: u64, op2: ReplOp, path2: []const u8) !void {
-        const path = try self.logPath();
-        defer self.allocator.free(path);
-
-        const file = try std.fs.createFileAbsolute(path, .{ .truncate = false });
-        defer file.close();
-        try file.seekFromEnd(0);
-
-        const line1 = try formatLogEntry(self.allocator, op1, path1, null);
-        defer self.allocator.free(line1);
-        const line2 = try formatLogEntry(self.allocator, op2, path2, id1);
-        defer self.allocator.free(line2);
-        try file.writeAll(line1);
-        try file.writeAll(line2);
         try file.sync();
     }
 
@@ -679,14 +528,6 @@ const ReplLog = struct {
                     }
                 }
 
-                // Enforce depends_on ordering: skip if dependency not yet completed
-                if (entry.depends_on) |dep_id| {
-                    const dep_done = for (self.entries.items) |*dep| {
-                        if (dep.id == dep_id) break dep.completed;
-                    } else true; // dependency already truncated → treat as done
-                    if (!dep_done) continue;
-                }
-
                 entry.in_flight = true;
                 return .{ .id = entry.id, .op = entry.op, .path = entry.path };
             }
@@ -710,8 +551,6 @@ const ReplLog = struct {
             }
         }
 
-        g_state.metrics.repl_pending.store(self.pendingCountLocked(), .release);
-
         // Check if truncation is needed
         self.maybeTruncate();
     }
@@ -729,8 +568,6 @@ const ReplLog = struct {
                 self.completed_count += 1;
             }
         }
-
-        g_state.metrics.repl_pending.store(self.pendingCountLocked(), .release);
     }
 
     fn pendingCountLocked(self: *ReplLog) u64 {
@@ -805,7 +642,7 @@ const ReplLog = struct {
         defer tmp_file.close();
 
         for (self.entries.items) |entry| {
-            const line = try formatLogEntry(self.allocator, entry.op, entry.path, entry.depends_on);
+            const line = try formatLogEntry(self.allocator, entry.op, entry.path);
             defer self.allocator.free(line);
             try tmp_file.writeAll(line);
         }
@@ -821,149 +658,12 @@ const ReplLog = struct {
     }
 };
 
-fn formatLogEntry(allocator: std.mem.Allocator, op: ReplOp, rel_path: []const u8, depends_on: ?u64) ![]const u8 {
+fn formatLogEntry(allocator: std.mem.Allocator, op: ReplOp, rel_path: []const u8) ![]const u8 {
     const op_str = switch (op) {
         .put => "put",
         .delete => "delete",
     };
-    // Remainder is " <op> [dep:<id> ]<path>"
-    const remainder = if (depends_on) |dep_id|
-        try std.fmt.allocPrint(allocator, " {s} dep:{d} {s}", .{ op_str, dep_id, rel_path })
-    else
-        try std.fmt.allocPrint(allocator, " {s} {s}", .{ op_str, rel_path });
-    defer allocator.free(remainder);
-
-    const crc_val = std.hash.crc.Crc32IsoHdlc.hash(remainder);
-    return try std.fmt.allocPrint(allocator, "{x:0>8}{s}\n", .{ crc_val, remainder });
-}
-
-// ============================================================================
-// Metrics
-// ============================================================================
-
-const Metrics = struct {
-    repl_pending: std.atomic.Value(u64) = std.atomic.Value(u64).init(0),
-    repl_completed: std.atomic.Value(u64) = std.atomic.Value(u64).init(0),
-    repl_errors: std.atomic.Value(u64) = std.atomic.Value(u64).init(0),
-    scrub_files_checked: std.atomic.Value(u64) = std.atomic.Value(u64).init(0),
-    scrub_corruptions: std.atomic.Value(u64) = std.atomic.Value(u64).init(0),
-    scrub_repairs: std.atomic.Value(u64) = std.atomic.Value(u64).init(0),
-    scrub_last_completed: std.atomic.Value(i64) = std.atomic.Value(i64).init(0),
-    scrub_duration_ms: std.atomic.Value(u64) = std.atomic.Value(u64).init(0),
-};
-
-fn metricsServerLoop(state: *FsState) void {
-    const addr_str = state.metrics_addr orelse return;
-    const port = parseMetricsAddr(addr_str) catch |err| {
-        log.err("invalid metrics address '{s}': {}", .{ addr_str, err });
-        return;
-    };
-
-    const addr = std.net.Address.parseIp4("0.0.0.0", port) catch |err| {
-        log.err("failed to parse metrics address: {}", .{err});
-        return;
-    };
-
-    var server = addr.listen(.{ .reuse_address = true }) catch |err| {
-        log.err("failed to start metrics server: {}", .{err});
-        return;
-    };
-    defer server.deinit();
-
-    log.info("metrics server listening on :{d}", .{port});
-
-    while (!state.shutdown.load(.acquire)) {
-        const conn = server.accept() catch |err| {
-            if (state.shutdown.load(.acquire)) break;
-            log.err("metrics accept error: {}", .{err});
-            continue;
-        };
-
-        handleMetricsConn(state, conn.stream) catch |err| {
-            log.err("metrics connection error: {}", .{err});
-        };
-    }
-}
-
-fn handleMetricsConn(state: *FsState, stream: std.net.Stream) !void {
-    defer stream.close();
-
-    // Read the HTTP request, looping until we see the end-of-headers
-    // marker (\r\n\r\n) or the buffer is full.
-    var buf: [4096]u8 = undefined;
-    var total: usize = 0;
-    while (total < buf.len) {
-        const n = stream.read(buf[total..]) catch return;
-        if (n == 0) break; // client closed connection
-        total += n;
-        // Check for end of HTTP headers
-        if (std.mem.indexOf(u8, buf[0..total], "\r\n\r\n") != null) break;
-    }
-    const request = buf[0..total];
-
-    if (std.mem.startsWith(u8, request, "GET /metrics ") or std.mem.startsWith(u8, request, "GET /metrics\r")) {
-        const body = formatMetrics(state) catch return;
-        defer state.allocator.free(body);
-
-        const header = std.fmt.allocPrint(state.allocator, "HTTP/1.1 200 OK\r\nContent-Type: text/plain; version=0.0.4\r\nContent-Length: {d}\r\nConnection: close\r\n\r\n", .{body.len}) catch return;
-        defer state.allocator.free(header);
-
-        stream.writeAll(header) catch return;
-        stream.writeAll(body) catch return;
-    } else {
-        const resp = "HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
-        stream.writeAll(resp) catch return;
-    }
-}
-
-fn formatMetrics(state: *FsState) ![]const u8 {
-    const m = &state.metrics;
-    const duration_ms = m.scrub_duration_ms.load(.acquire);
-    const duration: f64 = @as(f64, @floatFromInt(duration_ms)) / 1000.0;
-
-    return try std.fmt.allocPrint(state.allocator,
-        \\# HELP helmetfs_replication_pending Pending replication log entries.
-        \\# TYPE helmetfs_replication_pending gauge
-        \\helmetfs_replication_pending {d}
-        \\# HELP helmetfs_replication_completed_total Files replicated.
-        \\# TYPE helmetfs_replication_completed_total counter
-        \\helmetfs_replication_completed_total {d}
-        \\# HELP helmetfs_replication_errors_total Replication errors.
-        \\# TYPE helmetfs_replication_errors_total counter
-        \\helmetfs_replication_errors_total {d}
-        \\# HELP helmetfs_scrub_files_checked_total Files checked across all scrubs.
-        \\# TYPE helmetfs_scrub_files_checked_total counter
-        \\helmetfs_scrub_files_checked_total {d}
-        \\# HELP helmetfs_scrub_corruptions_found_total Corruption detections.
-        \\# TYPE helmetfs_scrub_corruptions_found_total counter
-        \\helmetfs_scrub_corruptions_found_total {d}
-        \\# HELP helmetfs_scrub_repairs_total Successful repairs from replica.
-        \\# TYPE helmetfs_scrub_repairs_total counter
-        \\helmetfs_scrub_repairs_total {d}
-        \\# HELP helmetfs_scrub_last_completed_timestamp Unix timestamp of last scrub.
-        \\# TYPE helmetfs_scrub_last_completed_timestamp gauge
-        \\helmetfs_scrub_last_completed_timestamp {d}
-        \\# HELP helmetfs_scrub_duration_seconds Duration of last scrub.
-        \\# TYPE helmetfs_scrub_duration_seconds gauge
-        \\helmetfs_scrub_duration_seconds {d:.3}
-        \\
-    , .{
-        m.repl_pending.load(.acquire),
-        m.repl_completed.load(.acquire),
-        m.repl_errors.load(.acquire),
-        m.scrub_files_checked.load(.acquire),
-        m.scrub_corruptions.load(.acquire),
-        m.scrub_repairs.load(.acquire),
-        m.scrub_last_completed.load(.acquire),
-        duration,
-    });
-}
-
-fn parseMetricsAddr(addr_str: []const u8) !u16 {
-    // Format: ":9090" or "9090"
-    if (addr_str.len == 0) return error.InvalidFormat;
-    const port_str = if (addr_str[0] == ':') addr_str[1..] else addr_str;
-    return std.fmt.parseUnsigned(u16, port_str, 10);
+    return try std.fmt.allocPrint(allocator, "{s} {s}\n", .{ op_str, rel_path });
 }
 
 // ============================================================================
@@ -1060,10 +760,8 @@ fn replWorkerLoop(state: *FsState) void {
 
             if (result) |_| {
                 state.repl_log.markCompleted(work.id);
-                _ = state.metrics.repl_completed.fetchAdd(1, .release);
                 break;
             } else |err| {
-                _ = state.metrics.repl_errors.fetchAdd(1, .release);
                 log.err("replication error for {s}: {}, retrying in {d}s", .{
                     work.path,
                     err,
@@ -1175,11 +873,7 @@ fn copyFileWithSync(src_path: []const u8, dst_path: []const u8) !void {
     var tmp_path_buf: [std.fs.max_path_bytes]u8 = undefined;
     const tmp_path = std.fmt.bufPrint(&tmp_path_buf, "{s}.tmp", .{dst_path}) catch return error.NameTooLong;
 
-    const dst = std.fs.createFileAbsolute(tmp_path, .{}) catch {
-        // Fall back to direct write if we can't create the temp file
-        src.seekTo(0) catch {};
-        return copyFileDirectWithSync(src, dst_path);
-    };
+    const dst = try std.fs.createFileAbsolute(tmp_path, .{});
 
     var ok = false;
     defer {
@@ -1208,19 +902,6 @@ fn copyFileWithSync(src_path: []const u8, dst_path: []const u8) !void {
     if (std.fs.path.dirname(dst_path)) |dir_path| {
         fsyncDir(dir_path);
     }
-}
-
-fn copyFileDirectWithSync(src: std.fs.File, dst_path: []const u8) !void {
-    const dst = try std.fs.createFileAbsolute(dst_path, .{});
-    defer dst.close();
-
-    var buf: [64 * 1024]u8 = undefined;
-    while (true) {
-        const n = try src.read(&buf);
-        if (n == 0) break;
-        try dst.writeAll(buf[0..n]);
-    }
-    try dst.sync();
 }
 
 fn fsyncDir(dir_path: []const u8) void {
@@ -1353,13 +1034,6 @@ fn runScrub(state: *FsState) void {
     const end = std.time.timestamp();
     const end_ms = std.time.milliTimestamp();
     const duration_ms: u64 = @intCast(end_ms - start_ms);
-
-    // Update metrics
-    _ = state.metrics.scrub_files_checked.fetchAdd(files_checked, .release);
-    _ = state.metrics.scrub_corruptions.fetchAdd(corruptions_found, .release);
-    _ = state.metrics.scrub_repairs.fetchAdd(repairs, .release);
-    state.metrics.scrub_last_completed.store(end, .release);
-    state.metrics.scrub_duration_ms.store(duration_ms, .release);
 
     // Write scrub timestamp
     writeScrubTimestamp(state, end);
@@ -1659,37 +1333,14 @@ fn fuse_open(path: [*c]const u8, fi: ?*c.struct_fuse_file_info) callconv(.c) c_i
 }
 
 fn fuse_read(path: [*c]const u8, buf_ptr: [*c]u8, size: usize, offset: c.off_t, fi: ?*c.struct_fuse_file_info) callconv(.c) c_int {
-    const state = g_state;
-    const rel = fuseRelPath(path);
+    _ = path;
 
     const fd: posix.fd_t = if (castFi(fi)) |f| decodeFh(f.fh).fd else return fuseErr(.BADF);
-
-    // Verify reads if enabled
-    if (state.verify_reads and rel.len > 0 and !state.path_state.hasWriteRef(rel) and state.path_state.shouldVerify(rel)) {
-        verifyRead(state, rel) catch |err| {
-            log.err("read verification failed for {s}: {}", .{ rel, err });
-        };
-    }
 
     const n = posix.pread(fd, buf_ptr[0..size], @intCast(offset)) catch {
         return fuseErr(.IO);
     };
     return @intCast(n);
-}
-
-fn verifyRead(state: *FsState, rel_path: []const u8) !void {
-    const backing_path_str = try std.fs.path.join(state.allocator, &.{ state.backing_dir, rel_path });
-    defer state.allocator.free(backing_path_str);
-    const sum_path = try std.fmt.allocPrint(state.allocator, "{s}.sum", .{backing_path_str});
-    defer state.allocator.free(sum_path);
-
-    const stored_hex = readSumFile(state.allocator, sum_path) catch return; // No .sum = no verification
-    defer state.allocator.free(stored_hex);
-
-    const current_hex = computeBlake3(backing_path_str) catch return;
-    if (!std.mem.eql(u8, &current_hex, stored_hex)) {
-        log.err("READ VERIFICATION FAILED: {s} - checksum mismatch (scrub will attempt repair)", .{rel_path});
-    }
 }
 
 fn fuse_write(path: [*c]const u8, data: [*c]const u8, size: usize, offset: c.off_t, fi: ?*c.struct_fuse_file_info) callconv(.c) c_int {
@@ -1881,9 +1532,14 @@ fn fuse_rename(from: [*c]const u8, to: [*c]const u8, flags: c_uint) callconv(.c)
     defer state.allocator.free(sum_to);
     std.fs.renameAbsolute(sum_from, sum_to) catch {};
 
-    // Enqueue delete(old) + put(new) as paired entries
+    // Enqueue delete(old) + put(new)
     if (rel_from.len > 0 and rel_to.len > 0) {
-        state.repl_log.enqueuePair(.delete, rel_from, .put, rel_to);
+        state.repl_log.enqueue(.delete, rel_from) catch |err| {
+            log.err("failed to enqueue rename delete for {s}: {}", .{ rel_from, err });
+        };
+        state.repl_log.enqueue(.put, rel_to) catch |err| {
+            log.err("failed to enqueue rename put for {s}: {}", .{ rel_to, err });
+        };
     }
 
     // Remove stale path state for the old name so the map doesn't grow
@@ -1966,10 +1622,6 @@ fn fuse_readlink(path: [*c]const u8, buf_ptr: [*c]u8, size: usize) callconv(.c) 
     buf[target.len] = 0;
 
     return 0;
-}
-
-fn fuse_link(_: [*c]const u8, _: [*c]const u8) callconv(.c) c_int {
-    return fuseErr(.OPNOTSUPP);
 }
 
 fn fuse_chmod(path: [*c]const u8, mode: c.mode_t, fi: ?*c.struct_fuse_file_info) callconv(.c) c_int {
@@ -2099,44 +1751,6 @@ fn fuse_statfs(path: [*c]const u8, stbuf: [*c]c.struct_statvfs) callconv(.c) c_i
     return 0;
 }
 
-fn fuse_fallocate(path: [*c]const u8, mode: c_int, offset: c.off_t, length: c.off_t, fi: ?*c.struct_fuse_file_info) callconv(.c) c_int {
-    if (comptime builtin.os.tag != .linux) {
-        // fallocate is Linux-specific; on macOS return ENOTSUP
-        return fuseErr(.OPNOTSUPP);
-    }
-
-    const state = g_state;
-    const rel = fuseRelPath(path);
-
-    const fd: posix.fd_t = if (castFi(fi)) |f|
-        decodeFh(f.fh).fd
-    else blk: {
-        const backing = backingPath(state.allocator, state, rel) catch return fuseErr(.NOMEM);
-        defer state.allocator.free(backing);
-        const file = std.fs.openFileAbsolute(backing, .{ .mode = .read_write }) catch |err| {
-            return posixErr(err);
-        };
-        break :blk file.handle;
-    };
-
-    const ret = c.fallocate(fd, mode, offset, length);
-    // Capture errno immediately, before close() can clobber it.
-    const err_val = std.c._errno().*;
-    // If we opened the file ourselves (no fi), close it.
-    if (castFi(fi) == null) posix.close(fd);
-
-    if (ret != 0) {
-        return -@as(c_int, @intCast(err_val));
-    }
-
-    // Mark dirty
-    if (rel.len > 0) {
-        state.path_state.setDirty(rel);
-    }
-
-    return 0;
-}
-
 fn fuse_access(path: [*c]const u8, mask: c_int) callconv(.c) c_int {
     const state = g_state;
     const rel = fuseRelPath(path);
@@ -2175,7 +1789,7 @@ fn fuse_init(_: ?*c.struct_fuse_conn_info, _: [*c]c.struct_fuse_config) callconv
 // mmap callback, so helmetfs cannot explicitly return ENOTSUP for mmap requests.
 // Under the default (non-direct_io) configuration, mmap'd writes go through the
 // kernel page cache and may bypass FUSE write() tracking. This is an accepted
-// limitation of the high-level API. See DESIGN.md for details.
+// limitation of the high-level API.
 //
 
 const fuse_ops = std.mem.zeroInit(c.struct_fuse_operations, .{
@@ -2186,7 +1800,6 @@ const fuse_ops = std.mem.zeroInit(c.struct_fuse_operations, .{
     .rmdir = fuse_rmdir,
     .symlink = fuse_symlink,
     .rename = fuse_rename,
-    .link = fuse_link,
     .chmod = fuse_chmod,
     .chown = fuse_chown,
     .truncate = fuse_truncate,
@@ -2202,7 +1815,6 @@ const fuse_ops = std.mem.zeroInit(c.struct_fuse_operations, .{
     .access = fuse_access,
     .create = fuse_create,
     .utimens = fuse_utimens,
-    .fallocate = fuse_fallocate,
 });
 
 // ============================================================================
@@ -2238,9 +1850,7 @@ const CliArgs = struct {
     mountpoint: []const u8,
     replica: ?[]const u8 = null,
     repl_workers: u32 = 4,
-    verify_reads: bool = false,
     scrub_time: []const u8 = "01:00",
-    metrics_addr: ?[]const u8 = null,
 };
 
 fn parseArgs(allocator: std.mem.Allocator) !CliArgs {
@@ -2306,16 +1916,9 @@ fn parseArgs(allocator: std.mem.Allocator) !CliArgs {
                 std.debug.print("Invalid replication workers count: {s}\n", .{val});
                 std.process.exit(1);
             };
-        } else if (std.mem.eql(u8, arg, "--verify-reads")) {
-            result.verify_reads = true;
         } else if (std.mem.eql(u8, arg, "--scrub-time")) {
             result.scrub_time = args_iter.next() orelse {
                 std.debug.print("--scrub-time requires a value (HH:MM)\n", .{});
-                std.process.exit(1);
-            };
-        } else if (std.mem.eql(u8, arg, "--metrics-addr")) {
-            result.metrics_addr = args_iter.next() orelse {
-                std.debug.print("--metrics-addr requires a value\n", .{});
                 std.process.exit(1);
             };
         } else {
@@ -2351,9 +1954,7 @@ fn printUsage() void {
         \\Options:
         \\  --replica <path>           Replica directory (required)
         \\  --replication-workers <n>  Number of replication workers (default: 4)
-        \\  --verify-reads             Enable read-time checksum verification
         \\  --scrub-time HH:MM        Scrub schedule in 24h format (default: 01:00)
-        \\  --metrics-addr :PORT      Prometheus metrics endpoint (disabled by default)
         \\
     , .{});
 }
@@ -2437,7 +2038,6 @@ fn doMount(allocator: std.mem.Allocator, args: CliArgs) !void {
     log.info("  mountpoint:  {s}", .{mount_abs});
     log.info("  replica dir: {s}", .{replica_abs});
     log.info("  workers:     {d}", .{args.repl_workers});
-    log.info("  verify reads: {}", .{args.verify_reads});
     log.info("  scrub time:  {s}", .{args.scrub_time});
 
     // Initialize global state
@@ -2445,10 +2045,8 @@ fn doMount(allocator: std.mem.Allocator, args: CliArgs) !void {
         allocator,
         source_abs,
         replica_abs,
-        args.verify_reads,
         scrub.hour,
         scrub.minute,
-        args.metrics_addr,
         args.repl_workers,
     );
 
@@ -2540,7 +2138,7 @@ const TestHarness = struct {
         defer allocator.free(replica_files);
         try std.fs.makeDirAbsolute(replica_files);
 
-        const state = try FsState.init(allocator, backing, replica, false, 1, 0, null, 1);
+        const state = try FsState.init(allocator, backing, replica, 1, 0, 1);
         g_state = state;
 
         return .{
@@ -2601,23 +2199,23 @@ const TestHarness = struct {
 
 // ---------- formatLogEntry / parseLine round-trip ----------
 
-test "formatLogEntry produces valid CRC-protected line" {
+test "formatLogEntry produces valid log line" {
     const allocator = testing.allocator;
-    const line = try formatLogEntry(allocator, .put, "foo/bar.txt", null);
+    const line = try formatLogEntry(allocator, .put, "foo/bar.txt");
     defer allocator.free(line);
 
     // Should end with newline
     try testing.expect(line[line.len - 1] == '\n');
 
-    // Should contain " put foo/bar.txt"
-    try testing.expect(std.mem.indexOf(u8, line, " put foo/bar.txt") != null);
+    // Should contain "put foo/bar.txt"
+    try testing.expect(std.mem.indexOf(u8, line, "put foo/bar.txt") != null);
 }
 
 test "formatLogEntry/parseLine round-trip for put" {
     var h = try TestHarness.init();
     defer h.deinit();
 
-    const line = try formatLogEntry(h.allocator, .put, "hello/world.txt", null);
+    const line = try formatLogEntry(h.allocator, .put, "hello/world.txt");
     defer h.allocator.free(line);
 
     // Strip trailing newline for parseLine
@@ -2638,7 +2236,7 @@ test "formatLogEntry/parseLine round-trip for delete" {
     var h = try TestHarness.init();
     defer h.deinit();
 
-    const line = try formatLogEntry(h.allocator, .delete, "gone.txt", null);
+    const line = try formatLogEntry(h.allocator, .delete, "gone.txt");
     defer h.allocator.free(line);
 
     const trimmed = std.mem.trimRight(u8, line, "\n");
@@ -2647,23 +2245,6 @@ test "formatLogEntry/parseLine round-trip for delete" {
     const entry = h.state.repl_log.entries.getLast();
     try testing.expectEqual(ReplOp.delete, entry.op);
     try testing.expectEqualStrings("gone.txt", entry.path);
-}
-
-test "parseLine rejects corrupted CRC" {
-    var h = try TestHarness.init();
-    defer h.deinit();
-
-    const line = try formatLogEntry(h.allocator, .put, "test.txt", null);
-    defer h.allocator.free(line);
-    const trimmed = std.mem.trimRight(u8, line, "\n");
-
-    // Corrupt the CRC by changing the first character
-    var corrupted = try h.allocator.dupe(u8, trimmed);
-    defer h.allocator.free(corrupted);
-    corrupted[0] = if (corrupted[0] == 'a') 'b' else 'a';
-
-    const result = h.state.repl_log.parseLine(corrupted);
-    try testing.expectError(error.CrcMismatch, result);
 }
 
 // ---------- PathStateMap ----------
@@ -2769,7 +2350,7 @@ test "isHiddenPath: regular file not hidden" {
     try testing.expect(!isHiddenPath(h.state, "subdir/file.txt"));
 }
 
-// ---------- parseScrubTime / parseMetricsAddr ----------
+// ---------- parseScrubTime ----------
 
 test "parseScrubTime: valid inputs" {
     const r1 = try parseScrubTime("01:00");
@@ -2789,17 +2370,6 @@ test "parseScrubTime: invalid inputs" {
     try testing.expectError(error.InvalidTime, parseScrubTime("24:00"));
     try testing.expectError(error.InvalidTime, parseScrubTime("12:60"));
     try testing.expectError(error.InvalidFormat, parseScrubTime("1200"));
-}
-
-test "parseMetricsAddr: valid inputs" {
-    try testing.expectEqual(@as(u16, 9090), try parseMetricsAddr(":9090"));
-    try testing.expectEqual(@as(u16, 8080), try parseMetricsAddr("8080"));
-    try testing.expectEqual(@as(u16, 1), try parseMetricsAddr(":1"));
-}
-
-test "parseMetricsAddr: invalid inputs" {
-    try testing.expectError(error.InvalidFormat, parseMetricsAddr(""));
-    try testing.expectError(error.InvalidCharacter, parseMetricsAddr(":abc"));
 }
 
 // ---------- computeBlake3 / writeSumFile / readSumFile ----------
@@ -2906,15 +2476,6 @@ test "ReplLog.enqueue adds entries" {
     const before = h.state.repl_log.entries.items.len;
     try h.state.repl_log.enqueue(.put, "file1.txt");
     try h.state.repl_log.enqueue(.delete, "file2.txt");
-    try testing.expectEqual(before + 2, h.state.repl_log.entries.items.len);
-}
-
-test "ReplLog.enqueuePair adds two entries atomically" {
-    var h = try TestHarness.init();
-    defer h.deinit();
-
-    const before = h.state.repl_log.entries.items.len;
-    h.state.repl_log.enqueuePair(.delete, "old.txt", .put, "new.txt");
     try testing.expectEqual(before + 2, h.state.repl_log.entries.items.len);
 }
 
@@ -3105,21 +2666,6 @@ test "ReplLog persists to disk and reloads" {
     try testing.expectEqualStrings("persist2.txt", log2.entries.items[1].path);
 }
 
-// ---------- formatMetrics ----------
-
-test "formatMetrics produces Prometheus-format output" {
-    var h = try TestHarness.init();
-    defer h.deinit();
-
-    const body = try formatMetrics(h.state);
-    defer h.allocator.free(body);
-
-    try testing.expect(std.mem.indexOf(u8, body, "helmetfs_replication_pending") != null);
-    try testing.expect(std.mem.indexOf(u8, body, "helmetfs_scrub_files_checked_total") != null);
-    try testing.expect(std.mem.indexOf(u8, body, "# HELP") != null);
-    try testing.expect(std.mem.indexOf(u8, body, "# TYPE") != null);
-}
-
 // ---------- ReplLog put coalescing ----------
 
 test "dequeueNext coalesces duplicate puts, returning only the latest" {
@@ -3188,22 +2734,6 @@ test "markCompleted triggers truncation and removes completed entries" {
     try testing.expectEqual(@as(usize, 1), h.state.repl_log.entries.items.len);
     try testing.expectEqualStrings("d.txt", h.state.repl_log.entries.items[0].path);
     try testing.expectEqual(@as(usize, 0), h.state.repl_log.completed_count);
-}
-
-// ---------- PathStateMap.shouldVerify ----------
-
-test "PathStateMap.shouldVerify throttles within 60s window" {
-    var psm = PathStateMap.init(testing.allocator);
-    defer deinitPathStateMap(&psm);
-
-    // First call should return true (no prior verification)
-    try testing.expect(psm.shouldVerify("throttle.txt"));
-
-    // Immediately calling again should return false (within 60s)
-    try testing.expect(!psm.shouldVerify("throttle.txt"));
-
-    // Different path should still allow verification
-    try testing.expect(psm.shouldVerify("other.txt"));
 }
 
 // ---------- scrubFile: replica also corrupt ----------
@@ -3334,14 +2864,14 @@ test "ReplLog loadFromDisk gracefully skips corrupted lines" {
     const log_path = try std.fs.path.join(h.allocator, &.{ h.backing_dir, ".helmetfs", "repl.log" });
     defer h.allocator.free(log_path);
 
-    const valid_line = try formatLogEntry(h.allocator, .put, "good.txt", null);
+    const valid_line = try formatLogEntry(h.allocator, .put, "good.txt");
     defer h.allocator.free(valid_line);
 
     {
         const file = try std.fs.createFileAbsolute(log_path, .{ .truncate = true });
         defer file.close();
         try file.writeAll(valid_line);
-        try file.writeAll("deadbeef put corrupted.txt\n"); // bad CRC
+        try file.writeAll("badop corrupted.txt\n"); // invalid operation
         try file.sync();
     }
 
@@ -3394,28 +2924,6 @@ test "flushDirtyFiles processes all dirty paths" {
     // Dirty flags should be cleared
     try testing.expect(!h.state.path_state.isDirty("flush1.txt"));
     try testing.expect(!h.state.path_state.isDirty("flush2.txt"));
-}
-
-// ---------- formatMetrics reflects actual values ----------
-
-test "formatMetrics reflects actual metric values" {
-    var h = try TestHarness.init();
-    defer h.deinit();
-
-    // Set specific metric values
-    h.state.metrics.repl_completed.store(42, .release);
-    h.state.metrics.repl_errors.store(3, .release);
-    h.state.metrics.scrub_corruptions.store(7, .release);
-    h.state.metrics.scrub_repairs.store(5, .release);
-
-    const body = try formatMetrics(h.state);
-    defer h.allocator.free(body);
-
-    // Verify the specific values appear in the output
-    try testing.expect(std.mem.indexOf(u8, body, "helmetfs_replication_completed_total 42") != null);
-    try testing.expect(std.mem.indexOf(u8, body, "helmetfs_replication_errors_total 3") != null);
-    try testing.expect(std.mem.indexOf(u8, body, "helmetfs_scrub_corruptions_found_total 7") != null);
-    try testing.expect(std.mem.indexOf(u8, body, "helmetfs_scrub_repairs_total 5") != null);
 }
 
 // ---------- ReplLog: delete entries are not coalesced ----------
@@ -3504,7 +3012,8 @@ test "end-to-end: rename enqueues delete+put pair and replication works" {
     std.fs.renameAbsolute(old_sum, new_sum) catch {};
 
     const entries_before = h.state.repl_log.entries.items.len;
-    h.state.repl_log.enqueuePair(.delete, "old-name.txt", .put, "new-name.txt");
+    try h.state.repl_log.enqueue(.delete, "old-name.txt");
+    try h.state.repl_log.enqueue(.put, "new-name.txt");
     try testing.expectEqual(entries_before + 2, h.state.repl_log.entries.items.len);
 
     // Process the delete
