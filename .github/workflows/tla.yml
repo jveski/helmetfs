@@ -1,0 +1,29 @@
+name: TLA+ Model Checking
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  tla:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Java
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: 21
+
+      - name: Download tla2tools.jar
+        run: |
+          wget -q -O tla/tla2tools.jar https://github.com/tlaplus/tlaplus/releases/download/v1.8.0/tla2tools.jar
+
+      - name: Run TLC model checker
+        run: |
+          java -jar tla/tla2tools.jar -config tla/helmetfs.cfg -workers auto tla/helmetfs.tla
