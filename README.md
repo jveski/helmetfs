@@ -1,11 +1,10 @@
 # helmetfs
 
-A FUSE filesystem that bridges between local and remote storage for backups and self-healing.
+A FUSE filesystem for real-time backups to remote storage and self-healing from file corruption.
 
-
-## Features
-
-TODO
+The helmet filesystem is layered on top of two filesystems: one local and one remote.
+Operations are passed through to the local fs and asynchronously replicated to the remote one.
+A nightly job checks the integrity of local files and recovers from bitflips by restoring from remote storage.
 
 
 ## Usage
@@ -21,7 +20,5 @@ helmetfs unmount <mountpoint>
 |---|---|---|
 | `--replica <path>` | Replica directory (required) | -- |
 | `--replication-workers <n>` | Number of background worker threads | `4` |
-| `--verify-reads` | Enable read-time checksum verification | off |
 | `--scrub-time HH:MM` | Daily scrub schedule (24-hour format) | `01:00` |
-| `--metrics-addr :PORT` | Enable Prometheus metrics endpoint | off |
 
