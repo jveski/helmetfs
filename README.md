@@ -7,6 +7,14 @@ Operations are passed through to the local fs and asynchronously replicated to t
 A nightly job checks the integrity of local files and recovers from bitflips by restoring from remote storage.
 
 
+## Installation
+
+```bash
+curl -Lo helmetfs "https://github.com/jveski/helmetfs/releases/latest/download/helmetfs-linux-$(uname -m | sed 's/x86_64/amd64/' | sed 's/aarch64/arm64/')"
+chmod +x helmetfs
+# move it somewhere in your $PATH
+```
+
 ## Usage
 
 ```bash
