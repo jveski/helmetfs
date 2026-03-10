@@ -107,6 +107,7 @@ const FsState = struct {
     scrub_hour: u8,
     scrub_minute: u8,
     repl_workers: u32,
+    no_remote_mkdir: bool,
 
     // Per-path state (dirty flag + write-descriptor refcount)
     path_state: PathStateMap,
@@ -129,6 +130,7 @@ const FsState = struct {
         scrub_hour: u8,
         scrub_minute: u8,
         repl_workers: u32,
+        no_remote_mkdir: bool,
     ) !*FsState {
         const self = try allocator.create(FsState);
         self.* = .{
@@ -138,6 +140,7 @@ const FsState = struct {
             .scrub_hour = scrub_hour,
             .scrub_minute = scrub_minute,
             .repl_workers = repl_workers,
+            .no_remote_mkdir = no_remote_mkdir,
             .path_state = PathStateMap.init(allocator),
             .repl_log = undefined,
             .shutdown = std.atomic.Value(bool).init(false),
@@ -862,6 +865,13 @@ fn replicateDelete(state: *FsState, rel_path: []const u8) !void {
         error.FileNotFound => {},
         else => return err,
     };
+
+    // Clean up empty parent directories on the replica
+    if (!state.no_remote_mkdir) {
+        const replica_files_root = try std.fs.path.join(state.allocator, &.{ state.replica_dir, "files" });
+        defer state.allocator.free(replica_files_root);
+        removeEmptyParentDirs(replica_path, replica_files_root);
+    }
 }
 
 fn copyFileWithSync(src_path: []const u8, dst_path: []const u8) !void {
@@ -926,6 +936,21 @@ fn ensureParentDir(path: []const u8) !void {
         },
         else => return err,
     };
+}
+
+/// Walk up the directory tree from `path`, removing empty directories until
+/// reaching `stop_at` (exclusive).  This is the inverse of `ensureParentDir`
+/// and is used to clean up replica subdirectories after the last file in a
+/// subtree is deleted.  Failures are silently ignored — leftover empty dirs
+/// are harmless and will be cleaned up on the next delete.
+fn removeEmptyParentDirs(path: []const u8, stop_at: []const u8) void {
+    var current = std.fs.path.dirname(path);
+    while (current) |dir| {
+        // Never remove the stop directory itself or anything above it
+        if (dir.len <= stop_at.len) break;
+        std.fs.deleteDirAbsolute(dir) catch break; // non-empty or permission error → stop
+        current = std.fs.path.dirname(dir);
+    }
 }
 
 // ============================================================================
@@ -1577,6 +1602,19 @@ fn fuse_mkdir(path: [*c]const u8, mode: c.mode_t) callconv(.c) c_int {
     // Preserve mode
     posix.fchmodat(posix.AT.FDCWD, backing, mode, 0) catch {};
 
+    // Replicate directory creation to replica
+    if (!state.no_remote_mkdir and rel.len > 0) {
+        const replica_path = std.fs.path.join(state.allocator, &.{ state.replica_dir, "files", rel }) catch return 0;
+        defer state.allocator.free(replica_path);
+        ensureParentDir(replica_path) catch {};
+        std.fs.makeDirAbsolute(replica_path) catch |err| switch (err) {
+            error.PathAlreadyExists => {},
+            else => {
+                log.warn("failed to mkdir on replica for {s}: {}", .{ rel, err });
+            },
+        };
+    }
+
     return 0;
 }
 
@@ -1590,6 +1628,13 @@ fn fuse_rmdir(path: [*c]const u8) callconv(.c) c_int {
     std.fs.deleteDirAbsolute(backing) catch |err| {
         return posixErr(err);
     };
+
+    // Replicate directory removal to replica
+    if (!state.no_remote_mkdir and rel.len > 0) {
+        const replica_path = std.fs.path.join(state.allocator, &.{ state.replica_dir, "files", rel }) catch return 0;
+        defer state.allocator.free(replica_path);
+        std.fs.deleteDirAbsolute(replica_path) catch {};
+    }
 
     return 0;
 }
@@ -1869,6 +1914,7 @@ const CliArgs = struct {
     replica: ?[]const u8 = null,
     repl_workers: u32 = 4,
     scrub_time: []const u8 = "01:00",
+    no_remote_mkdir: bool = false,
 };
 
 fn parseArgs(allocator: std.mem.Allocator) !CliArgs {
@@ -1939,6 +1985,8 @@ fn parseArgs(allocator: std.mem.Allocator) !CliArgs {
                 std.debug.print("--scrub-time requires a value (HH:MM)\n", .{});
                 std.process.exit(1);
             };
+        } else if (std.mem.eql(u8, arg, "--no-remote-mkdir")) {
+            result.no_remote_mkdir = true;
         } else {
             std.debug.print("Unknown option: {s}\n", .{arg});
             printUsage();
@@ -1973,6 +2021,10 @@ fn printUsage() void {
         \\  --replica <path>           Replica directory (required)
         \\  --replication-workers <n>  Number of replication workers (default: 4)
         \\  --scrub-time HH:MM        Scrub schedule in 24h format (default: 01:00)
+        \\  --no-remote-mkdir          Skip creating/removing subdirectories on the
+        \\                             replica. Use when the replica is an object store
+        \\                             or filesystem that does not require explicit
+        \\                             directory management.
         \\
     , .{});
 }
@@ -2057,6 +2109,7 @@ fn doMount(allocator: std.mem.Allocator, args: CliArgs) !void {
     log.info("  replica dir: {s}", .{replica_abs});
     log.info("  workers:     {d}", .{args.repl_workers});
     log.info("  scrub time:  {s}", .{args.scrub_time});
+    log.info("  remote mkdir: {s}", .{if (args.no_remote_mkdir) "disabled" else "enabled"});
 
     // Initialize global state
     g_state = try FsState.init(
@@ -2066,6 +2119,7 @@ fn doMount(allocator: std.mem.Allocator, args: CliArgs) !void {
         scrub.hour,
         scrub.minute,
         args.repl_workers,
+        args.no_remote_mkdir,
     );
 
     // Start background workers
@@ -2156,7 +2210,7 @@ const TestHarness = struct {
         defer allocator.free(replica_files);
         try std.fs.makeDirAbsolute(replica_files);
 
-        const state = try FsState.init(allocator, backing, replica, 1, 0, 1);
+        const state = try FsState.init(allocator, backing, replica, 1, 0, 1, false);
         g_state = state;
 
         return .{
@@ -3100,4 +3154,178 @@ test "end-to-end: scrub handles mix of clean, untracked, and corrupt files" {
     const clean = try h.readBackingFile("clean.txt");
     defer h.allocator.free(clean);
     try testing.expectEqualStrings("all good", clean);
+}
+
+// ---------- Remote directory management ----------
+
+test "removeEmptyParentDirs removes empty parents up to stop_at" {
+    var h = try TestHarness.init();
+    defer h.deinit();
+
+    const replica_files = try std.fs.path.join(h.allocator, &.{ h.replica_dir, "files" });
+    defer h.allocator.free(replica_files);
+
+    // Create nested dirs: replica/files/a/b/c
+    const dir_c = try std.fs.path.join(h.allocator, &.{ replica_files, "a", "b", "c" });
+    defer h.allocator.free(dir_c);
+    try ensureParentDir(dir_c);
+    try std.fs.makeDirAbsolute(dir_c);
+
+    // Create a file in c/ so we can delete it and test cleanup
+    const file_path = try std.fs.path.join(h.allocator, &.{ dir_c, "file.txt" });
+    defer h.allocator.free(file_path);
+    const f = try std.fs.createFileAbsolute(file_path, .{});
+    f.close();
+    try std.fs.deleteFileAbsolute(file_path);
+
+    // Now remove empty parents starting from file_path
+    removeEmptyParentDirs(file_path, replica_files);
+
+    // a/b/c, a/b, and a should all be removed (they're empty)
+    const dir_a = try std.fs.path.join(h.allocator, &.{ replica_files, "a" });
+    defer h.allocator.free(dir_a);
+    std.fs.accessAbsolute(dir_a, .{}) catch |err| switch (err) {
+        error.FileNotFound => return, // Expected — dir was cleaned up
+        else => return err,
+    };
+    // If we get here, dir_a still exists — that's a failure
+    return error.DirNotRemoved;
+}
+
+test "removeEmptyParentDirs stops at non-empty directory" {
+    var h = try TestHarness.init();
+    defer h.deinit();
+
+    const replica_files = try std.fs.path.join(h.allocator, &.{ h.replica_dir, "files" });
+    defer h.allocator.free(replica_files);
+
+    // Create: replica/files/a/b/c/file.txt and replica/files/a/sibling.txt
+    const file_path = try std.fs.path.join(h.allocator, &.{ replica_files, "a", "b", "c", "file.txt" });
+    defer h.allocator.free(file_path);
+    try ensureParentDir(file_path);
+    const f1 = try std.fs.createFileAbsolute(file_path, .{});
+    f1.close();
+
+    const sibling = try std.fs.path.join(h.allocator, &.{ replica_files, "a", "sibling.txt" });
+    defer h.allocator.free(sibling);
+    const f2 = try std.fs.createFileAbsolute(sibling, .{});
+    f2.close();
+
+    // Delete file.txt, then clean up
+    try std.fs.deleteFileAbsolute(file_path);
+    removeEmptyParentDirs(file_path, replica_files);
+
+    // a/b/c and a/b should be removed, but a/ should remain (has sibling.txt)
+    const dir_b = try std.fs.path.join(h.allocator, &.{ replica_files, "a", "b" });
+    defer h.allocator.free(dir_b);
+    std.fs.accessAbsolute(dir_b, .{}) catch |err| switch (err) {
+        error.FileNotFound => {
+            // Good — b was removed. Now check a/ still exists.
+            const dir_a = try std.fs.path.join(h.allocator, &.{ replica_files, "a" });
+            defer h.allocator.free(dir_a);
+            try std.fs.accessAbsolute(dir_a, .{});
+            return;
+        },
+        else => return err,
+    };
+    return error.DirNotRemoved;
+}
+
+test "removeEmptyParentDirs does not remove stop_at directory" {
+    var h = try TestHarness.init();
+    defer h.deinit();
+
+    const replica_files = try std.fs.path.join(h.allocator, &.{ h.replica_dir, "files" });
+    defer h.allocator.free(replica_files);
+
+    // Create a file directly inside replica/files/
+    const file_path = try std.fs.path.join(h.allocator, &.{ replica_files, "root-file.txt" });
+    defer h.allocator.free(file_path);
+    const f = try std.fs.createFileAbsolute(file_path, .{});
+    f.close();
+    try std.fs.deleteFileAbsolute(file_path);
+
+    // Clean up — should not remove replica/files/ itself
+    removeEmptyParentDirs(file_path, replica_files);
+
+    try std.fs.accessAbsolute(replica_files, .{});
+}
+
+test "replicateDelete cleans up empty parent dirs on replica" {
+    var h = try TestHarness.init();
+    defer h.deinit();
+
+    // Create a file in a subdirectory
+    try h.createBackingFile("deep/nested/file.txt", "hello");
+    try checksumAndEnqueue(h.state, "deep/nested/file.txt");
+    try replicatePut(h.state, "deep/nested/file.txt");
+
+    // Verify replica has the file and dirs
+    try testing.expect(h.replicaFileExists("deep/nested/file.txt"));
+
+    // Now delete
+    try replicateDelete(h.state, "deep/nested/file.txt");
+
+    // File should be gone
+    try testing.expect(!h.replicaFileExists("deep/nested/file.txt"));
+
+    // Empty parent dirs should also be cleaned up
+    const deep_dir = try std.fs.path.join(h.allocator, &.{ h.replica_dir, "files", "deep" });
+    defer h.allocator.free(deep_dir);
+    std.fs.accessAbsolute(deep_dir, .{}) catch |err| switch (err) {
+        error.FileNotFound => return, // Expected
+        else => return err,
+    };
+    return error.DirNotRemoved;
+}
+
+test "replicateDelete skips dir cleanup when no_remote_mkdir is set" {
+    const allocator = testing.allocator;
+
+    // Create a harness with no_remote_mkdir = true
+    const tmp_template = "/tmp/helmetfs-test-XXXXXX";
+    var tmp_buf: [tmp_template.len:0]u8 = tmp_template.*;
+    const result = c.mkdtemp(&tmp_buf);
+    if (result == null) return error.TmpDirFailed;
+    const tmp_dir = try allocator.dupe(u8, std.mem.span(result));
+    defer allocator.free(tmp_dir);
+
+    const backing = try std.fs.path.join(allocator, &.{ tmp_dir, "backing" });
+    defer allocator.free(backing);
+    const replica = try std.fs.path.join(allocator, &.{ tmp_dir, "replica" });
+    defer allocator.free(replica);
+
+    try std.fs.makeDirAbsolute(backing);
+    try std.fs.makeDirAbsolute(replica);
+    const replica_files = try std.fs.path.join(allocator, &.{ replica, "files" });
+    defer allocator.free(replica_files);
+    try std.fs.makeDirAbsolute(replica_files);
+
+    const state = try FsState.init(allocator, backing, replica, 1, 0, 1, true);
+    defer state.deinit();
+    const prev = g_state;
+    g_state = state;
+    defer g_state = prev;
+
+    // Create and replicate a file in a subdirectory
+    const backing_file = try std.fs.path.join(allocator, &.{ backing, "sub", "file.txt" });
+    defer allocator.free(backing_file);
+    try ensureParentDir(backing_file);
+    const bf = try std.fs.createFileAbsolute(backing_file, .{});
+    defer bf.close();
+    try bf.writeAll("data");
+
+    try checksumAndEnqueue(state, "sub/file.txt");
+    try replicatePut(state, "sub/file.txt");
+
+    // Delete the file
+    try replicateDelete(state, "sub/file.txt");
+
+    // With no_remote_mkdir, the empty "sub" dir should still exist on the replica
+    const replica_sub = try std.fs.path.join(allocator, &.{ replica_files, "sub" });
+    defer allocator.free(replica_sub);
+    try std.fs.accessAbsolute(replica_sub, .{});
+
+    // Cleanup
+    std.fs.deleteTreeAbsolute(tmp_dir) catch {};
 }
