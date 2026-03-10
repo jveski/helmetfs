@@ -1124,6 +1124,16 @@ fn scrubFile(state: *FsState, rel_path: []const u8, corruptions: *u64, repairs_c
         return;
     }
 
+    // Also skip if the file is dirty — a write completed but hasn't been
+    // checksummed yet.  The window between decWriteRef and checksumAndEnqueue
+    // in fuse_release means write_refcount can be 0 while the checksum is
+    // stale.  Repairing here would silently roll back a legitimate write.
+    // (See TLA+ ScrubRepair precondition: dirty_gen = clean_gen.)
+    if (state.path_state.isDirty(rel_path)) {
+        log.info("scrub: skipping repair of {s} — file is dirty (pending checksum)", .{rel_path});
+        return;
+    }
+
     log.info("scrub: repairing {s} from replica", .{rel_path});
 
     copyFileWithSync(replica_path, backing_path) catch |err| {
@@ -1693,9 +1703,17 @@ fn fuse_truncate(path: [*c]const u8, size: c.off_t, fi: ?*c.struct_fuse_file_inf
         };
     }
 
-    // Mark dirty
+    // Mark dirty and trigger checksum + replication enqueue.
+    // For the non-fi path (truncate without an open fd), there is no
+    // subsequent fuse_release to drive checksumAndEnqueue, so we must do
+    // it here.  checksumAndEnqueue (non-forced) checks hasWriteRef, so
+    // if another writer currently has the file open, the dirty flag stays
+    // set and that writer's release will handle replication.
     if (rel.len > 0) {
         state.path_state.setDirty(rel);
+        checksumAndEnqueue(state, rel) catch |err| {
+            log.err("truncate checksum failed for {s}: {}", .{ rel, err });
+        };
     }
 
     return 0;
