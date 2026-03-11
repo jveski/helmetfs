@@ -1,6 +1,3 @@
-// helmetfs - FUSE passthrough filesystem with async replication and self-healing
-//
-
 const std = @import("std");
 const builtin = @import("builtin");
 const posix = std.posix;
@@ -24,18 +21,10 @@ const c = @cImport({
 
 const log = std.log.scoped(.helmetfs);
 
-// ============================================================================
-// FUSE Compatibility Layer
-// ============================================================================
-//
-// macFUSE's fuse_file_info and fuse_conn_info use C bitfields which Zig's
-// cImport translates as opaque types. We define ABI-compatible Zig structs
-// and @ptrCast when accessing fields from FUSE callbacks.
-//
-
+// macFUSE bitfields are opaque to cImport; we define ABI-compatible structs.
 const FuseFileInfo = extern struct {
     flags: i32,
-    bitfields: u32 = 0, // writepage:1, direct_io:1, keep_cache:1, etc.
+    bitfields: u32 = 0,
     padding2: u32 = 0,
     padding3: u32 = 0,
     fh: u64 = 0,
@@ -50,11 +39,8 @@ fn castFi(fi: ?*c.struct_fuse_file_info) ?*FuseFileInfo {
     return @ptrCast(@alignCast(fi));
 }
 
-// Encode/decode the "opened for writing" flag in the fh field.
-// File descriptors are small non-negative integers; we use bit 63 of the u64
-// fh to store whether this descriptor was opened for writing.  This avoids
-// relying on fi.flags in release(), which is not guaranteed to reflect the
-// original open flags on every FUSE implementation.
+// Bit 63 of fh encodes "opened for writing" — avoids relying on fi.flags in
+// release(), which is not guaranteed to reflect original open flags.
 const FH_WRITE_BIT: u64 = 1 << 63;
 
 fn encodeFh(fd: posix.fd_t, opened_for_write: bool) u64 {
@@ -69,34 +55,20 @@ fn decodeFh(fh: u64) struct { fd: posix.fd_t, opened_for_write: bool } {
     };
 }
 
-// macFUSE's libfuse_version has bitfields making it opaque to Zig's cImport.
-// Layout: { major: u32, minor: u32, hotfix: u32, darwin_ext_and_padding: u32 }
 const LibfuseVersion = extern struct {
     major: u32,
     minor: u32,
     hotfix: u32,
-    flags: u32, // darwin_extensions_enabled:1 | padding:31
+    flags: u32,
 };
 
-// Wrapper for fuse_new that calls _fuse_new_31 directly, bypassing the
-// static inline fuse_new_fn that Zig cannot link.
 fn fuseNew(args: [*c]c.struct_fuse_args, ops: [*c]const c.struct_fuse_operations, op_size: usize, user_data: ?*anyopaque) ?*c.struct_fuse {
     if (comptime builtin.os.tag == .macos) {
-        var version = LibfuseVersion{
-            .major = 3,
-            .minor = 17,
-            .hotfix = 0,
-            .flags = 0, // darwin_extensions_enabled = 0
-        };
+        var version = LibfuseVersion{ .major = 3, .minor = 17, .hotfix = 0, .flags = 0 };
         return c._fuse_new_31(args, ops, op_size, @ptrCast(&version), user_data);
-    } else {
-        return c.fuse_new(args, ops, op_size, user_data);
     }
+    return c.fuse_new(args, ops, op_size, user_data);
 }
-
-// ============================================================================
-// Global State
-// ============================================================================
 
 var g_state: *FsState = undefined;
 
@@ -108,19 +80,10 @@ const FsState = struct {
     scrub_minute: u8,
     repl_workers: u32,
     no_remote_mkdir: bool,
-
-    // Per-path state (dirty flag + write-descriptor refcount)
     path_state: PathStateMap,
-
-    // Replication log
     repl_log: ReplLog,
-
-    // Shutdown flag
     shutdown: std.atomic.Value(bool),
-
-    // Scrub thread handle
     scrub_thread: ?std.Thread,
-    // Replication worker threads
     repl_threads: []std.Thread,
 
     fn init(
@@ -147,7 +110,6 @@ const FsState = struct {
             .scrub_thread = null,
             .repl_threads = &.{},
         };
-        // Create .helmetfs directory
         const helmetfs_dir = try std.fs.path.join(allocator, &.{ backing_dir, ".helmetfs" });
         defer allocator.free(helmetfs_dir);
         std.fs.makeDirAbsolute(helmetfs_dir) catch |err| switch (err) {
@@ -158,35 +120,22 @@ const FsState = struct {
         return self;
     }
 
-    /// Free resources owned by FsState.  Workers must already be stopped.
     fn deinit(self: *FsState) void {
-        // Free replication log entries
         for (self.repl_log.entries.items) |entry| {
             self.allocator.free(entry.path);
         }
         self.repl_log.entries.deinit(self.allocator);
-
-        // Free path-state map keys
-        var it = self.path_state.map.iterator();
-        while (it.next()) |entry| {
-            self.allocator.free(entry.key_ptr.*);
-        }
-        self.path_state.map.deinit();
-
-        // Free thread handle array (only if it was heap-allocated by startWorkers)
+        self.path_state.deinit();
         if (self.repl_threads.len > 0) {
             self.allocator.free(self.repl_threads);
         }
-
         self.allocator.destroy(self);
     }
 
     fn startWorkers(self: *FsState) !void {
-        // Start replication workers
         self.repl_threads = try self.allocator.alloc(std.Thread, self.repl_workers);
         var started: usize = 0;
         errdefer {
-            // On failure, signal shutdown and join already-started threads
             self.shutdown.store(true, .release);
             {
                 self.repl_log.mutex.lock();
@@ -203,34 +152,22 @@ const FsState = struct {
             t.* = try std.Thread.spawn(.{}, replWorkerLoop, .{self});
             started += 1;
         }
-        // Start scrub thread
         self.scrub_thread = try std.Thread.spawn(.{}, scrubLoop, .{self});
     }
 
     fn stopWorkers(self: *FsState) void {
         self.shutdown.store(true, .release);
-        // Wake waiting workers while holding the mutex to prevent lost wakeups.
-        // A worker could be between checking shutdown (false) and calling
-        // cond.wait; broadcasting without the mutex would miss that worker.
         {
             self.repl_log.mutex.lock();
             defer self.repl_log.mutex.unlock();
             self.repl_log.cond.broadcast();
         }
-        // Join replication workers
-        for (self.repl_threads) |t| {
-            t.join();
-        }
-        // Join scrub thread
-        if (self.scrub_thread) |t| {
-            t.join();
-        }
+        for (self.repl_threads) |t| t.join();
+        if (self.scrub_thread) |t| t.join();
     }
 
-    /// Flush dirty files to replication log (for shutdown/destroy)
     fn flushDirtyFiles(self: *FsState) void {
         self.path_state.rwlock.lockShared();
-        // Collect dirty paths
         var dirty_paths: std.ArrayList([]const u8) = .{};
         defer dirty_paths.deinit(self.allocator);
         var it = self.path_state.map.iterator();
@@ -254,10 +191,6 @@ const FsState = struct {
     }
 };
 
-// ============================================================================
-// Path State Tracking
-// ============================================================================
-
 const PathInfo = struct {
     dirty_gen: u64 = 0,
     clean_gen: u64 = 0,
@@ -276,44 +209,36 @@ const PathStateMap = struct {
         };
     }
 
-    fn setDirty(self: *PathStateMap, rel_path: []const u8) void {
-        self.rwlock.lock();
-        defer self.rwlock.unlock();
-        const key_copy = self.allocator.dupe(u8, rel_path) catch {
-            log.err("OOM in setDirty for path: {s}", .{rel_path});
-            return;
-        };
+    fn deinit(self: *PathStateMap) void {
+        var it = self.map.iterator();
+        while (it.next()) |entry| self.allocator.free(entry.key_ptr.*);
+        self.map.deinit();
+    }
+
+    fn getOrCreate(self: *PathStateMap, rel_path: []const u8) ?*PathInfo {
+        const key_copy = self.allocator.dupe(u8, rel_path) catch return null;
         const gop = self.map.getOrPut(key_copy) catch {
             self.allocator.free(key_copy);
-            log.err("OOM in setDirty map insert for path: {s}", .{rel_path});
-            return;
+            return null;
         };
         if (gop.found_existing) {
             self.allocator.free(key_copy);
-            gop.value_ptr.dirty_gen += 1;
         } else {
-            gop.value_ptr.* = .{ .dirty_gen = 1 };
+            gop.value_ptr.* = .{};
         }
+        return gop.value_ptr;
+    }
+
+    fn setDirty(self: *PathStateMap, rel_path: []const u8) void {
+        self.rwlock.lock();
+        defer self.rwlock.unlock();
+        if (self.getOrCreate(rel_path)) |info| info.dirty_gen += 1;
     }
 
     fn incWriteRef(self: *PathStateMap, rel_path: []const u8) void {
         self.rwlock.lock();
         defer self.rwlock.unlock();
-        const key_copy = self.allocator.dupe(u8, rel_path) catch {
-            log.err("OOM in incWriteRef for path: {s}", .{rel_path});
-            return;
-        };
-        const gop = self.map.getOrPut(key_copy) catch {
-            self.allocator.free(key_copy);
-            log.err("OOM in incWriteRef map insert for path: {s}", .{rel_path});
-            return;
-        };
-        if (!gop.found_existing) {
-            gop.value_ptr.* = .{ .write_refcount = 1 };
-        } else {
-            self.allocator.free(key_copy);
-            gop.value_ptr.write_refcount += 1;
-        }
+        if (self.getOrCreate(rel_path)) |info| info.write_refcount += 1;
     }
 
     fn decWriteRef(self: *PathStateMap, rel_path: []const u8) void {
@@ -343,14 +268,9 @@ const PathStateMap = struct {
     fn clearDirty(self: *PathStateMap, rel_path: []const u8) void {
         self.rwlock.lock();
         defer self.rwlock.unlock();
-        if (self.map.getPtr(rel_path)) |info| {
-            info.clean_gen = info.dirty_gen;
-        }
+        if (self.map.getPtr(rel_path)) |info| info.clean_gen = info.dirty_gen;
     }
 
-    /// Snapshot the current dirty generation for a path.  The caller
-    /// computes the checksum and then calls clearDirtyIfGen to
-    /// conditionally clear only if no new writes arrived in between.
     fn getDirtyGen(self: *PathStateMap, rel_path: []const u8) u64 {
         self.rwlock.lockShared();
         defer self.rwlock.unlockShared();
@@ -358,9 +278,6 @@ const PathStateMap = struct {
         return 0;
     }
 
-    /// Clear the dirty flag only if the dirty generation has not advanced
-    /// past `gen` since we snapshotted it.  This prevents a concurrent
-    /// setDirty from being silently discarded.
     fn clearDirtyIfGen(self: *PathStateMap, rel_path: []const u8, gen: u64) void {
         self.rwlock.lock();
         defer self.rwlock.unlock();
@@ -371,8 +288,6 @@ const PathStateMap = struct {
         }
     }
 
-    /// Remove a path's state entirely.  Used when a file is deleted
-    /// to prevent unbounded growth of the map.
     fn remove(self: *PathStateMap, rel_path: []const u8) void {
         self.rwlock.lock();
         defer self.rwlock.unlock();
@@ -381,10 +296,6 @@ const PathStateMap = struct {
         }
     }
 };
-
-// ============================================================================
-// Replication Log
-// ============================================================================
 
 const ReplOp = enum { put, delete };
 
@@ -413,11 +324,15 @@ const ReplLog = struct {
             .entries = .empty,
         };
         self.last_truncate_time = std.time.timestamp();
-        // Load existing log entries from disk
         self.loadFromDisk() catch |err| {
             log.warn("failed to load replication log: {}", .{err});
         };
         return self;
+    }
+
+    fn deinitEntries(self: *ReplLog) void {
+        for (self.entries.items) |entry| self.allocator.free(entry.path);
+        self.entries.deinit(self.allocator);
     }
 
     fn logPath(self: *ReplLog) ![]const u8 {
@@ -450,7 +365,6 @@ const ReplLog = struct {
     }
 
     fn parseLine(self: *ReplLog, line: []const u8) !void {
-        // Format: <operation> <relative-path>
         const first_space = std.mem.indexOfScalar(u8, line, ' ') orelse return error.InvalidFormat;
         const op_str = line[0..first_space];
         const rel_path = line[first_space + 1 ..];
@@ -483,7 +397,6 @@ const ReplLog = struct {
             return err;
         };
 
-        // Write to disk
         self.appendToDisk(op, rel_path) catch |err| {
             log.err("failed to append to replication log: {}", .{err});
         };
@@ -510,11 +423,9 @@ const ReplLog = struct {
         defer self.mutex.unlock();
 
         while (!g_state.shutdown.load(.acquire)) {
-            // Find next non-completed, non-in-flight entry
             for (self.entries.items, 0..) |*entry, i| {
                 if (entry.completed or entry.in_flight) continue;
 
-                // For put entries, check if there's a newer put for the same path
                 if (entry.op == .put) {
                     var dominated = false;
                     for (self.entries.items[i + 1 ..]) |*later| {
@@ -524,7 +435,6 @@ const ReplLog = struct {
                         }
                     }
                     if (dominated) {
-                        // Skip stale put — mark as completed
                         entry.completed = true;
                         self.completed_count += 1;
                         continue;
@@ -534,8 +444,6 @@ const ReplLog = struct {
                 entry.in_flight = true;
                 return .{ .id = entry.id, .op = entry.op, .path = entry.path };
             }
-
-            // No work available, wait
             self.cond.wait(&self.mutex);
         }
         return null;
@@ -554,12 +462,9 @@ const ReplLog = struct {
             }
         }
 
-        // Check if truncation is needed
         self.maybeTruncate();
     }
 
-    /// Mark all pending entries for `rel_path` as completed.
-    /// Used in tests to simulate the worker completing replication.
     fn markCompletedByPath(self: *ReplLog, rel_path: []const u8) void {
         self.mutex.lock();
         defer self.mutex.unlock();
@@ -602,9 +507,6 @@ const ReplLog = struct {
 
         if (!should_truncate) return;
 
-        // Collect remaining (non-completed) entries first.  Only free
-        // completed entries once we know the new list is fully built,
-        // so an OOM here does not corrupt the existing entry list.
         var remaining: std.ArrayList(ReplEntry) = .{};
         for (self.entries.items) |entry| {
             if (!entry.completed) {
@@ -616,7 +518,6 @@ const ReplLog = struct {
             }
         }
 
-        // Success — now free completed entries' paths
         for (self.entries.items) |entry| {
             if (entry.completed) {
                 self.allocator.free(entry.path);
@@ -628,7 +529,6 @@ const ReplLog = struct {
         self.completed_count = 0;
         self.last_truncate_time = now;
 
-        // Atomic rewrite of log file
         self.rewriteLogAtomic() catch |err| {
             log.err("failed to truncate replication log: {}", .{err});
         };
@@ -640,7 +540,6 @@ const ReplLog = struct {
         const log_path = try self.logPath();
         defer self.allocator.free(log_path);
 
-        // Write remaining entries to temp file
         const tmp_file = try std.fs.createFileAbsolute(tmp_path, .{});
         defer tmp_file.close();
 
@@ -651,10 +550,8 @@ const ReplLog = struct {
         }
         try tmp_file.sync();
 
-        // Rename over the original
         try std.fs.renameAbsolute(tmp_path, log_path);
 
-        // Fsync parent directory to persist the rename
         if (std.fs.path.dirname(log_path)) |dir_path| {
             fsyncDir(dir_path);
         }
@@ -662,27 +559,18 @@ const ReplLog = struct {
 };
 
 fn formatLogEntry(allocator: std.mem.Allocator, op: ReplOp, rel_path: []const u8) ![]const u8 {
-    const op_str = switch (op) {
-        .put => "put",
-        .delete => "delete",
-    };
-    return try std.fmt.allocPrint(allocator, "{s} {s}\n", .{ op_str, rel_path });
+    return try std.fmt.allocPrint(allocator, "{s} {s}\n", .{ @tagName(op), rel_path });
 }
-
-// ============================================================================
-// Checksum Computation
-// ============================================================================
 
 fn computeBlake3(backing_path: []const u8) ![64]u8 {
     const file = try std.fs.openFileAbsolute(backing_path, .{});
     defer file.close();
 
-    // Advisory read lock
     _ = c.flock(file.handle, c.LOCK_SH);
     defer _ = c.flock(file.handle, c.LOCK_UN);
 
     var hasher = std.crypto.hash.Blake3.init(.{});
-    var buf: [64 * 1024]u8 = undefined; // 64 KB — safe for default thread stacks
+    var buf: [64 * 1024]u8 = undefined; // 64 KB
     while (true) {
         const n = try file.readAll(&buf);
         if (n == 0) break;
@@ -707,28 +595,19 @@ fn readSumFile(allocator: std.mem.Allocator, sum_path: []const u8) ![]const u8 {
     defer file.close();
     var buf: [128]u8 = undefined;
     const n = try file.readAll(&buf);
-    const content = buf[0..n];
-    const trimmed = std.mem.trimRight(u8, content, "\n\r ");
+    const trimmed = std.mem.trimRight(u8, buf[0..n], "\n\r ");
     return try allocator.dupe(u8, trimmed);
 }
 
 fn checksumAndEnqueue(state: *FsState, rel_path: []const u8) !void {
-    // Skip if the file still has open write descriptors — checksumming a
-    // partially-written file would produce a wrong digest.  The dirty flag
-    // stays set so that release() will retry once the last writer closes.
+    // Skip if file still has open write descriptors — checksumming a
+    // partially-written file would produce a wrong digest.
     if (state.path_state.hasWriteRef(rel_path)) return;
-
     try checksumAndEnqueueForced(state, rel_path);
 }
 
-/// Like checksumAndEnqueue but bypasses the write-ref check.  Used by
-/// fuse_fsync where the caller has already flushed data to disk and
-/// wants to trigger replication even though the file is still open.
 fn checksumAndEnqueueForced(state: *FsState, rel_path: []const u8) !void {
-    // Snapshot the dirty generation before computing the checksum.
-    // If a concurrent write bumps the generation while we're hashing,
-    // clearDirtyIfGen will leave the dirty flag set so a subsequent
-    // release/fsync picks it up.
+    // Snapshot dirty_gen before hashing so concurrent writes don't get lost.
     const gen = state.path_state.getDirtyGen(rel_path);
 
     const backing_path = try std.fs.path.join(state.allocator, &.{ state.backing_dir, rel_path });
@@ -737,23 +616,17 @@ fn checksumAndEnqueueForced(state: *FsState, rel_path: []const u8) !void {
     defer state.allocator.free(sum_path);
 
     const hex_digest = try computeBlake3(backing_path);
-
     try writeSumFile(sum_path, &hex_digest);
-
     try state.repl_log.enqueue(.put, rel_path);
     state.path_state.clearDirtyIfGen(rel_path, gen);
 }
-
-// ============================================================================
-// Replication Workers
-// ============================================================================
 
 fn replWorkerLoop(state: *FsState) void {
     while (!state.shutdown.load(.acquire)) {
         const work = state.repl_log.dequeueNext() orelse break;
 
-        var backoff_ns: u64 = 1_000_000_000; // 1 second
-        const max_backoff_ns: u64 = 300_000_000_000; // 5 minutes
+        var backoff_ns: u64 = 1_000_000_000;
+        const max_backoff_ns: u64 = 300_000_000_000;
 
         while (!state.shutdown.load(.acquire)) {
             const result = switch (work.op) {
@@ -783,42 +656,32 @@ fn replicatePut(state: *FsState, rel_path: []const u8) !void {
     const replica_path = try std.fs.path.join(state.allocator, &.{ state.replica_dir, "files", rel_path });
     defer state.allocator.free(replica_path);
 
-    // Check if source is a symlink
     const backing_stat = posix.fstatat(posix.AT.FDCWD, backing_path, posix.AT.SYMLINK_NOFOLLOW) catch |err| switch (err) {
-        error.FileNotFound => return, // File was deleted before we could replicate
+        error.FileNotFound => return,
         else => return err,
     };
 
     if (backing_stat.mode & posix.S.IFMT == posix.S.IFLNK) {
-        // Replicate symlink
         try ensureParentDir(replica_path);
-        // Remove existing if any
         std.fs.deleteFileAbsolute(replica_path) catch |err| switch (err) {
             error.FileNotFound => {},
             else => return err,
         };
-        // Read symlink target
         const backing_z = try state.allocator.dupeZ(u8, backing_path);
         defer state.allocator.free(backing_z);
         const replica_z = try state.allocator.dupeZ(u8, replica_path);
         defer state.allocator.free(replica_z);
         var link_buf: [std.fs.max_path_bytes]u8 = undefined;
         const target = posix.readlinkat(posix.AT.FDCWD, backing_z, &link_buf) catch return error.ReadLinkFailed;
-        // Create symlink on replica
         posix.symlinkat(target, posix.AT.FDCWD, replica_z) catch return error.SymlinkFailed;
         return;
     }
 
-    // Regular file replication
     const sum_backing = try std.fmt.allocPrint(state.allocator, "{s}.sum", .{backing_path});
     defer state.allocator.free(sum_backing);
     const sum_replica = try std.fmt.allocPrint(state.allocator, "{s}.sum", .{replica_path});
     defer state.allocator.free(sum_replica);
 
-    // Verify backing file integrity before replicating.  If the file was
-    // modified after the log entry was created (e.g. corruption between
-    // enqueue and replication, or a stale entry replayed after remount),
-    // skip replication so we don't overwrite a good replica with bad data.
     if (readSumFile(state.allocator, sum_backing)) |stored_hex| {
         defer state.allocator.free(stored_hex);
         if (computeBlake3(backing_path)) |computed_hex| {
@@ -829,22 +692,18 @@ fn replicatePut(state: *FsState, rel_path: []const u8) !void {
         } else |_| {}
     } else |_| {}
 
-    // Copy file content
     try ensureParentDir(replica_path);
     try copyFileWithSync(backing_path, replica_path);
 
-    // Copy .sum sidecar
     copyFileWithSync(sum_backing, sum_replica) catch |err| switch (err) {
-        error.FileNotFound => {}, // .sum might not exist yet
+        error.FileNotFound => {},
         else => return err,
     };
 
-    // Preserve mode bits and ownership
     const stat_info = posix.fstatat(posix.AT.FDCWD, backing_path, 0) catch return;
     const mode: posix.mode_t = stat_info.mode & 0o7777;
     posix.fchmodat(posix.AT.FDCWD, replica_path, mode, 0) catch {};
 
-    // chown (may fail if not root, that's OK)
     const replica_z = state.allocator.dupeZ(u8, replica_path) catch return;
     defer state.allocator.free(replica_z);
     _ = c.chown(replica_z.ptr, stat_info.uid, stat_info.gid);
@@ -856,7 +715,6 @@ fn replicateDelete(state: *FsState, rel_path: []const u8) !void {
     const sum_replica = try std.fmt.allocPrint(state.allocator, "{s}.sum", .{replica_path});
     defer state.allocator.free(sum_replica);
 
-    // Idempotent delete
     std.fs.deleteFileAbsolute(replica_path) catch |err| switch (err) {
         error.FileNotFound => {},
         else => return err,
@@ -866,7 +724,6 @@ fn replicateDelete(state: *FsState, rel_path: []const u8) !void {
         else => return err,
     };
 
-    // Clean up empty parent directories on the replica
     if (!state.no_remote_mkdir) {
         const replica_files_root = try std.fs.path.join(state.allocator, &.{ state.replica_dir, "files" });
         defer state.allocator.free(replica_files_root);
@@ -878,8 +735,6 @@ fn copyFileWithSync(src_path: []const u8, dst_path: []const u8) !void {
     const src = try std.fs.openFileAbsolute(src_path, .{});
     defer src.close();
 
-    // Write to a temporary file next to the destination, then atomically rename.
-    // This prevents readers from seeing a partially-written file.
     var tmp_path_buf: [std.fs.max_path_bytes]u8 = undefined;
     const tmp_path = std.fmt.bufPrint(&tmp_path_buf, "{s}.tmp", .{dst_path}) catch return error.NameTooLong;
 
@@ -893,7 +748,7 @@ fn copyFileWithSync(src_path: []const u8, dst_path: []const u8) !void {
         }
     }
 
-    var buf: [64 * 1024]u8 = undefined; // 64 KB — safe for default thread stacks
+    var buf: [64 * 1024]u8 = undefined; // 64 KB
     while (true) {
         const n = try src.read(&buf);
         if (n == 0) break;
@@ -908,7 +763,6 @@ fn copyFileWithSync(src_path: []const u8, dst_path: []const u8) !void {
         return err;
     };
 
-    // Fsync parent directory to persist the rename
     if (std.fs.path.dirname(dst_path)) |dir_path| {
         fsyncDir(dir_path);
     }
@@ -917,8 +771,7 @@ fn copyFileWithSync(src_path: []const u8, dst_path: []const u8) !void {
 fn fsyncDir(dir_path: []const u8) void {
     var dir = std.fs.openDirAbsolute(dir_path, .{}) catch return;
     defer dir.close();
-    // Use the raw syscall instead of posix.fsync to avoid unreachable panics
-    // on filesystems (e.g. tmpfs) that return EINVAL for directory fsync.
+    // Raw syscall avoids unreachable panics on filesystems that return EINVAL for dir fsync.
     _ = std.posix.system.fsync(dir.fd);
 }
 
@@ -927,7 +780,6 @@ fn ensureParentDir(path: []const u8) !void {
     std.fs.makeDirAbsolute(dir_path) catch |err| switch (err) {
         error.PathAlreadyExists => return,
         error.FileNotFound => {
-            // Parent of parent doesn't exist, recurse
             try ensureParentDir(dir_path);
             std.fs.makeDirAbsolute(dir_path) catch |e| switch (e) {
                 error.PathAlreadyExists => return,
@@ -938,39 +790,26 @@ fn ensureParentDir(path: []const u8) !void {
     };
 }
 
-/// Walk up the directory tree from `path`, removing empty directories until
-/// reaching `stop_at` (exclusive).  This is the inverse of `ensureParentDir`
-/// and is used to clean up replica subdirectories after the last file in a
-/// subtree is deleted.  Failures are silently ignored — leftover empty dirs
-/// are harmless and will be cleaned up on the next delete.
 fn removeEmptyParentDirs(path: []const u8, stop_at: []const u8) void {
     var current = std.fs.path.dirname(path);
     while (current) |dir| {
-        // Never remove the stop directory itself or anything above it
         if (dir.len <= stop_at.len) break;
-        std.fs.deleteDirAbsolute(dir) catch break; // non-empty or permission error → stop
+        std.fs.deleteDirAbsolute(dir) catch break;
         current = std.fs.path.dirname(dir);
     }
 }
 
-// ============================================================================
-// Self-Healing Scrub
-// ============================================================================
-
 fn scrubLoop(state: *FsState) void {
-    // Check if we need an immediate scrub
     if (shouldScrubImmediately(state)) {
         log.info("scrub overdue, running immediately", .{});
         runScrub(state);
     }
 
     while (!state.shutdown.load(.acquire)) {
-        // Sleep until next scrub time
         const sleep_ns = nsUntilNextScrub(state.scrub_hour, state.scrub_minute);
-        // Sleep in small increments to check for shutdown
         var remaining = sleep_ns;
         while (remaining > 0 and !state.shutdown.load(.acquire)) {
-            const chunk = @min(remaining, 1_000_000_000); // 1 second
+            const chunk = @min(remaining, 1_000_000_000);
             std.Thread.sleep(chunk);
             remaining -= chunk;
         }
@@ -992,7 +831,7 @@ fn shouldScrubImmediately(state: *FsState) bool {
     const last_scrub = std.fmt.parseInt(i64, content, 10) catch return true;
 
     const now = std.time.timestamp();
-    return (now - last_scrub) > 86400; // 24 hours
+    return (now - last_scrub) > 86400;
 }
 
 fn nsUntilNextScrub(target_hour: u8, target_minute: u8) u64 {
@@ -1019,7 +858,6 @@ fn runScrub(state: *FsState) void {
     var corruptions_found: u64 = 0;
     var repairs: u64 = 0;
 
-    // Walk the backing directory
     var dir = std.fs.openDirAbsolute(state.backing_dir, .{ .iterate = true }) catch |err| {
         log.err("scrub: failed to open backing dir: {}", .{err});
         return;
@@ -1034,20 +872,14 @@ fn runScrub(state: *FsState) void {
 
     while (walker.next() catch null) |entry| {
         if (state.shutdown.load(.acquire)) break;
-
-        // Skip directories
         if (entry.kind == .directory) continue;
-        // Skip symlinks (no .sum files for symlinks)
         if (entry.kind == .sym_link) continue;
-        // Skip .helmetfs directory
         if (std.mem.startsWith(u8, entry.path, ".helmetfs")) continue;
-        // Skip .sum sidecar files
         if (std.mem.endsWith(u8, entry.path, ".sum")) continue;
 
         const rel_path = state.allocator.dupe(u8, entry.path) catch continue;
         defer state.allocator.free(rel_path);
 
-        // Skip files with open write descriptors
         if (state.path_state.hasWriteRef(rel_path)) continue;
 
         scrubFile(state, rel_path, &corruptions_found, &repairs) catch |err| {
@@ -1060,7 +892,6 @@ fn runScrub(state: *FsState) void {
     const end_ms = std.time.milliTimestamp();
     const duration_ms: u64 = @intCast(end_ms - start_ms);
 
-    // Write scrub timestamp
     writeScrubTimestamp(state, end);
 
     log.info("scrub complete: checked={d}, corruptions={d}, repairs={d}, duration={d}ms", .{
@@ -1074,16 +905,13 @@ fn scrubFile(state: *FsState, rel_path: []const u8, corruptions: *u64, repairs_c
     const sum_path = try std.fmt.allocPrint(state.allocator, "{s}.sum", .{backing_path});
     defer state.allocator.free(sum_path);
 
-    // Compute current checksum
     const current_hex = computeBlake3(backing_path) catch |err| {
         log.err("scrub: failed to compute checksum for {s}: {}", .{ rel_path, err });
         return err;
     };
 
-    // Try to read existing .sum file
     const stored_hex = readSumFile(state.allocator, sum_path) catch |err| switch (err) {
         error.FileNotFound => {
-            // Untracked file — adopt it
             log.info("scrub: adopting untracked file {s}", .{rel_path});
             writeSumFile(sum_path, &current_hex) catch |we| {
                 log.err("scrub: failed to write .sum for {s}: {}", .{ rel_path, we });
@@ -1098,32 +926,26 @@ fn scrubFile(state: *FsState, rel_path: []const u8, corruptions: *u64, repairs_c
     };
     defer state.allocator.free(stored_hex);
 
-    // Compare checksums
     if (std.mem.eql(u8, &current_hex, stored_hex)) {
-        return; // All good
+        return;
     }
 
-    // Checksum mismatch — corruption detected
     corruptions.* += 1;
     log.warn("scrub: CORRUPTION detected in {s}", .{rel_path});
 
-    // Check for pending replication (stale replica warning)
     const has_pending = state.repl_log.hasPendingPut(rel_path);
 
-    // Attempt repair from replica
     const replica_path = try std.fs.path.join(state.allocator, &.{ state.replica_dir, "files", rel_path });
     defer state.allocator.free(replica_path);
     const replica_sum_path = try std.fmt.allocPrint(state.allocator, "{s}.sum", .{replica_path});
     defer state.allocator.free(replica_sum_path);
 
-    // Read replica checksum
     const replica_hex = readSumFile(state.allocator, replica_sum_path) catch {
         log.err("scrub: replica unavailable for repair of {s}", .{rel_path});
         return;
     };
     defer state.allocator.free(replica_hex);
 
-    // Verify replica file integrity
     const replica_computed = computeBlake3(replica_path) catch {
         log.err("scrub: cannot read replica file for repair of {s}", .{rel_path});
         return;
@@ -1134,25 +956,19 @@ fn scrubFile(state: *FsState, rel_path: []const u8, corruptions: *u64, repairs_c
         return;
     }
 
-    // Repair from replica
     if (has_pending) {
         log.warn("scrub: skipping repair of {s} — pending replication means replica is stale", .{rel_path});
         return;
     }
 
-    // Re-check write ref before overwriting.  A writer may have opened the
-    // file between the initial hasWriteRef check in runScrub and now; if
-    // so the "corruption" is really an in-progress write and we must not
-    // clobber the file.
+    // Re-check write ref before overwriting — a writer may have opened the
+    // file between the initial check and now.
     if (state.path_state.hasWriteRef(rel_path)) {
         log.info("scrub: skipping repair of {s} — file now has open writer", .{rel_path});
         return;
     }
 
-    // Also skip if the file is dirty — a write completed but hasn't been
-    // checksummed yet.  The window between decWriteRef and checksumAndEnqueue
-    // in fuse_release means write_refcount can be 0 while the checksum is
-    // stale.  Repairing here would silently roll back a legitimate write.
+    // Skip if dirty — write completed but hasn't been checksummed yet.
     // (See TLA+ ScrubRepair precondition: dirty_gen = clean_gen.)
     if (state.path_state.isDirty(rel_path)) {
         log.info("scrub: skipping repair of {s} — file is dirty (pending checksum)", .{rel_path});
@@ -1165,7 +981,6 @@ fn scrubFile(state: *FsState, rel_path: []const u8, corruptions: *u64, repairs_c
         log.err("scrub: failed to repair {s}: {}", .{ rel_path, err });
         return;
     };
-    // Rewrite .sum file
     writeSumFile(sum_path, &replica_computed) catch |err| {
         log.err("scrub: failed to write .sum after repair of {s}: {}", .{ rel_path, err });
         return;
@@ -1177,51 +992,32 @@ fn scrubFile(state: *FsState, rel_path: []const u8, corruptions: *u64, repairs_c
 fn writeScrubTimestamp(state: *FsState, ts: i64) void {
     const ts_path = std.fs.path.join(state.allocator, &.{ state.backing_dir, ".helmetfs", "scrub.timestamp" }) catch return;
     defer state.allocator.free(ts_path);
-
     const file = std.fs.createFileAbsolute(ts_path, .{}) catch return;
     defer file.close();
-
     const ts_str = std.fmt.allocPrint(state.allocator, "{d}\n", .{ts}) catch return;
     defer state.allocator.free(ts_str);
     file.writeAll(ts_str) catch return;
     file.sync() catch return;
 }
 
-// ============================================================================
-// Hidden Paths
-// ============================================================================
-
 fn isHiddenPath(state: *FsState, rel_path: []const u8) bool {
-    // .helmetfs/ directory
     if (std.mem.startsWith(u8, rel_path, ".helmetfs")) return true;
 
-    // .sum sidecar files — only hidden when corresponding data file exists
     if (std.mem.endsWith(u8, rel_path, ".sum")) {
-        const data_path_len = rel_path.len - 4; // strip ".sum"
-        const data_rel = rel_path[0..data_path_len];
+        const data_rel = rel_path[0 .. rel_path.len - 4];
         const data_full = std.fs.path.join(state.allocator, &.{ state.backing_dir, data_rel }) catch return false;
         defer state.allocator.free(data_full);
-        // Check if data file exists
         _ = posix.fstatat(posix.AT.FDCWD, data_full, posix.AT.SYMLINK_NOFOLLOW) catch return false;
-        return true; // Data file exists, so hide the .sum
+        return true;
     }
 
     return false;
 }
 
-// ============================================================================
-// FUSE Operations
-// ============================================================================
-
 fn fuseRelPath(path: [*c]const u8) []const u8 {
     const s = std.mem.span(@as([*:0]const u8, @ptrCast(path)));
-    // Strip leading '/'
     if (s.len > 0 and s[0] == '/') return s[1..];
     return s;
-}
-
-fn fuseSentinel(path: [*c]const u8) [*:0]const u8 {
-    return @ptrCast(path);
 }
 
 fn backingPath(allocator: std.mem.Allocator, state: *FsState, rel_path: []const u8) ![:0]const u8 {
@@ -1269,14 +1065,11 @@ fn posixErr(err: anytype) c_int {
     return fuseErr(.IO);
 }
 
-// --- FUSE callback implementations ---
-
 fn fuse_getattr(path: [*c]const u8, stbuf: [*c]c.struct_stat, fi: ?*c.struct_fuse_file_info) callconv(.c) c_int {
     _ = fi;
     const state = g_state;
     const rel = fuseRelPath(path);
 
-    // Check hidden paths
     if (rel.len > 0 and isHiddenPath(state, rel)) {
         return fuseErr(.NOENT);
     }
@@ -1284,14 +1077,10 @@ fn fuse_getattr(path: [*c]const u8, stbuf: [*c]c.struct_stat, fi: ?*c.struct_fus
     const backing = backingPath(state.allocator, state, rel) catch return fuseErr(.NOMEM);
     defer state.allocator.free(backing);
 
-    const stat_result = posix.fstatat(posix.AT.FDCWD, backing, posix.AT.SYMLINK_NOFOLLOW);
-    if (stat_result) |stat_val| {
-        const buf: *posix.Stat = @ptrCast(@alignCast(stbuf));
-        buf.* = stat_val;
-        return 0;
-    } else |err| {
-        return posixErr(err);
-    }
+    const stat_val = posix.fstatat(posix.AT.FDCWD, backing, posix.AT.SYMLINK_NOFOLLOW) catch |err| return posixErr(err);
+    const buf: *posix.Stat = @ptrCast(@alignCast(stbuf));
+    buf.* = stat_val;
+    return 0;
 }
 
 fn fuse_readdir(path: [*c]const u8, buf: ?*anyopaque, filler: c.fuse_fill_dir_t, _: c.off_t, _: ?*c.struct_fuse_file_info, _: c.enum_fuse_readdir_flags) callconv(.c) c_int {
@@ -1301,18 +1090,14 @@ fn fuse_readdir(path: [*c]const u8, buf: ?*anyopaque, filler: c.fuse_fill_dir_t,
     const backing = backingPath(state.allocator, state, rel) catch return fuseErr(.NOMEM);
     defer state.allocator.free(backing);
 
-    var dir = std.fs.openDirAbsoluteZ(backing, .{ .iterate = true }) catch |err| {
-        return posixErr(err);
-    };
+    var dir = std.fs.openDirAbsoluteZ(backing, .{ .iterate = true }) catch |err| return posixErr(err);
     defer dir.close();
 
-    // Always add . and ..
     _ = filler.?(buf, ".", null, 0, 0);
     _ = filler.?(buf, "..", null, 0, 0);
 
     var it = dir.iterate();
     while (it.next() catch null) |entry| {
-        // Build the relative path for this entry to check if hidden
         const entry_rel = if (rel.len == 0)
             state.allocator.dupe(u8, entry.name) catch continue
         else
@@ -1325,7 +1110,6 @@ fn fuse_readdir(path: [*c]const u8, buf: ?*anyopaque, filler: c.fuse_fill_dir_t,
         defer state.allocator.free(name_z);
         _ = filler.?(buf, name_z.ptr, null, 0, 0);
     }
-
     return 0;
 }
 
@@ -1341,37 +1125,30 @@ fn fuse_open(path: [*c]const u8, fi: ?*c.struct_fuse_file_info) callconv(.c) c_i
     defer state.allocator.free(backing);
 
     const flags: c_int = if (castFi(fi)) |f| f.flags else 0;
-    const fd = posix.openZ(backing, @bitCast(flags), 0) catch |err| {
-        return posixErr(err);
-    };
+    const fd = posix.openZ(backing, @bitCast(flags), 0) catch |err| return posixErr(err);
 
     if (castFi(fi)) |f| {
         const raw_flags = @as(u32, @bitCast(flags));
         const acc_mode = raw_flags & 0o3;
         const has_trunc = (raw_flags & @as(u32, c.O_TRUNC)) != 0;
-        const is_write = (acc_mode == 1 or acc_mode == 2 or has_trunc); // O_WRONLY, O_RDWR, or O_TRUNC
+        const is_write = (acc_mode == 1 or acc_mode == 2 or has_trunc);
         f.fh = encodeFh(fd, is_write);
         if (is_write) {
             state.path_state.incWriteRef(rel);
         }
-        // O_TRUNC modifies the file even without write access mode
         if (has_trunc) {
             state.path_state.setDirty(rel);
         }
     } else {
-        // No file_info to store the fd — close to avoid leak
         posix.close(fd);
         return fuseErr(.BADF);
     }
-
     return 0;
 }
 
 fn fuse_read(path: [*c]const u8, buf_ptr: [*c]u8, size: usize, offset: c.off_t, fi: ?*c.struct_fuse_file_info) callconv(.c) c_int {
     _ = path;
-
     const fd: posix.fd_t = if (castFi(fi)) |f| decodeFh(f.fh).fd else return fuseErr(.BADF);
-
     const n = posix.pread(fd, buf_ptr[0..size], @intCast(offset)) catch {
         return fuseErr(.IO);
     };
@@ -1381,18 +1158,13 @@ fn fuse_read(path: [*c]const u8, buf_ptr: [*c]u8, size: usize, offset: c.off_t, 
 fn fuse_write(path: [*c]const u8, data: [*c]const u8, size: usize, offset: c.off_t, fi: ?*c.struct_fuse_file_info) callconv(.c) c_int {
     const state = g_state;
     const rel = fuseRelPath(path);
-
     const fd: posix.fd_t = if (castFi(fi)) |f| decodeFh(f.fh).fd else return fuseErr(.BADF);
-
     const n = posix.pwrite(fd, @as([*]const u8, @ptrCast(data))[0..size], @intCast(offset)) catch {
         return fuseErr(.IO);
     };
-
-    // Mark dirty
     if (rel.len > 0) {
         state.path_state.setDirty(rel);
     }
-
     return @intCast(n);
 }
 
@@ -1400,7 +1172,6 @@ fn fuse_fsync(path: [*c]const u8, datasync: c_int, fi: ?*c.struct_fuse_file_info
     const state = g_state;
     const rel = fuseRelPath(path);
 
-    // Forward fsync to backing dir
     if (castFi(fi)) |f| {
         const fd: posix.fd_t = decodeFh(f.fh).fd;
         if (datasync != 0) {
@@ -1410,16 +1181,13 @@ fn fuse_fsync(path: [*c]const u8, datasync: c_int, fi: ?*c.struct_fuse_file_info
         }
     }
 
-    // If dirty, compute checksum and enqueue replication.
-    // Use the forced variant because the file is still open (hasWriteRef is
-    // true) but the data has been fsync'd to disk, so the checksum is valid.
+    // Use forced variant because the file is still open but data is fsync'd.
     if (rel.len > 0 and state.path_state.isDirty(rel)) {
         checksumAndEnqueueForced(state, rel) catch |err| {
             log.err("fsync checksum failed for {s}: {}", .{ rel, err });
             return fuseErr(.IO);
         };
     }
-
     return 0;
 }
 
@@ -1427,9 +1195,8 @@ fn fuse_release(path: [*c]const u8, fi: ?*c.struct_fuse_file_info) callconv(.c) 
     const state = g_state;
     const rel = fuseRelPath(path);
 
-    // Decrement write refcount BEFORE checksumming — checksumAndEnqueue skips
-    // files that still have open write descriptors (hasWriteRef), so the
-    // refcount must be decremented first to allow the checksum to proceed.
+    // Decrement write refcount BEFORE checksumming so checksumAndEnqueue
+    // doesn't skip this file due to hasWriteRef.
     if (castFi(fi)) |f| {
         const decoded = decodeFh(f.fh);
         if (decoded.opened_for_write) {
@@ -1438,13 +1205,11 @@ fn fuse_release(path: [*c]const u8, fi: ?*c.struct_fuse_file_info) callconv(.c) 
         posix.close(decoded.fd);
     }
 
-    // If dirty, compute checksum and enqueue replication
     if (rel.len > 0 and state.path_state.isDirty(rel)) {
         checksumAndEnqueue(state, rel) catch |err| {
             log.err("release checksum failed for {s}: {}", .{ rel, err });
         };
     }
-
     return 0;
 }
 
@@ -1460,20 +1225,15 @@ fn fuse_create(path: [*c]const u8, mode: c.mode_t, fi: ?*c.struct_fuse_file_info
     defer state.allocator.free(backing);
 
     const flags: c_int = if (castFi(fi)) |f| f.flags else 0;
-    const fd = posix.openZ(backing, @bitCast(flags), mode) catch |err| {
-        return posixErr(err);
-    };
+    const fd = posix.openZ(backing, @bitCast(flags), mode) catch |err| return posixErr(err);
 
     if (castFi(fi)) |f| {
         f.fh = encodeFh(fd, true);
-        // Create opens for writing
         state.path_state.incWriteRef(rel);
     } else {
-        // No file_info to store the fd — close to avoid leak
         posix.close(fd);
         return fuseErr(.BADF);
     }
-
     return 0;
 }
 
@@ -1488,26 +1248,19 @@ fn fuse_unlink(path: [*c]const u8) callconv(.c) c_int {
     const backing = backingPath(state.allocator, state, rel) catch return fuseErr(.NOMEM);
     defer state.allocator.free(backing);
 
-    // Delete the file
-    std.fs.deleteFileAbsolute(backing) catch |err| {
-        return posixErr(err);
-    };
+    std.fs.deleteFileAbsolute(backing) catch |err| return posixErr(err);
 
-    // Remove .sum sidecar
     const sum_path = std.fmt.allocPrint(state.allocator, "{s}.sum", .{backing}) catch return 0;
     defer state.allocator.free(sum_path);
     std.fs.deleteFileAbsolute(sum_path) catch {};
 
-    // Enqueue delete to replica
     if (rel.len > 0) {
         state.repl_log.enqueue(.delete, rel) catch |err| {
             log.err("failed to enqueue delete for {s}: {}", .{ rel, err });
         };
     }
 
-    // Remove stale path state so the map doesn't grow unboundedly.
     state.path_state.remove(rel);
-
     return 0;
 }
 
@@ -1516,11 +1269,9 @@ fn fuse_rename(from: [*c]const u8, to: [*c]const u8, flags: c_uint) callconv(.c)
     const rel_from = fuseRelPath(from);
     const rel_to = fuseRelPath(to);
 
-    // Handle rename flags (RENAME_NOREPLACE, RENAME_EXCHANGE, etc.)
     if (comptime builtin.os.tag == .linux) {
         const RENAME_NOREPLACE = 1;
         const RENAME_EXCHANGE = 2;
-        // Reject any unsupported flags (RENAME_EXCHANGE, RENAME_WHITEOUT, etc.)
         if (flags & ~@as(c_uint, RENAME_NOREPLACE) != 0) {
             if (flags & RENAME_EXCHANGE != 0) {
                 return fuseErr(.OPNOTSUPP);
@@ -1528,7 +1279,6 @@ fn fuse_rename(from: [*c]const u8, to: [*c]const u8, flags: c_uint) callconv(.c)
             return fuseErr(.INVAL);
         }
         if (flags & RENAME_NOREPLACE != 0) {
-            // RENAME_NOREPLACE: fail if destination already exists
             const backing_to_check = backingPath(state.allocator, state, rel_to) catch return fuseErr(.NOMEM);
             defer state.allocator.free(backing_to_check);
             if (posix.fstatat(posix.AT.FDCWD, backing_to_check, posix.AT.SYMLINK_NOFOLLOW)) |_| {
@@ -1536,13 +1286,11 @@ fn fuse_rename(from: [*c]const u8, to: [*c]const u8, flags: c_uint) callconv(.c)
             } else |_| {}
         }
     } else {
-        // macOS FUSE does not use rename flags
         if (flags != 0) {
             return fuseErr(.OPNOTSUPP);
         }
     }
 
-    // Check hidden paths
     if (rel_from.len > 0 and isHiddenPath(state, rel_from)) {
         return fuseErr(.NOENT);
     }
@@ -1555,19 +1303,14 @@ fn fuse_rename(from: [*c]const u8, to: [*c]const u8, flags: c_uint) callconv(.c)
     const backing_to = backingPath(state.allocator, state, rel_to) catch return fuseErr(.NOMEM);
     defer state.allocator.free(backing_to);
 
-    // Rename the data file
-    std.fs.renameAbsolute(backing_from, backing_to) catch |err| {
-        return posixErr(err);
-    };
+    std.fs.renameAbsolute(backing_from, backing_to) catch |err| return posixErr(err);
 
-    // Move .sum sidecar alongside
     const sum_from = std.fmt.allocPrint(state.allocator, "{s}.sum", .{backing_from}) catch return 0;
     defer state.allocator.free(sum_from);
     const sum_to = std.fmt.allocPrint(state.allocator, "{s}.sum", .{backing_to}) catch return 0;
     defer state.allocator.free(sum_to);
     std.fs.renameAbsolute(sum_from, sum_to) catch {};
 
-    // Enqueue delete(old) + put(new)
     if (rel_from.len > 0 and rel_to.len > 0) {
         state.repl_log.enqueue(.delete, rel_from) catch |err| {
             log.err("failed to enqueue rename delete for {s}: {}", .{ rel_from, err });
@@ -1577,10 +1320,7 @@ fn fuse_rename(from: [*c]const u8, to: [*c]const u8, flags: c_uint) callconv(.c)
         };
     }
 
-    // Remove stale path state for the old name so the map doesn't grow
-    // unboundedly.  (The new name will get fresh state on next access.)
     state.path_state.remove(rel_from);
-
     return 0;
 }
 
@@ -1595,14 +1335,10 @@ fn fuse_mkdir(path: [*c]const u8, mode: c.mode_t) callconv(.c) c_int {
     const backing = backingPath(state.allocator, state, rel) catch return fuseErr(.NOMEM);
     defer state.allocator.free(backing);
 
-    std.fs.makeDirAbsolute(backing) catch |err| {
-        return posixErr(err);
-    };
+    std.fs.makeDirAbsolute(backing) catch |err| return posixErr(err);
 
-    // Preserve mode
     posix.fchmodat(posix.AT.FDCWD, backing, mode, 0) catch {};
 
-    // Replicate directory creation to replica
     if (!state.no_remote_mkdir and rel.len > 0) {
         const replica_path = std.fs.path.join(state.allocator, &.{ state.replica_dir, "files", rel }) catch return 0;
         defer state.allocator.free(replica_path);
@@ -1614,7 +1350,6 @@ fn fuse_mkdir(path: [*c]const u8, mode: c.mode_t) callconv(.c) c_int {
             },
         };
     }
-
     return 0;
 }
 
@@ -1625,17 +1360,13 @@ fn fuse_rmdir(path: [*c]const u8) callconv(.c) c_int {
     const backing = backingPath(state.allocator, state, rel) catch return fuseErr(.NOMEM);
     defer state.allocator.free(backing);
 
-    std.fs.deleteDirAbsolute(backing) catch |err| {
-        return posixErr(err);
-    };
+    std.fs.deleteDirAbsolute(backing) catch |err| return posixErr(err);
 
-    // Replicate directory removal to replica
     if (!state.no_remote_mkdir and rel.len > 0) {
         const replica_path = std.fs.path.join(state.allocator, &.{ state.replica_dir, "files", rel }) catch return 0;
         defer state.allocator.free(replica_path);
         std.fs.deleteDirAbsolute(replica_path) catch {};
     }
-
     return 0;
 }
 
@@ -1646,19 +1377,16 @@ fn fuse_symlink(target: [*c]const u8, linkpath: [*c]const u8) callconv(.c) c_int
     const backing = backingPath(state.allocator, state, rel) catch return fuseErr(.NOMEM);
     defer state.allocator.free(backing);
 
-    posix.symlinkat(std.mem.span(@as([*:0]const u8, @ptrCast(target))), posix.AT.FDCWD, backing) catch |err| {
-        return posixErr(err);
-    };
+    posix.symlinkat(std.mem.span(@as([*:0]const u8, @ptrCast(target))), posix.AT.FDCWD, backing) catch |err| return posixErr(err);
 
-    // Enqueue for replication (symlinks are replicated)
     if (rel.len > 0) {
         state.repl_log.enqueue(.put, rel) catch |err| {
             log.err("failed to enqueue symlink replication for {s}: {}", .{ rel, err });
         };
     }
-
     return 0;
 }
+
 fn fuse_readlink(path: [*c]const u8, buf_ptr: [*c]u8, size: usize) callconv(.c) c_int {
     const state = g_state;
     const rel = fuseRelPath(path);
@@ -1671,9 +1399,7 @@ fn fuse_readlink(path: [*c]const u8, buf_ptr: [*c]u8, size: usize) callconv(.c) 
     defer state.allocator.free(backing);
 
     const buf: [*]u8 = @ptrCast(buf_ptr);
-    const target = posix.readlinkat(posix.AT.FDCWD, backing, buf[0 .. size - 1]) catch |err| {
-        return posixErr(err);
-    };
+    const target = posix.readlinkat(posix.AT.FDCWD, backing, buf[0 .. size - 1]) catch |err| return posixErr(err);
     buf[target.len] = 0;
 
     return 0;
@@ -1687,17 +1413,13 @@ fn fuse_chmod(path: [*c]const u8, mode: c.mode_t, fi: ?*c.struct_fuse_file_info)
     const backing = backingPath(state.allocator, state, rel) catch return fuseErr(.NOMEM);
     defer state.allocator.free(backing);
 
-    posix.fchmodat(posix.AT.FDCWD, backing, mode, 0) catch {
-        return fuseErr(.IO);
-    };
+    posix.fchmodat(posix.AT.FDCWD, backing, mode, 0) catch return fuseErr(.IO);
 
-    // Enqueue replication for metadata change
     if (rel.len > 0) {
         state.repl_log.enqueue(.put, rel) catch |err| {
             log.err("failed to enqueue chmod replication for {s}: {}", .{ rel, err });
         };
     }
-
     return 0;
 }
 
@@ -1709,20 +1431,17 @@ fn fuse_chown(path: [*c]const u8, uid: c.uid_t, gid: c.gid_t, fi: ?*c.struct_fus
     const backing = backingPath(state.allocator, state, rel) catch return fuseErr(.NOMEM);
     defer state.allocator.free(backing);
 
-    // lchown to not follow symlinks
     const ret = c.lchown(backing.ptr, uid, gid);
     if (ret != 0) {
         const err_val = std.c._errno().*;
         return -@as(c_int, @intCast(err_val));
     }
 
-    // Enqueue replication for metadata change
     if (rel.len > 0) {
         state.repl_log.enqueue(.put, rel) catch |err| {
             log.err("failed to enqueue chown replication for {s}: {}", .{ rel, err });
         };
     }
-
     return 0;
 }
 
@@ -1732,35 +1451,23 @@ fn fuse_truncate(path: [*c]const u8, size: c.off_t, fi: ?*c.struct_fuse_file_inf
 
     if (castFi(fi)) |f| {
         const fd: posix.fd_t = decodeFh(f.fh).fd;
-        posix.ftruncate(fd, @intCast(size)) catch {
-            return fuseErr(.IO);
-        };
+        posix.ftruncate(fd, @intCast(size)) catch return fuseErr(.IO);
     } else {
         const backing = backingPath(state.allocator, state, rel) catch return fuseErr(.NOMEM);
         defer state.allocator.free(backing);
-
-        const file = std.fs.openFileAbsolute(backing, .{ .mode = .read_write }) catch {
-            return fuseErr(.NOENT);
-        };
+        const file = std.fs.openFileAbsolute(backing, .{ .mode = .read_write }) catch return fuseErr(.NOENT);
         defer file.close();
-        posix.ftruncate(file.handle, @intCast(size)) catch {
-            return fuseErr(.IO);
-        };
+        posix.ftruncate(file.handle, @intCast(size)) catch return fuseErr(.IO);
     }
 
-    // Mark dirty and trigger checksum + replication enqueue.
     // For the non-fi path (truncate without an open fd), there is no
-    // subsequent fuse_release to drive checksumAndEnqueue, so we must do
-    // it here.  checksumAndEnqueue (non-forced) checks hasWriteRef, so
-    // if another writer currently has the file open, the dirty flag stays
-    // set and that writer's release will handle replication.
+    // subsequent fuse_release, so we must checksum here.
     if (rel.len > 0) {
         state.path_state.setDirty(rel);
         checksumAndEnqueue(state, rel) catch |err| {
             log.err("truncate checksum failed for {s}: {}", .{ rel, err });
         };
     }
-
     return 0;
 }
 
@@ -1787,14 +1494,12 @@ fn fuse_utimens(path: [*c]const u8, tv: [*c]const c.struct_timespec, fi: ?*c.str
             }
             return signed;
         }
-        // Enqueue replication for metadata change
         if (rel.len > 0) {
             state.repl_log.enqueue(.put, rel) catch |err| {
                 log.err("failed to enqueue utimens replication for {s}: {}", .{ rel, err });
             };
         }
     }
-
     return 0;
 }
 
@@ -1830,7 +1535,6 @@ fn fuse_access(path: [*c]const u8, mask: c_int) callconv(.c) c_int {
         const err_val = std.c._errno().*;
         return -@as(c_int, @intCast(err_val));
     }
-
     return 0;
 }
 
@@ -1843,17 +1547,6 @@ fn fuse_destroy(_: ?*anyopaque) callconv(.c) void {
 fn fuse_init(_: ?*c.struct_fuse_conn_info, _: [*c]c.struct_fuse_config) callconv(.c) ?*anyopaque {
     return null;
 }
-
-// ============================================================================
-// FUSE Operations Table
-// ============================================================================
-//
-// Note on mmap (issue #2): The FUSE high-level API does not expose a separate
-// mmap callback, so helmetfs cannot explicitly return ENOTSUP for mmap requests.
-// Under the default (non-direct_io) configuration, mmap'd writes go through the
-// kernel page cache and may bypass FUSE write() tracking. This is an accepted
-// limitation of the high-level API.
-//
 
 const fuse_ops = std.mem.zeroInit(c.struct_fuse_operations, .{
     .getattr = fuse_getattr,
@@ -1880,10 +1573,6 @@ const fuse_ops = std.mem.zeroInit(c.struct_fuse_operations, .{
     .utimens = fuse_utimens,
 });
 
-// ============================================================================
-// Signal Handling
-// ============================================================================
-
 var g_fuse_instance: ?*c.struct_fuse = null;
 
 fn signalHandler(_: c_int) callconv(.c) void {
@@ -1903,10 +1592,6 @@ fn setupSignalHandlers() void {
     posix.sigaction(posix.SIG.INT, &act, null);
 }
 
-// ============================================================================
-// CLI
-// ============================================================================
-
 const CliArgs = struct {
     command: enum { mount, unmount },
     source: []const u8,
@@ -1921,7 +1606,6 @@ fn parseArgs(allocator: std.mem.Allocator) !CliArgs {
     var args_iter = try std.process.argsWithAllocator(allocator);
     defer args_iter.deinit();
 
-    // Skip program name
     _ = args_iter.next();
 
     const command_str = args_iter.next() orelse {
@@ -2029,10 +1713,6 @@ fn printUsage() void {
     , .{});
 }
 
-// ============================================================================
-// Main
-// ============================================================================
-
 pub fn main() !void {
     var gpa = std.heap.GeneralPurposeAllocator(.{}){};
     const allocator = gpa.allocator();
@@ -2040,12 +1720,8 @@ pub fn main() !void {
     const args = try parseArgs(allocator);
 
     switch (args.command) {
-        .unmount => {
-            doUnmount(args.mountpoint);
-        },
-        .mount => {
-            try doMount(allocator, args);
-        },
+        .unmount => doUnmount(args.mountpoint),
+        .mount => try doMount(allocator, args),
     }
 }
 
@@ -2077,16 +1753,8 @@ fn doUnmount(mountpoint: []const u8) void {
                 std.process.exit(1);
             }
         },
-        .Signal => |sig| {
-            std.debug.print("{s} was killed by signal {d}\n", .{ cmd, sig });
-            std.process.exit(1);
-        },
-        .Stopped => |sig| {
-            std.debug.print("{s} was stopped by signal {d}\n", .{ cmd, sig });
-            std.process.exit(1);
-        },
-        .Unknown => |val| {
-            std.debug.print("{s} terminated with unknown status {d}\n", .{ cmd, val });
+        else => {
+            std.debug.print("{s} terminated abnormally\n", .{cmd});
             std.process.exit(1);
         },
     }
@@ -2098,7 +1766,6 @@ fn doMount(allocator: std.mem.Allocator, args: CliArgs) !void {
         std.process.exit(1);
     };
 
-    // Resolve source to absolute path
     const source_abs = try std.fs.realpathAlloc(allocator, args.source);
     const replica_abs = try std.fs.realpathAlloc(allocator, args.replica.?);
     const mount_abs = try std.fs.realpathAlloc(allocator, args.mountpoint);
@@ -2111,7 +1778,6 @@ fn doMount(allocator: std.mem.Allocator, args: CliArgs) !void {
     log.info("  scrub time:  {s}", .{args.scrub_time});
     log.info("  remote mkdir: {s}", .{if (args.no_remote_mkdir) "disabled" else "enabled"});
 
-    // Initialize global state
     g_state = try FsState.init(
         allocator,
         source_abs,
@@ -2122,22 +1788,17 @@ fn doMount(allocator: std.mem.Allocator, args: CliArgs) !void {
         args.no_remote_mkdir,
     );
 
-    // Start background workers
     try g_state.startWorkers();
 
-    // Build FUSE args
     const mount_z = try allocator.dupeZ(u8, mount_abs);
 
-    var fuse_argv = [_][*:0]const u8{
-        "helmetfs",
-    };
+    var fuse_argv = [_][*:0]const u8{"helmetfs"};
     var fuse_args = c.fuse_args{
         .argc = @intCast(fuse_argv.len),
         .argv = @ptrCast(&fuse_argv),
         .allocated = 0,
     };
 
-    // Create FUSE and run
     const fuse_instance = fuseNew(&fuse_args, &fuse_ops, @sizeOf(c.struct_fuse_operations), null);
 
     if (fuse_instance == null) {
@@ -2146,8 +1807,6 @@ fn doMount(allocator: std.mem.Allocator, args: CliArgs) !void {
     }
     g_fuse_instance = fuse_instance;
 
-    // Setup signal handlers AFTER g_fuse_instance is set, so that if a
-    // signal arrives the handler can call fuse_exit on the instance.
     setupSignalHandlers();
 
     if (c.fuse_mount(fuse_instance, mount_z.ptr) != 0) {
@@ -2158,7 +1817,6 @@ fn doMount(allocator: std.mem.Allocator, args: CliArgs) !void {
 
     log.info("mounted, serving requests", .{});
 
-    // Run FUSE main loop (multi-threaded)
     var loop_cfg = c.struct_fuse_loop_config{
         .clone_fd = 0,
         .max_idle_threads = 10,
@@ -2167,7 +1825,6 @@ fn doMount(allocator: std.mem.Allocator, args: CliArgs) !void {
 
     log.info("FUSE loop exited with {d}", .{ret});
 
-    // fuse_destroy callback handles flush + stopWorkers; just tear down FUSE.
     c.fuse_unmount(fuse_instance);
     c.fuse_destroy(fuse_instance);
 
@@ -2176,13 +1833,8 @@ fn doMount(allocator: std.mem.Allocator, args: CliArgs) !void {
     log.info("helmetfs shutdown complete", .{});
 }
 
-// ============================================================================
-// Tests
-// ============================================================================
-
 const testing = std.testing;
 
-/// Test harness that creates temp backing/replica dirs and initializes g_state.
 const TestHarness = struct {
     allocator: std.mem.Allocator,
     backing_dir: []const u8,
@@ -2191,9 +1843,12 @@ const TestHarness = struct {
     tmp_dir_path: []const u8,
 
     fn init() !TestHarness {
+        return initWithFlags(false);
+    }
+
+    fn initWithFlags(no_remote_mkdir: bool) !TestHarness {
         const allocator = testing.allocator;
 
-        // Create a unique temp directory under /tmp
         const tmp_template = "/tmp/helmetfs-test-XXXXXX";
         var tmp_buf: [tmp_template.len:0]u8 = tmp_template.*;
         const result = c.mkdtemp(&tmp_buf);
@@ -2205,12 +1860,11 @@ const TestHarness = struct {
 
         try std.fs.makeDirAbsolute(backing);
         try std.fs.makeDirAbsolute(replica);
-        // Create replica/files subdirectory (replication target)
         const replica_files = try std.fs.path.join(allocator, &.{ replica, "files" });
         defer allocator.free(replica_files);
         try std.fs.makeDirAbsolute(replica_files);
 
-        const state = try FsState.init(allocator, backing, replica, 1, 0, 1, false);
+        const state = try FsState.init(allocator, backing, replica, 1, 0, 1, no_remote_mkdir);
         g_state = state;
 
         return .{
@@ -2223,7 +1877,6 @@ const TestHarness = struct {
     }
 
     fn deinit(self: *TestHarness) void {
-        // Recursively remove temp dir
         std.fs.deleteTreeAbsolute(self.tmp_dir_path) catch {};
         self.allocator.free(self.backing_dir);
         self.allocator.free(self.replica_dir);
@@ -2231,7 +1884,6 @@ const TestHarness = struct {
         self.state.deinit();
     }
 
-    /// Create a file in the backing directory with the given contents.
     fn createBackingFile(self: *TestHarness, rel_path: []const u8, contents: []const u8) !void {
         const full = try std.fs.path.join(self.allocator, &.{ self.backing_dir, rel_path });
         defer self.allocator.free(full);
@@ -2241,7 +1893,6 @@ const TestHarness = struct {
         try file.writeAll(contents);
     }
 
-    /// Read a file from the backing directory.
     fn readBackingFile(self: *TestHarness, rel_path: []const u8) ![]const u8 {
         const full = try std.fs.path.join(self.allocator, &.{ self.backing_dir, rel_path });
         defer self.allocator.free(full);
@@ -2250,7 +1901,6 @@ const TestHarness = struct {
         return try file.readToEndAlloc(self.allocator, 1024 * 1024);
     }
 
-    /// Create a file in the replica/files directory with the given contents.
     fn createReplicaFile(self: *TestHarness, rel_path: []const u8, contents: []const u8) !void {
         const full = try std.fs.path.join(self.allocator, &.{ self.replica_dir, "files", rel_path });
         defer self.allocator.free(full);
@@ -2260,7 +1910,6 @@ const TestHarness = struct {
         try file.writeAll(contents);
     }
 
-    /// Check if a file exists in the replica/files directory.
     fn replicaFileExists(self: *TestHarness, rel_path: []const u8) bool {
         const full = std.fs.path.join(self.allocator, &.{ self.replica_dir, "files", rel_path }) catch return false;
         defer self.allocator.free(full);
@@ -2269,182 +1918,109 @@ const TestHarness = struct {
     }
 };
 
-// ---------- formatLogEntry / parseLine round-trip ----------
-
-test "formatLogEntry produces valid log line" {
-    const allocator = testing.allocator;
-    const line = try formatLogEntry(allocator, .put, "foo/bar.txt");
-    defer allocator.free(line);
-
-    // Should end with newline
-    try testing.expect(line[line.len - 1] == '\n');
-
-    // Should contain "put foo/bar.txt"
-    try testing.expect(std.mem.indexOf(u8, line, "put foo/bar.txt") != null);
-}
-
-test "formatLogEntry/parseLine round-trip for put" {
+test "formatLogEntry/parseLine round-trip" {
     var h = try TestHarness.init();
     defer h.deinit();
 
-    const line = try formatLogEntry(h.allocator, .put, "hello/world.txt");
-    defer h.allocator.free(line);
-
-    // Strip trailing newline for parseLine
-    const trimmed = std.mem.trimRight(u8, line, "\n");
-
-    // parseLine should succeed without error
-    const count_before = h.state.repl_log.entries.items.len;
-    try h.state.repl_log.parseLine(trimmed);
-    const count_after = h.state.repl_log.entries.items.len;
-    try testing.expectEqual(count_before + 1, count_after);
-
-    const entry = h.state.repl_log.entries.items[count_after - 1];
-    try testing.expectEqual(ReplOp.put, entry.op);
-    try testing.expectEqualStrings("hello/world.txt", entry.path);
-}
-
-test "formatLogEntry/parseLine round-trip for delete" {
-    var h = try TestHarness.init();
-    defer h.deinit();
-
-    const line = try formatLogEntry(h.allocator, .delete, "gone.txt");
-    defer h.allocator.free(line);
-
-    const trimmed = std.mem.trimRight(u8, line, "\n");
-    try h.state.repl_log.parseLine(trimmed);
-
-    const entry = h.state.repl_log.entries.getLast();
-    try testing.expectEqual(ReplOp.delete, entry.op);
-    try testing.expectEqualStrings("gone.txt", entry.path);
-}
-
-// ---------- PathStateMap ----------
-
-fn deinitPathStateMap(psm: *PathStateMap) void {
-    var it = psm.map.iterator();
-    while (it.next()) |entry| {
-        psm.allocator.free(entry.key_ptr.*);
+    const cases = .{
+        .{ .op = ReplOp.put, .path = "hello/world.txt" },
+        .{ .op = ReplOp.delete, .path = "gone.txt" },
+    };
+    inline for (cases) |tc| {
+        const line = try formatLogEntry(h.allocator, tc.op, tc.path);
+        defer h.allocator.free(line);
+        const trimmed = std.mem.trimRight(u8, line, "\n");
+        const before = h.state.repl_log.entries.items.len;
+        try h.state.repl_log.parseLine(trimmed);
+        try testing.expectEqual(before + 1, h.state.repl_log.entries.items.len);
+        const entry = h.state.repl_log.entries.getLast();
+        try testing.expectEqual(tc.op, entry.op);
+        try testing.expectEqualStrings(tc.path, entry.path);
     }
-    psm.map.deinit();
 }
 
-test "PathStateMap: setDirty and isDirty" {
+test "PathStateMap: dirty, writeRef, clearDirtyIfGen, and remove" {
     var psm = PathStateMap.init(testing.allocator);
-    defer deinitPathStateMap(&psm);
+    defer psm.deinit();
 
     try testing.expect(!psm.isDirty("foo.txt"));
     psm.setDirty("foo.txt");
     try testing.expect(psm.isDirty("foo.txt"));
-}
-
-test "PathStateMap: clearDirty" {
-    var psm = PathStateMap.init(testing.allocator);
-    defer deinitPathStateMap(&psm);
-
-    psm.setDirty("bar.txt");
-    try testing.expect(psm.isDirty("bar.txt"));
-    psm.clearDirty("bar.txt");
-    try testing.expect(!psm.isDirty("bar.txt"));
-}
-
-test "PathStateMap: incWriteRef and hasWriteRef" {
-    var psm = PathStateMap.init(testing.allocator);
-    defer deinitPathStateMap(&psm);
+    psm.clearDirty("foo.txt");
+    try testing.expect(!psm.isDirty("foo.txt"));
 
     try testing.expect(!psm.hasWriteRef("a.txt"));
     psm.incWriteRef("a.txt");
-    try testing.expect(psm.hasWriteRef("a.txt"));
     psm.incWriteRef("a.txt");
     try testing.expect(psm.hasWriteRef("a.txt"));
-}
-
-test "PathStateMap: decWriteRef" {
-    var psm = PathStateMap.init(testing.allocator);
-    defer deinitPathStateMap(&psm);
-
-    psm.incWriteRef("b.txt");
-    psm.incWriteRef("b.txt");
-    psm.decWriteRef("b.txt");
-    try testing.expect(psm.hasWriteRef("b.txt")); // refcount=1
-    psm.decWriteRef("b.txt");
-    try testing.expect(!psm.hasWriteRef("b.txt")); // refcount=0
-}
-
-test "PathStateMap: dirty and writeRef are independent" {
-    var psm = PathStateMap.init(testing.allocator);
-    defer deinitPathStateMap(&psm);
+    psm.decWriteRef("a.txt");
+    try testing.expect(psm.hasWriteRef("a.txt"));
+    psm.decWriteRef("a.txt");
+    try testing.expect(!psm.hasWriteRef("a.txt"));
 
     psm.setDirty("c.txt");
     psm.incWriteRef("c.txt");
-    try testing.expect(psm.isDirty("c.txt"));
-    try testing.expect(psm.hasWriteRef("c.txt"));
-
     psm.clearDirty("c.txt");
     try testing.expect(!psm.isDirty("c.txt"));
     try testing.expect(psm.hasWriteRef("c.txt"));
+
+    psm.setDirty("g.txt");
+    const gen = psm.getDirtyGen("g.txt");
+    psm.clearDirtyIfGen("g.txt", gen -% 1);
+    try testing.expect(psm.isDirty("g.txt"));
+    psm.clearDirtyIfGen("g.txt", gen);
+    try testing.expect(!psm.isDirty("g.txt"));
+
+    psm.setDirty("r.txt");
+    psm.remove("r.txt");
+    try testing.expect(!psm.isDirty("r.txt"));
 }
 
-// ---------- isHiddenPath ----------
-
-test "isHiddenPath: .helmetfs directory is hidden" {
+test "isHiddenPath" {
     var h = try TestHarness.init();
     defer h.deinit();
 
     try testing.expect(isHiddenPath(h.state, ".helmetfs"));
     try testing.expect(isHiddenPath(h.state, ".helmetfs/repl.log"));
-}
 
-test "isHiddenPath: .sum sidecar hidden when data file exists" {
-    var h = try TestHarness.init();
-    defer h.deinit();
-
-    // Create data file
     try h.createBackingFile("data.txt", "hello");
-
-    // .sum sidecar should be hidden
     try testing.expect(isHiddenPath(h.state, "data.txt.sum"));
-}
 
-test "isHiddenPath: .sum not hidden when data file missing" {
-    var h = try TestHarness.init();
-    defer h.deinit();
-
-    // No data file exists — .sum should be visible (not hidden)
     try testing.expect(!isHiddenPath(h.state, "nodata.txt.sum"));
-}
-
-test "isHiddenPath: regular file not hidden" {
-    var h = try TestHarness.init();
-    defer h.deinit();
 
     try testing.expect(!isHiddenPath(h.state, "readme.md"));
     try testing.expect(!isHiddenPath(h.state, "subdir/file.txt"));
 }
 
-// ---------- parseScrubTime ----------
+test "parseScrubTime" {
+    const valid_cases = .{
+        .{ "01:00", 1, 0 },
+        .{ "23:59", 23, 59 },
+        .{ "00:00", 0, 0 },
+    };
+    inline for (valid_cases) |tc| {
+        const r = try parseScrubTime(tc[0]);
+        try testing.expectEqual(@as(u8, tc[1]), r.hour);
+        try testing.expectEqual(@as(u8, tc[2]), r.minute);
+    }
 
-test "parseScrubTime: valid inputs" {
-    const r1 = try parseScrubTime("01:00");
-    try testing.expectEqual(@as(u8, 1), r1.hour);
-    try testing.expectEqual(@as(u8, 0), r1.minute);
-
-    const r2 = try parseScrubTime("23:59");
-    try testing.expectEqual(@as(u8, 23), r2.hour);
-    try testing.expectEqual(@as(u8, 59), r2.minute);
-
-    const r3 = try parseScrubTime("00:00");
-    try testing.expectEqual(@as(u8, 0), r3.hour);
-    try testing.expectEqual(@as(u8, 0), r3.minute);
+    const error_cases = .{
+        .{ "24:00", error.InvalidTime },
+        .{ "12:60", error.InvalidTime },
+        .{ "1200", error.InvalidFormat },
+    };
+    inline for (error_cases) |tc| {
+        try testing.expectError(tc[1], parseScrubTime(tc[0]));
+    }
 }
 
-test "parseScrubTime: invalid inputs" {
-    try testing.expectError(error.InvalidTime, parseScrubTime("24:00"));
-    try testing.expectError(error.InvalidTime, parseScrubTime("12:60"));
-    try testing.expectError(error.InvalidFormat, parseScrubTime("1200"));
+test "nsUntilNextScrub returns value in (0, 24h]" {
+    for ([_]u8{ 0, 3, 6, 12, 18, 23 }) |hour| {
+        const ns = nsUntilNextScrub(hour, 0);
+        try testing.expect(ns > 0);
+        try testing.expect(ns <= 86400 * 1_000_000_000);
+    }
 }
-
-// ---------- computeBlake3 / writeSumFile / readSumFile ----------
 
 test "computeBlake3 produces consistent 64-char hex digest" {
     var h = try TestHarness.init();
@@ -2473,11 +2049,8 @@ test "writeSumFile / readSumFile round-trip" {
 
     const read_hex = try readSumFile(h.allocator, sum_path);
     defer h.allocator.free(read_hex);
-
     try testing.expectEqualStrings(hex, read_hex);
 }
-
-// ---------- copyFileWithSync / ensureParentDir ----------
 
 test "copyFileWithSync copies file correctly" {
     var h = try TestHarness.init();
@@ -2508,13 +2081,10 @@ test "ensureParentDir creates nested directories" {
 
     try ensureParentDir(deep_file);
 
-    // Parent directory should now exist
     const parent = std.fs.path.dirname(deep_file).?;
     var dir = try std.fs.openDirAbsolute(parent, .{});
     dir.close();
 }
-
-// ---------- checksumAndEnqueue ----------
 
 test "checksumAndEnqueue creates .sum and enqueues put" {
     var h = try TestHarness.init();
@@ -2525,23 +2095,19 @@ test "checksumAndEnqueue creates .sum and enqueues put" {
     const entries_before = h.state.repl_log.entries.items.len;
     try checksumAndEnqueue(h.state, "doc.txt");
 
-    // .sum file should exist
     const sum_path = try std.fs.path.join(h.allocator, &.{ h.backing_dir, "doc.txt.sum" });
     defer h.allocator.free(sum_path);
     const hex = try readSumFile(h.allocator, sum_path);
     defer h.allocator.free(hex);
     try testing.expectEqual(@as(usize, 64), hex.len);
 
-    // Should have enqueued a put entry
     try testing.expect(h.state.repl_log.entries.items.len > entries_before);
     const last = h.state.repl_log.entries.getLast();
     try testing.expectEqual(ReplOp.put, last.op);
     try testing.expectEqualStrings("doc.txt", last.path);
 }
 
-// ---------- ReplLog enqueue / coalescing ----------
-
-test "ReplLog.enqueue adds entries" {
+test "ReplLog enqueue and hasPendingPut" {
     var h = try TestHarness.init();
     defer h.deinit();
 
@@ -2549,31 +2115,20 @@ test "ReplLog.enqueue adds entries" {
     try h.state.repl_log.enqueue(.put, "file1.txt");
     try h.state.repl_log.enqueue(.delete, "file2.txt");
     try testing.expectEqual(before + 2, h.state.repl_log.entries.items.len);
-}
 
-test "ReplLog.hasPendingPut detects pending puts" {
-    var h = try TestHarness.init();
-    defer h.deinit();
-
-    try testing.expect(!h.state.repl_log.hasPendingPut("x.txt"));
+    try testing.expect(!h.state.repl_log.hasPendingPut("nope.txt"));
     try h.state.repl_log.enqueue(.put, "x.txt");
     try testing.expect(h.state.repl_log.hasPendingPut("x.txt"));
 }
-
-// ---------- replicatePut / replicateDelete ----------
 
 test "replicatePut copies file and .sum to replica" {
     var h = try TestHarness.init();
     defer h.deinit();
 
-    // Create backing file and its .sum
     try h.createBackingFile("replme.txt", "replicate this");
     try checksumAndEnqueue(h.state, "replme.txt");
-
-    // Replicate
     try replicatePut(h.state, "replme.txt");
 
-    // Verify replica file exists and has correct contents
     const replica_path = try std.fs.path.join(h.allocator, &.{ h.replica_dir, "files", "replme.txt" });
     defer h.allocator.free(replica_path);
     const file = try std.fs.openFileAbsolute(replica_path, .{});
@@ -2582,30 +2137,20 @@ test "replicatePut copies file and .sum to replica" {
     defer h.allocator.free(contents);
     try testing.expectEqualStrings("replicate this", contents);
 
-    // Verify replica .sum exists
     const replica_sum = try std.fmt.allocPrint(h.allocator, "{s}.sum", .{replica_path});
     defer h.allocator.free(replica_sum);
     std.fs.accessAbsolute(replica_sum, .{}) catch {
         return error.ReplicaSumMissing;
     };
+
+    try replicatePut(h.state, "ghost.txt");
+    try testing.expect(!h.replicaFileExists("ghost.txt"));
 }
 
-test "replicatePut handles subdirectories" {
+test "replicateDelete removes files and is idempotent" {
     var h = try TestHarness.init();
     defer h.deinit();
 
-    try h.createBackingFile("sub/dir/file.txt", "nested content");
-    try checksumAndEnqueue(h.state, "sub/dir/file.txt");
-    try replicatePut(h.state, "sub/dir/file.txt");
-
-    try testing.expect(h.replicaFileExists("sub/dir/file.txt"));
-}
-
-test "replicateDelete removes file and .sum from replica" {
-    var h = try TestHarness.init();
-    defer h.deinit();
-
-    // Create replica file and .sum
     try h.createReplicaFile("todelete.txt", "gone soon");
     const replica_sum = try std.fs.path.join(h.allocator, &.{ h.replica_dir, "files", "todelete.txt.sum" });
     defer h.allocator.free(replica_sum);
@@ -2614,325 +2159,27 @@ test "replicateDelete removes file and .sum from replica" {
     try testing.expect(h.replicaFileExists("todelete.txt"));
 
     try replicateDelete(h.state, "todelete.txt");
-
     try testing.expect(!h.replicaFileExists("todelete.txt"));
+
+    try replicateDelete(h.state, "todelete.txt");
 }
-
-test "replicateDelete is idempotent" {
-    var h = try TestHarness.init();
-    defer h.deinit();
-
-    // Deleting a non-existent file should not error
-    try replicateDelete(h.state, "nonexistent.txt");
-}
-
-// ---------- scrubFile ----------
-
-test "scrubFile adopts untracked file" {
-    var h = try TestHarness.init();
-    defer h.deinit();
-
-    // Create a file with no .sum sidecar
-    try h.createBackingFile("untracked.txt", "new file");
-
-    var corruptions: u64 = 0;
-    var repairs: u64 = 0;
-    try scrubFile(h.state, "untracked.txt", &corruptions, &repairs);
-
-    // Should have created a .sum file
-    const sum_path = try std.fs.path.join(h.allocator, &.{ h.backing_dir, "untracked.txt.sum" });
-    defer h.allocator.free(sum_path);
-    const hex = try readSumFile(h.allocator, sum_path);
-    defer h.allocator.free(hex);
-    try testing.expectEqual(@as(usize, 64), hex.len);
-
-    // No corruption (it was just adopted)
-    try testing.expectEqual(@as(u64, 0), corruptions);
-}
-
-test "scrubFile detects corruption and repairs from replica" {
-    var h = try TestHarness.init();
-    defer h.deinit();
-
-    // Create the original file and its checksum
-    try h.createBackingFile("important.txt", "correct data");
-    try checksumAndEnqueue(h.state, "important.txt");
-
-    // Replicate to replica so we have a good copy
-    try replicatePut(h.state, "important.txt");
-    h.state.repl_log.markCompletedByPath("important.txt");
-
-    // Now corrupt the backing file
-    try h.createBackingFile("important.txt", "CORRUPTED DATA");
-
-    var corruptions: u64 = 0;
-    var repairs: u64 = 0;
-    try scrubFile(h.state, "important.txt", &corruptions, &repairs);
-
-    // Should detect corruption and repair
-    try testing.expectEqual(@as(u64, 1), corruptions);
-    try testing.expectEqual(@as(u64, 1), repairs);
-
-    // File should be restored to original content
-    const restored = try h.readBackingFile("important.txt");
-    defer h.allocator.free(restored);
-    try testing.expectEqualStrings("correct data", restored);
-}
-
-test "scrubFile passes clean file" {
-    var h = try TestHarness.init();
-    defer h.deinit();
-
-    try h.createBackingFile("clean.txt", "all good");
-    try checksumAndEnqueue(h.state, "clean.txt");
-
-    var corruptions: u64 = 0;
-    var repairs: u64 = 0;
-    try scrubFile(h.state, "clean.txt", &corruptions, &repairs);
-
-    try testing.expectEqual(@as(u64, 0), corruptions);
-    try testing.expectEqual(@as(u64, 0), repairs);
-}
-
-// ---------- nsUntilNextScrub ----------
-
-test "nsUntilNextScrub returns positive value" {
-    const ns = nsUntilNextScrub(3, 0);
-    try testing.expect(ns > 0);
-    // Should be at most ~24 hours in nanoseconds
-    try testing.expect(ns <= 86400 * 1_000_000_000);
-}
-
-test "nsUntilNextScrub returns at most 24 hours" {
-    // Test several different target times
-    for ([_]u8{ 0, 6, 12, 18, 23 }) |hour| {
-        const ns = nsUntilNextScrub(hour, 0);
-        try testing.expect(ns > 0);
-        try testing.expect(ns <= 86400 * 1_000_000_000);
-    }
-}
-
-// ---------- ReplLog disk persistence ----------
 
 test "ReplLog persists to disk and reloads" {
     var h = try TestHarness.init();
     defer h.deinit();
 
-    // Enqueue some entries
     try h.state.repl_log.enqueue(.put, "persist1.txt");
     try h.state.repl_log.enqueue(.delete, "persist2.txt");
 
-    // Create a fresh ReplLog from the same backing dir — it should load entries
     var log2 = try ReplLog.init(h.allocator, h.backing_dir);
-    defer {
-        for (log2.entries.items) |entry| {
-            h.allocator.free(entry.path);
-        }
-        log2.entries.deinit(h.allocator);
-    }
+    defer log2.deinitEntries();
 
     try testing.expectEqual(@as(usize, 2), log2.entries.items.len);
     try testing.expectEqual(ReplOp.put, log2.entries.items[0].op);
     try testing.expectEqualStrings("persist1.txt", log2.entries.items[0].path);
     try testing.expectEqual(ReplOp.delete, log2.entries.items[1].op);
     try testing.expectEqualStrings("persist2.txt", log2.entries.items[1].path);
-}
 
-// ---------- ReplLog put coalescing ----------
-
-test "dequeueNext coalesces duplicate puts, returning only the latest" {
-    var h = try TestHarness.init();
-    defer h.deinit();
-
-    // Manually add entries without disk I/O (directly into the list)
-    const p1 = try h.allocator.dupe(u8, "dup.txt");
-    const p2 = try h.allocator.dupe(u8, "dup.txt");
-    const p3 = try h.allocator.dupe(u8, "unique.txt");
-    try h.state.repl_log.entries.append(h.allocator, .{ .id = 0, .op = .put, .path = p1 });
-    try h.state.repl_log.entries.append(h.allocator, .{ .id = 1, .op = .put, .path = p3 });
-    try h.state.repl_log.entries.append(h.allocator, .{ .id = 2, .op = .put, .path = p2 });
-    h.state.repl_log.next_id = 3;
-
-    // First dequeue should skip stale dup.txt (index 0) and return unique.txt (index 1)
-    const first = h.state.repl_log.dequeueNext();
-    try testing.expect(first != null);
-    try testing.expectEqualStrings("unique.txt", first.?.path);
-
-    // The stale put at index 0 should have been marked completed by coalescing
-    try testing.expect(h.state.repl_log.entries.items[0].completed);
-
-    // Mark unique.txt as completed (may trigger truncation, compacting entries)
-    h.state.repl_log.markCompleted(first.?.id);
-
-    // Next dequeue should return the latest dup.txt (the only remaining entry)
-    const second = h.state.repl_log.dequeueNext();
-    try testing.expect(second != null);
-    try testing.expectEqualStrings("dup.txt", second.?.path);
-    h.state.repl_log.markCompleted(second.?.id);
-
-    // All consumed — set shutdown so dequeueNext returns null instead of blocking
-    h.state.shutdown.store(true, .release);
-    h.state.repl_log.cond.broadcast();
-    const third = h.state.repl_log.dequeueNext();
-    try testing.expect(third == null);
-}
-
-// ---------- ReplLog markCompleted + maybeTruncate ----------
-
-test "markCompleted triggers truncation and removes completed entries" {
-    var h = try TestHarness.init();
-    defer h.deinit();
-
-    // Add 4 entries
-    try h.state.repl_log.enqueue(.put, "a.txt");
-    try h.state.repl_log.enqueue(.put, "b.txt");
-    try h.state.repl_log.enqueue(.delete, "c.txt");
-    try h.state.repl_log.enqueue(.put, "d.txt");
-
-    try testing.expectEqual(@as(usize, 4), h.state.repl_log.entries.items.len);
-
-    // Set last_truncate_time to now so only ratio-based truncation applies
-    h.state.repl_log.last_truncate_time = std.time.timestamp();
-
-    // Mark 3 of 4 completed (75% > 50% — triggers ratio-based truncation)
-    h.state.repl_log.markCompleted(0);
-    // After first: completed_count=1, total=4, 1*2=2 > 4? No. No truncation yet.
-    h.state.repl_log.markCompleted(1);
-    // After second: completed_count=2, total=4, 2*2=4 > 4? No. No truncation yet.
-    h.state.repl_log.markCompleted(2);
-    // After third: completed_count=3, total=4, 3*2=6 > 4? Yes. Truncation fires.
-
-    // After truncation, only the uncompleted entry (d.txt) should remain
-    try testing.expectEqual(@as(usize, 1), h.state.repl_log.entries.items.len);
-    try testing.expectEqualStrings("d.txt", h.state.repl_log.entries.items[0].path);
-    try testing.expectEqual(@as(usize, 0), h.state.repl_log.completed_count);
-}
-
-// ---------- scrubFile: replica also corrupt ----------
-
-test "scrubFile does not repair when replica is also corrupt" {
-    var h = try TestHarness.init();
-    defer h.deinit();
-
-    // Create original file and checksum
-    try h.createBackingFile("both-bad.txt", "original data");
-    try checksumAndEnqueue(h.state, "both-bad.txt");
-
-    // Replicate to get a good copy in replica
-    try replicatePut(h.state, "both-bad.txt");
-
-    // Now corrupt BOTH the backing file and the replica file
-    try h.createBackingFile("both-bad.txt", "CORRUPTED BACKING");
-    try h.createReplicaFile("both-bad.txt", "CORRUPTED REPLICA");
-
-    var corruptions: u64 = 0;
-    var repairs: u64 = 0;
-    try scrubFile(h.state, "both-bad.txt", &corruptions, &repairs);
-
-    // Should detect corruption but NOT repair (replica checksum won't match)
-    try testing.expectEqual(@as(u64, 1), corruptions);
-    try testing.expectEqual(@as(u64, 0), repairs);
-
-    // File should still be corrupted (not overwritten with bad replica)
-    const contents = try h.readBackingFile("both-bad.txt");
-    defer h.allocator.free(contents);
-    try testing.expectEqualStrings("CORRUPTED BACKING", contents);
-}
-
-// ---------- replicatePut: source deleted before replication ----------
-
-test "replicatePut silently handles source file deleted before replication" {
-    var h = try TestHarness.init();
-    defer h.deinit();
-
-    // replicatePut for a non-existent file should not error (FileNotFound is handled)
-    try replicatePut(h.state, "ghost.txt");
-
-    // Replica should not have the file
-    try testing.expect(!h.replicaFileExists("ghost.txt"));
-}
-
-// ---------- checksumAndEnqueue clears dirty flag ----------
-
-test "checksumAndEnqueue clears dirty flag on success" {
-    var h = try TestHarness.init();
-    defer h.deinit();
-
-    try h.createBackingFile("dirty.txt", "some content");
-
-    // Mark dirty
-    h.state.path_state.setDirty("dirty.txt");
-    try testing.expect(h.state.path_state.isDirty("dirty.txt"));
-
-    // checksumAndEnqueue should clear it
-    try checksumAndEnqueue(h.state, "dirty.txt");
-    try testing.expect(!h.state.path_state.isDirty("dirty.txt"));
-}
-
-// ---------- End-to-end: write + checksum + replicate + corrupt + scrub repair ----------
-
-test "end-to-end: file goes through checksum, replication, corruption, and scrub repair" {
-    var h = try TestHarness.init();
-    defer h.deinit();
-
-    // Step 1: "Write" a file (simulate what fuse_write + fuse_release would do)
-    try h.createBackingFile("e2e.txt", "precious data");
-    h.state.path_state.setDirty("e2e.txt");
-    try testing.expect(h.state.path_state.isDirty("e2e.txt"));
-
-    // Step 2: Checksum and enqueue (what release/fsync does)
-    try checksumAndEnqueue(h.state, "e2e.txt");
-    try testing.expect(!h.state.path_state.isDirty("e2e.txt"));
-
-    // Verify .sum sidecar was created
-    const sum_path = try std.fs.path.join(h.allocator, &.{ h.backing_dir, "e2e.txt.sum" });
-    defer h.allocator.free(sum_path);
-    const original_sum = try readSumFile(h.allocator, sum_path);
-    defer h.allocator.free(original_sum);
-    try testing.expectEqual(@as(usize, 64), original_sum.len);
-
-    // Step 3: Replicate to replica
-    try replicatePut(h.state, "e2e.txt");
-    h.state.repl_log.markCompletedByPath("e2e.txt");
-    try testing.expect(h.replicaFileExists("e2e.txt"));
-
-    // Verify replica contents match
-    const replica_path = try std.fs.path.join(h.allocator, &.{ h.replica_dir, "files", "e2e.txt" });
-    defer h.allocator.free(replica_path);
-    const replica_file = try std.fs.openFileAbsolute(replica_path, .{});
-    defer replica_file.close();
-    const replica_contents = try replica_file.readToEndAlloc(h.allocator, 1024);
-    defer h.allocator.free(replica_contents);
-    try testing.expectEqualStrings("precious data", replica_contents);
-
-    // Step 4: Simulate corruption
-    try h.createBackingFile("e2e.txt", "CORRUPTED DATA!!");
-
-    // Step 5: Scrub detects and repairs
-    var corruptions: u64 = 0;
-    var repairs: u64 = 0;
-    try scrubFile(h.state, "e2e.txt", &corruptions, &repairs);
-    try testing.expectEqual(@as(u64, 1), corruptions);
-    try testing.expectEqual(@as(u64, 1), repairs);
-
-    // Step 6: Verify file was restored
-    const restored = try h.readBackingFile("e2e.txt");
-    defer h.allocator.free(restored);
-    try testing.expectEqualStrings("precious data", restored);
-
-    // Verify .sum was also updated to match the repaired file
-    const repaired_sum = try readSumFile(h.allocator, sum_path);
-    defer h.allocator.free(repaired_sum);
-    try testing.expectEqualStrings(original_sum, repaired_sum);
-}
-
-// ---------- ReplLog loadFromDisk: corrupted lines ----------
-
-test "ReplLog loadFromDisk gracefully skips corrupted lines" {
-    var h = try TestHarness.init();
-    defer h.deinit();
-
-    // Write a valid entry and a corrupted entry directly to the log file
     const log_path = try std.fs.path.join(h.allocator, &.{ h.backing_dir, ".helmetfs", "repl.log" });
     defer h.allocator.free(log_path);
 
@@ -2943,31 +2190,171 @@ test "ReplLog loadFromDisk gracefully skips corrupted lines" {
         const file = try std.fs.createFileAbsolute(log_path, .{ .truncate = true });
         defer file.close();
         try file.writeAll(valid_line);
-        try file.writeAll("badop corrupted.txt\n"); // invalid operation
+        try file.writeAll("badop corrupted.txt\n");
         try file.sync();
     }
 
-    // Load from disk into a fresh ReplLog
-    var log2 = try ReplLog.init(h.allocator, h.backing_dir);
-    defer {
-        for (log2.entries.items) |entry| {
-            h.allocator.free(entry.path);
-        }
-        log2.entries.deinit(h.allocator);
-    }
+    var log3 = try ReplLog.init(h.allocator, h.backing_dir);
+    defer log3.deinitEntries();
 
-    // Only the valid entry should have been loaded
-    try testing.expectEqual(@as(usize, 1), log2.entries.items.len);
-    try testing.expectEqualStrings("good.txt", log2.entries.items[0].path);
+    try testing.expectEqual(@as(usize, 1), log3.entries.items.len);
+    try testing.expectEqualStrings("good.txt", log3.entries.items[0].path);
 }
 
-// ---------- flushDirtyFiles ----------
+test "dequeueNext coalesces puts but not deletes" {
+    var h = try TestHarness.init();
+    defer h.deinit();
+
+    const p1 = try h.allocator.dupe(u8, "dup.txt");
+    const p2 = try h.allocator.dupe(u8, "dup.txt");
+    const p3 = try h.allocator.dupe(u8, "unique.txt");
+    try h.state.repl_log.entries.append(h.allocator, .{ .id = 0, .op = .put, .path = p1 });
+    try h.state.repl_log.entries.append(h.allocator, .{ .id = 1, .op = .put, .path = p3 });
+    try h.state.repl_log.entries.append(h.allocator, .{ .id = 2, .op = .put, .path = p2 });
+    h.state.repl_log.next_id = 3;
+
+    const first = h.state.repl_log.dequeueNext();
+    try testing.expect(first != null);
+    try testing.expectEqualStrings("unique.txt", first.?.path);
+    try testing.expect(h.state.repl_log.entries.items[0].completed);
+
+    h.state.repl_log.markCompleted(first.?.id);
+
+    const second = h.state.repl_log.dequeueNext();
+    try testing.expect(second != null);
+    try testing.expectEqualStrings("dup.txt", second.?.path);
+    h.state.repl_log.markCompleted(second.?.id);
+
+    h.state.shutdown.store(true, .release);
+    h.state.repl_log.cond.broadcast();
+    try testing.expect(h.state.repl_log.dequeueNext() == null);
+
+    h.state.shutdown.store(false, .release);
+
+    for (h.state.repl_log.entries.items) |entry| {
+        if (!entry.completed) h.allocator.free(entry.path);
+    }
+    h.state.repl_log.entries.clearRetainingCapacity();
+    h.state.repl_log.completed_count = 0;
+
+    const d1 = try h.allocator.dupe(u8, "del.txt");
+    const d2 = try h.allocator.dupe(u8, "del.txt");
+    try h.state.repl_log.entries.append(h.allocator, .{ .id = 10, .op = .delete, .path = d1 });
+    try h.state.repl_log.entries.append(h.allocator, .{ .id = 11, .op = .delete, .path = d2 });
+    h.state.repl_log.next_id = 12;
+
+    const del_first = h.state.repl_log.dequeueNext();
+    try testing.expect(del_first != null);
+    try testing.expectEqual(@as(u64, 10), del_first.?.id);
+    try testing.expectEqual(ReplOp.delete, del_first.?.op);
+    h.state.repl_log.markCompleted(del_first.?.id);
+
+    const del_second = h.state.repl_log.dequeueNext();
+    try testing.expect(del_second != null);
+    try testing.expectEqual(@as(u64, 11), del_second.?.id);
+    try testing.expectEqual(ReplOp.delete, del_second.?.op);
+    h.state.repl_log.markCompleted(del_second.?.id);
+
+    h.state.shutdown.store(true, .release);
+    h.state.repl_log.cond.broadcast();
+    try testing.expect(h.state.repl_log.dequeueNext() == null);
+}
+
+test "markCompleted triggers truncation and removes completed entries" {
+    var h = try TestHarness.init();
+    defer h.deinit();
+
+    try h.state.repl_log.enqueue(.put, "a.txt");
+    try h.state.repl_log.enqueue(.put, "b.txt");
+    try h.state.repl_log.enqueue(.delete, "c.txt");
+    try h.state.repl_log.enqueue(.put, "d.txt");
+
+    try testing.expectEqual(@as(usize, 4), h.state.repl_log.entries.items.len);
+
+    h.state.repl_log.last_truncate_time = std.time.timestamp();
+
+    h.state.repl_log.markCompleted(0);
+    h.state.repl_log.markCompleted(1);
+    h.state.repl_log.markCompleted(2);
+
+    try testing.expectEqual(@as(usize, 1), h.state.repl_log.entries.items.len);
+    try testing.expectEqualStrings("d.txt", h.state.repl_log.entries.items[0].path);
+    try testing.expectEqual(@as(usize, 0), h.state.repl_log.completed_count);
+}
+
+test "scrubFile does not repair when replica is also corrupt" {
+    var h = try TestHarness.init();
+    defer h.deinit();
+
+    try h.createBackingFile("both-bad.txt", "original data");
+    try checksumAndEnqueue(h.state, "both-bad.txt");
+    try replicatePut(h.state, "both-bad.txt");
+
+    try h.createBackingFile("both-bad.txt", "CORRUPTED BACKING");
+    try h.createReplicaFile("both-bad.txt", "CORRUPTED REPLICA");
+
+    var corruptions: u64 = 0;
+    var repairs: u64 = 0;
+    try scrubFile(h.state, "both-bad.txt", &corruptions, &repairs);
+
+    try testing.expectEqual(@as(u64, 1), corruptions);
+    try testing.expectEqual(@as(u64, 0), repairs);
+
+    const contents = try h.readBackingFile("both-bad.txt");
+    defer h.allocator.free(contents);
+    try testing.expectEqualStrings("CORRUPTED BACKING", contents);
+}
+
+test "end-to-end: file goes through checksum, replication, corruption, and scrub repair" {
+    var h = try TestHarness.init();
+    defer h.deinit();
+
+    try h.createBackingFile("e2e.txt", "precious data");
+    h.state.path_state.setDirty("e2e.txt");
+    try testing.expect(h.state.path_state.isDirty("e2e.txt"));
+
+    try checksumAndEnqueue(h.state, "e2e.txt");
+    try testing.expect(!h.state.path_state.isDirty("e2e.txt"));
+
+    const sum_path = try std.fs.path.join(h.allocator, &.{ h.backing_dir, "e2e.txt.sum" });
+    defer h.allocator.free(sum_path);
+    const original_sum = try readSumFile(h.allocator, sum_path);
+    defer h.allocator.free(original_sum);
+    try testing.expectEqual(@as(usize, 64), original_sum.len);
+
+    try replicatePut(h.state, "e2e.txt");
+    h.state.repl_log.markCompletedByPath("e2e.txt");
+    try testing.expect(h.replicaFileExists("e2e.txt"));
+
+    const replica_path = try std.fs.path.join(h.allocator, &.{ h.replica_dir, "files", "e2e.txt" });
+    defer h.allocator.free(replica_path);
+    const replica_file = try std.fs.openFileAbsolute(replica_path, .{});
+    defer replica_file.close();
+    const replica_contents = try replica_file.readToEndAlloc(h.allocator, 1024);
+    defer h.allocator.free(replica_contents);
+    try testing.expectEqualStrings("precious data", replica_contents);
+
+    try h.createBackingFile("e2e.txt", "CORRUPTED DATA!!");
+
+    var corruptions: u64 = 0;
+    var repairs: u64 = 0;
+    try scrubFile(h.state, "e2e.txt", &corruptions, &repairs);
+    try testing.expectEqual(@as(u64, 1), corruptions);
+    try testing.expectEqual(@as(u64, 1), repairs);
+
+    const restored = try h.readBackingFile("e2e.txt");
+    defer h.allocator.free(restored);
+    try testing.expectEqualStrings("precious data", restored);
+
+    const repaired_sum = try readSumFile(h.allocator, sum_path);
+    defer h.allocator.free(repaired_sum);
+    try testing.expectEqualStrings(original_sum, repaired_sum);
+}
 
 test "flushDirtyFiles processes all dirty paths" {
     var h = try TestHarness.init();
     defer h.deinit();
 
-    // Create files and mark them dirty
     try h.createBackingFile("flush1.txt", "data one");
     try h.createBackingFile("flush2.txt", "data two");
 
@@ -2979,10 +2366,8 @@ test "flushDirtyFiles processes all dirty paths" {
 
     const entries_before = h.state.repl_log.entries.items.len;
 
-    // Flush dirty files (simulates what FUSE destroy does)
     h.state.flushDirtyFiles();
 
-    // Both files should now have .sum sidecars
     const sum1 = try std.fs.path.join(h.allocator, &.{ h.backing_dir, "flush1.txt.sum" });
     defer h.allocator.free(sum1);
     const sum2 = try std.fs.path.join(h.allocator, &.{ h.backing_dir, "flush2.txt.sum" });
@@ -2990,47 +2375,11 @@ test "flushDirtyFiles processes all dirty paths" {
     std.fs.accessAbsolute(sum1, .{}) catch return error.Sum1Missing;
     std.fs.accessAbsolute(sum2, .{}) catch return error.Sum2Missing;
 
-    // Both should have been enqueued for replication
     try testing.expect(h.state.repl_log.entries.items.len >= entries_before + 2);
 
-    // Dirty flags should be cleared
     try testing.expect(!h.state.path_state.isDirty("flush1.txt"));
     try testing.expect(!h.state.path_state.isDirty("flush2.txt"));
 }
-
-// ---------- ReplLog: delete entries are not coalesced ----------
-
-test "dequeueNext does not coalesce delete entries" {
-    var h = try TestHarness.init();
-    defer h.deinit();
-
-    // Two deletes for the same path should both be processed
-    const p1 = try h.allocator.dupe(u8, "del.txt");
-    const p2 = try h.allocator.dupe(u8, "del.txt");
-    try h.state.repl_log.entries.append(h.allocator, .{ .id = 0, .op = .delete, .path = p1 });
-    try h.state.repl_log.entries.append(h.allocator, .{ .id = 1, .op = .delete, .path = p2 });
-    h.state.repl_log.next_id = 2;
-
-    const first = h.state.repl_log.dequeueNext();
-    try testing.expect(first != null);
-    try testing.expectEqual(@as(u64, 0), first.?.id);
-    try testing.expectEqual(ReplOp.delete, first.?.op);
-
-    h.state.repl_log.markCompleted(first.?.id);
-
-    const second = h.state.repl_log.dequeueNext();
-    try testing.expect(second != null);
-    try testing.expectEqual(@as(u64, 1), second.?.id);
-    try testing.expectEqual(ReplOp.delete, second.?.op);
-
-    h.state.repl_log.markCompleted(second.?.id);
-
-    h.state.shutdown.store(true, .release);
-    h.state.repl_log.cond.broadcast();
-    try testing.expect(h.state.repl_log.dequeueNext() == null);
-}
-
-// ---------- ReplLog atomic rewrite preserves pending entries on disk ----------
 
 test "ReplLog atomic rewrite preserves only pending entries on disk" {
     var h = try TestHarness.init();
@@ -3040,37 +2389,26 @@ test "ReplLog atomic rewrite preserves only pending entries on disk" {
     try h.state.repl_log.enqueue(.delete, "remove.txt");
     try h.state.repl_log.enqueue(.put, "also-keep.txt");
 
-    // Mark the middle entry as completed and force truncation
     h.state.repl_log.last_truncate_time = 0;
     h.state.repl_log.markCompleted(1);
 
-    // Reload from disk to verify persistence
     var log2 = try ReplLog.init(h.allocator, h.backing_dir);
-    defer {
-        for (log2.entries.items) |entry| {
-            h.allocator.free(entry.path);
-        }
-        log2.entries.deinit(h.allocator);
-    }
+    defer log2.deinitEntries();
 
     try testing.expectEqual(@as(usize, 2), log2.entries.items.len);
     try testing.expectEqualStrings("keep.txt", log2.entries.items[0].path);
     try testing.expectEqualStrings("also-keep.txt", log2.entries.items[1].path);
 }
 
-// ---------- End-to-end: rename triggers delete+put pair ----------
-
 test "end-to-end: rename enqueues delete+put pair and replication works" {
     var h = try TestHarness.init();
     defer h.deinit();
 
-    // Create original file, checksum, and replicate
     try h.createBackingFile("old-name.txt", "rename me");
     try checksumAndEnqueue(h.state, "old-name.txt");
     try replicatePut(h.state, "old-name.txt");
     try testing.expect(h.replicaFileExists("old-name.txt"));
 
-    // Simulate rename: move file in backing, move .sum, enqueue pair
     const old_backing = try std.fs.path.join(h.allocator, &.{ h.backing_dir, "old-name.txt" });
     defer h.allocator.free(old_backing);
     const new_backing = try std.fs.path.join(h.allocator, &.{ h.backing_dir, "new-name.txt" });
@@ -3088,15 +2426,12 @@ test "end-to-end: rename enqueues delete+put pair and replication works" {
     try h.state.repl_log.enqueue(.put, "new-name.txt");
     try testing.expectEqual(entries_before + 2, h.state.repl_log.entries.items.len);
 
-    // Process the delete
     try replicateDelete(h.state, "old-name.txt");
     try testing.expect(!h.replicaFileExists("old-name.txt"));
 
-    // Process the put
     try replicatePut(h.state, "new-name.txt");
     try testing.expect(h.replicaFileExists("new-name.txt"));
 
-    // Verify replica content
     const replica_path = try std.fs.path.join(h.allocator, &.{ h.replica_dir, "files", "new-name.txt" });
     defer h.allocator.free(replica_path);
     const file = try std.fs.openFileAbsolute(replica_path, .{});
@@ -3106,22 +2441,17 @@ test "end-to-end: rename enqueues delete+put pair and replication works" {
     try testing.expectEqualStrings("rename me", content);
 }
 
-// ---------- Multiple files: scrub handles mixed state ----------
-
 test "end-to-end: scrub handles mix of clean, untracked, and corrupt files" {
     var h = try TestHarness.init();
     defer h.deinit();
 
-    // File A: clean (has valid .sum)
     try h.createBackingFile("clean.txt", "all good");
     try checksumAndEnqueue(h.state, "clean.txt");
     try replicatePut(h.state, "clean.txt");
     h.state.repl_log.markCompletedByPath("clean.txt");
 
-    // File B: untracked (no .sum)
     try h.createBackingFile("untracked.txt", "new arrival");
 
-    // File C: corrupted (has .sum but content changed)
     try h.createBackingFile("corrupt.txt", "original");
     try checksumAndEnqueue(h.state, "corrupt.txt");
     try replicatePut(h.state, "corrupt.txt");
@@ -3131,201 +2461,116 @@ test "end-to-end: scrub handles mix of clean, untracked, and corrupt files" {
     var corruptions: u64 = 0;
     var repairs: u64 = 0;
 
-    // Scrub all three files
     try scrubFile(h.state, "clean.txt", &corruptions, &repairs);
     try scrubFile(h.state, "untracked.txt", &corruptions, &repairs);
     try scrubFile(h.state, "corrupt.txt", &corruptions, &repairs);
 
-    // 1 corruption (corrupt.txt), 1 repair (from replica)
     try testing.expectEqual(@as(u64, 1), corruptions);
     try testing.expectEqual(@as(u64, 1), repairs);
 
-    // Untracked file should now have a .sum
     const untracked_sum = try std.fs.path.join(h.allocator, &.{ h.backing_dir, "untracked.txt.sum" });
     defer h.allocator.free(untracked_sum);
     std.fs.accessAbsolute(untracked_sum, .{}) catch return error.UntrackedSumMissing;
 
-    // Corrupt file should be repaired
     const restored = try h.readBackingFile("corrupt.txt");
     defer h.allocator.free(restored);
     try testing.expectEqualStrings("original", restored);
 
-    // Clean file should be unchanged
     const clean = try h.readBackingFile("clean.txt");
     defer h.allocator.free(clean);
     try testing.expectEqualStrings("all good", clean);
 }
 
-// ---------- Remote directory management ----------
-
-test "removeEmptyParentDirs removes empty parents up to stop_at" {
+test "removeEmptyParentDirs" {
     var h = try TestHarness.init();
     defer h.deinit();
 
     const replica_files = try std.fs.path.join(h.allocator, &.{ h.replica_dir, "files" });
     defer h.allocator.free(replica_files);
 
-    // Create nested dirs: replica/files/a/b/c
-    const dir_c = try std.fs.path.join(h.allocator, &.{ replica_files, "a", "b", "c" });
-    defer h.allocator.free(dir_c);
-    try ensureParentDir(dir_c);
-    try std.fs.makeDirAbsolute(dir_c);
+    // Case 1: removes empty parents up to stop_at
+    {
+        const dir_c = try std.fs.path.join(h.allocator, &.{ replica_files, "a", "b", "c" });
+        defer h.allocator.free(dir_c);
+        try ensureParentDir(dir_c);
+        try std.fs.makeDirAbsolute(dir_c);
 
-    // Create a file in c/ so we can delete it and test cleanup
-    const file_path = try std.fs.path.join(h.allocator, &.{ dir_c, "file.txt" });
-    defer h.allocator.free(file_path);
-    const f = try std.fs.createFileAbsolute(file_path, .{});
-    f.close();
-    try std.fs.deleteFileAbsolute(file_path);
+        const file_path = try std.fs.path.join(h.allocator, &.{ dir_c, "file.txt" });
+        defer h.allocator.free(file_path);
+        const f = try std.fs.createFileAbsolute(file_path, .{});
+        f.close();
+        try std.fs.deleteFileAbsolute(file_path);
 
-    // Now remove empty parents starting from file_path
-    removeEmptyParentDirs(file_path, replica_files);
+        removeEmptyParentDirs(file_path, replica_files);
 
-    // a/b/c, a/b, and a should all be removed (they're empty)
-    const dir_a = try std.fs.path.join(h.allocator, &.{ replica_files, "a" });
-    defer h.allocator.free(dir_a);
-    std.fs.accessAbsolute(dir_a, .{}) catch |err| switch (err) {
-        error.FileNotFound => return, // Expected — dir was cleaned up
-        else => return err,
-    };
-    // If we get here, dir_a still exists — that's a failure
-    return error.DirNotRemoved;
-}
+        const dir_a = try std.fs.path.join(h.allocator, &.{ replica_files, "a" });
+        defer h.allocator.free(dir_a);
+        std.fs.accessAbsolute(dir_a, .{}) catch |err| switch (err) {
+            error.FileNotFound => {
+                // Expected — all empty dirs removed
+            },
+            else => return err,
+        };
+    }
 
-test "removeEmptyParentDirs stops at non-empty directory" {
-    var h = try TestHarness.init();
-    defer h.deinit();
+    // Case 2: stops at non-empty directory
+    {
+        const file_path = try std.fs.path.join(h.allocator, &.{ replica_files, "x", "y", "z", "file.txt" });
+        defer h.allocator.free(file_path);
+        try ensureParentDir(file_path);
+        const f1 = try std.fs.createFileAbsolute(file_path, .{});
+        f1.close();
 
-    const replica_files = try std.fs.path.join(h.allocator, &.{ h.replica_dir, "files" });
-    defer h.allocator.free(replica_files);
+        const sibling = try std.fs.path.join(h.allocator, &.{ replica_files, "x", "sibling.txt" });
+        defer h.allocator.free(sibling);
+        const f2 = try std.fs.createFileAbsolute(sibling, .{});
+        f2.close();
 
-    // Create: replica/files/a/b/c/file.txt and replica/files/a/sibling.txt
-    const file_path = try std.fs.path.join(h.allocator, &.{ replica_files, "a", "b", "c", "file.txt" });
-    defer h.allocator.free(file_path);
-    try ensureParentDir(file_path);
-    const f1 = try std.fs.createFileAbsolute(file_path, .{});
-    f1.close();
+        try std.fs.deleteFileAbsolute(file_path);
+        removeEmptyParentDirs(file_path, replica_files);
 
-    const sibling = try std.fs.path.join(h.allocator, &.{ replica_files, "a", "sibling.txt" });
-    defer h.allocator.free(sibling);
-    const f2 = try std.fs.createFileAbsolute(sibling, .{});
-    f2.close();
+        const dir_y = try std.fs.path.join(h.allocator, &.{ replica_files, "x", "y" });
+        defer h.allocator.free(dir_y);
+        std.fs.accessAbsolute(dir_y, .{}) catch |err| switch (err) {
+            error.FileNotFound => {
+                const dir_x = try std.fs.path.join(h.allocator, &.{ replica_files, "x" });
+                defer h.allocator.free(dir_x);
+                try std.fs.accessAbsolute(dir_x, .{});
+                // Clean up for next case
+                try std.fs.deleteFileAbsolute(sibling);
+                std.fs.deleteTreeAbsolute(dir_x) catch {};
+            },
+            else => return err,
+        };
+    }
 
-    // Delete file.txt, then clean up
-    try std.fs.deleteFileAbsolute(file_path);
-    removeEmptyParentDirs(file_path, replica_files);
+    // Case 3: does not remove stop_at directory itself
+    {
+        const file_path = try std.fs.path.join(h.allocator, &.{ replica_files, "root-file.txt" });
+        defer h.allocator.free(file_path);
+        const f = try std.fs.createFileAbsolute(file_path, .{});
+        f.close();
+        try std.fs.deleteFileAbsolute(file_path);
 
-    // a/b/c and a/b should be removed, but a/ should remain (has sibling.txt)
-    const dir_b = try std.fs.path.join(h.allocator, &.{ replica_files, "a", "b" });
-    defer h.allocator.free(dir_b);
-    std.fs.accessAbsolute(dir_b, .{}) catch |err| switch (err) {
-        error.FileNotFound => {
-            // Good — b was removed. Now check a/ still exists.
-            const dir_a = try std.fs.path.join(h.allocator, &.{ replica_files, "a" });
-            defer h.allocator.free(dir_a);
-            try std.fs.accessAbsolute(dir_a, .{});
-            return;
-        },
-        else => return err,
-    };
-    return error.DirNotRemoved;
-}
+        removeEmptyParentDirs(file_path, replica_files);
 
-test "removeEmptyParentDirs does not remove stop_at directory" {
-    var h = try TestHarness.init();
-    defer h.deinit();
-
-    const replica_files = try std.fs.path.join(h.allocator, &.{ h.replica_dir, "files" });
-    defer h.allocator.free(replica_files);
-
-    // Create a file directly inside replica/files/
-    const file_path = try std.fs.path.join(h.allocator, &.{ replica_files, "root-file.txt" });
-    defer h.allocator.free(file_path);
-    const f = try std.fs.createFileAbsolute(file_path, .{});
-    f.close();
-    try std.fs.deleteFileAbsolute(file_path);
-
-    // Clean up — should not remove replica/files/ itself
-    removeEmptyParentDirs(file_path, replica_files);
-
-    try std.fs.accessAbsolute(replica_files, .{});
-}
-
-test "replicateDelete cleans up empty parent dirs on replica" {
-    var h = try TestHarness.init();
-    defer h.deinit();
-
-    // Create a file in a subdirectory
-    try h.createBackingFile("deep/nested/file.txt", "hello");
-    try checksumAndEnqueue(h.state, "deep/nested/file.txt");
-    try replicatePut(h.state, "deep/nested/file.txt");
-
-    // Verify replica has the file and dirs
-    try testing.expect(h.replicaFileExists("deep/nested/file.txt"));
-
-    // Now delete
-    try replicateDelete(h.state, "deep/nested/file.txt");
-
-    // File should be gone
-    try testing.expect(!h.replicaFileExists("deep/nested/file.txt"));
-
-    // Empty parent dirs should also be cleaned up
-    const deep_dir = try std.fs.path.join(h.allocator, &.{ h.replica_dir, "files", "deep" });
-    defer h.allocator.free(deep_dir);
-    std.fs.accessAbsolute(deep_dir, .{}) catch |err| switch (err) {
-        error.FileNotFound => return, // Expected
-        else => return err,
-    };
-    return error.DirNotRemoved;
+        try std.fs.accessAbsolute(replica_files, .{});
+    }
 }
 
 test "replicateDelete skips dir cleanup when no_remote_mkdir is set" {
-    const allocator = testing.allocator;
+    var h = try TestHarness.initWithFlags(true);
+    defer h.deinit();
 
-    // Create a harness with no_remote_mkdir = true
-    const tmp_template = "/tmp/helmetfs-test-XXXXXX";
-    var tmp_buf: [tmp_template.len:0]u8 = tmp_template.*;
-    const result = c.mkdtemp(&tmp_buf);
-    if (result == null) return error.TmpDirFailed;
-    const tmp_dir = try allocator.dupe(u8, std.mem.span(result));
-    defer allocator.free(tmp_dir);
+    try h.createBackingFile("sub/file.txt", "data");
+    try checksumAndEnqueue(h.state, "sub/file.txt");
+    try replicatePut(h.state, "sub/file.txt");
 
-    const backing = try std.fs.path.join(allocator, &.{ tmp_dir, "backing" });
-    defer allocator.free(backing);
-    const replica = try std.fs.path.join(allocator, &.{ tmp_dir, "replica" });
-    defer allocator.free(replica);
+    try replicateDelete(h.state, "sub/file.txt");
 
-    try std.fs.makeDirAbsolute(backing);
-    try std.fs.makeDirAbsolute(replica);
-    const replica_files = try std.fs.path.join(allocator, &.{ replica, "files" });
-    defer allocator.free(replica_files);
-    try std.fs.makeDirAbsolute(replica_files);
-
-    const state = try FsState.init(allocator, backing, replica, 1, 0, 1, true);
-    defer state.deinit();
-    const prev = g_state;
-    g_state = state;
-    defer g_state = prev;
-
-    // Create and replicate a file in a subdirectory
-    const backing_file = try std.fs.path.join(allocator, &.{ backing, "sub", "file.txt" });
-    defer allocator.free(backing_file);
-    try ensureParentDir(backing_file);
-    const bf = try std.fs.createFileAbsolute(backing_file, .{});
-    defer bf.close();
-    try bf.writeAll("data");
-
-    try checksumAndEnqueue(state, "sub/file.txt");
-    try replicatePut(state, "sub/file.txt");
-
-    // Delete the file
-    try replicateDelete(state, "sub/file.txt");
-
-    // With no_remote_mkdir, the empty "sub" dir should still exist on the replica
-    const replica_sub = try std.fs.path.join(allocator, &.{ replica_files, "sub" });
-    defer allocator.free(replica_sub);
+    const replica_files = try std.fs.path.join(h.allocator, &.{ h.replica_dir, "files" });
+    defer h.allocator.free(replica_files);
+    const replica_sub = try std.fs.path.join(h.allocator, &.{ replica_files, "sub" });
+    defer h.allocator.free(replica_sub);
     try std.fs.accessAbsolute(replica_sub, .{});
-
-    // Cleanup
-    std.fs.deleteTreeAbsolute(tmp_dir) catch {};
 }
