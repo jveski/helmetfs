@@ -2578,11 +2578,26 @@ test "replicateDelete skips dir cleanup when no_remote_mkdir is set" {
 // ---------------------------------------------------------------------------
 // Fuzz-style concurrency stress tests
 // ---------------------------------------------------------------------------
+// Fuzz tests
+//
+// These are single-threaded by design: Zig 0.15's built-in fuzzer tracks
+// comparison coverage via a non-thread-safe AutoArrayHashMap
+// (Fuzzer.traced_comparisons).  Spawning worker threads from a fuzz test
+// causes concurrent calls to traceValue → traced_comparisons.put(), which
+// races on the hashmap and segfaults.
+//
+// The fuzzer can only vary input bytes, not thread scheduling, so
+// multi-threaded fuzz tests don't add fuzzing value anyway.  Concurrency
+// is already exercised by the regular unit tests above.
+// ---------------------------------------------------------------------------
 
-/// Worker function for PathStateMap fuzz test.  Each byte of `input` selects
-/// an operation and a path from a small pool, exercising every PathStateMap
-/// method under contention from many threads.
-fn fuzzPathStateWorker(psm: *PathStateMap, input: []const u8) void {
+/// Each byte of `input` selects an operation and a path from a small pool,
+/// exercising every PathStateMap method in sequences the fuzzer can explore.
+fn fuzzTestOnePathState(_: void, input: []const u8) anyerror!void {
+    const allocator = testing.allocator;
+    var psm = PathStateMap.init(allocator);
+    defer psm.deinit();
+
     const paths = [_][]const u8{ "a.txt", "b.txt", "c.txt", "d/e.txt" };
 
     for (input) |byte| {
@@ -2601,169 +2616,87 @@ fn fuzzPathStateWorker(psm: *PathStateMap, input: []const u8) void {
     }
 }
 
-fn fuzzTestOnePathState(_: void, input: []const u8) anyerror!void {
-    const allocator = testing.allocator;
-    var psm = PathStateMap.init(allocator);
-    defer psm.deinit();
-
-    const thread_count = 8;
-    var threads: [thread_count]std.Thread = undefined;
-    var started: usize = 0;
-
-    // Give each thread a different slice of the input (or the whole thing if
-    // the input is short) so they hit overlapping paths with varying ops.
-    for (0..thread_count) |i| {
-        const chunk_start = if (input.len > 0) (i * input.len / thread_count) else 0;
-        const chunk_end = if (input.len > 0) ((i + 1) * input.len / thread_count) else 0;
-        const chunk = if (chunk_end > chunk_start) input[chunk_start..chunk_end] else input[0..0];
-        threads[i] = std.Thread.spawn(.{}, fuzzPathStateWorker, .{ &psm, chunk }) catch
-            return error.ThreadSpawnFailed;
-        started += 1;
-    }
-
-    for (threads[0..started]) |t| t.join();
-}
-
-test "fuzz: PathStateMap concurrent access" {
+test "fuzz: PathStateMap operations" {
     try std.testing.fuzz({}, fuzzTestOnePathState, .{
         .corpus = &.{ "abcdefghijklmnopqrstuvwxyz0123456789!@#$%^&*()", "\x00\x04\x08\x0c\x10\x14\x18\x1c\x03\x07\x0b\x0f" },
     });
 }
 
-/// Worker function for ReplLog fuzz test — producer side.  Enqueues entries
-/// whose op and path are derived from fuzz input bytes.
-fn fuzzReplLogProducer(repl_log: *ReplLog, input: []const u8) void {
-    const paths = [_][]const u8{ "p.txt", "q.txt", "r/s.txt" };
-    for (input) |byte| {
-        const op: ReplOp = if (byte & 1 == 0) .put else .delete;
-        const path = paths[byte % paths.len];
-        repl_log.enqueue(op, path) catch continue;
-    }
-}
-
-/// Worker function for ReplLog fuzz test — consumer side.  Dequeues and
-/// marks entries completed until shutdown is signalled.
-fn fuzzReplLogConsumer(repl_log: *ReplLog) void {
-    while (!g_state.shutdown.load(.acquire)) {
-        const work = repl_log.dequeueNext() orelse break;
-        repl_log.markCompleted(work.id);
-    }
-}
-
+/// Each byte drives an enqueue, then immediately dequeue+complete, exercising
+/// the ReplLog's entry coalescing and truncation logic.
 fn fuzzTestOneReplLog(_: void, input: []const u8) anyerror!void {
     var h = try TestHarness.init();
     defer h.deinit();
 
-    // Reset shutdown so consumers will block
-    h.state.shutdown.store(false, .release);
+    const paths = [_][]const u8{ "p.txt", "q.txt", "r/s.txt" };
 
-    const producer_count = 4;
-    const consumer_count = 4;
-    const total = producer_count + consumer_count;
-    var threads: [total]std.Thread = undefined;
-    var started: usize = 0;
-
-    // Spawn consumers first (they will block on the condition variable)
-    for (0..consumer_count) |i| {
-        threads[started] = std.Thread.spawn(.{}, fuzzReplLogConsumer, .{&h.state.repl_log}) catch
-            return error.ThreadSpawnFailed;
-        started += 1;
-        _ = i;
+    // Enqueue a batch of entries driven by fuzz input.
+    for (input) |byte| {
+        const op: ReplOp = if (byte & 1 == 0) .put else .delete;
+        const path = paths[byte % paths.len];
+        h.state.repl_log.enqueue(op, path) catch continue;
     }
 
-    // Spawn producers — split fuzz input among them
-    for (0..producer_count) |i| {
-        const chunk_start = if (input.len > 0) (i * input.len / producer_count) else 0;
-        const chunk_end = if (input.len > 0) ((i + 1) * input.len / producer_count) else 0;
-        const chunk = if (chunk_end > chunk_start) input[chunk_start..chunk_end] else input[0..0];
-        threads[started] = std.Thread.spawn(.{}, fuzzReplLogProducer, .{ &h.state.repl_log, chunk }) catch
-            return error.ThreadSpawnFailed;
-        started += 1;
-    }
-
-    // Wait for producers to finish
-    for (threads[consumer_count..started]) |t| t.join();
-
-    // Signal shutdown and wake consumers so they exit
+    // Drain and complete all entries — exercises dequeueNext coalescing,
+    // markCompleted, and maybeTruncate.
     h.state.shutdown.store(true, .release);
-    {
-        h.state.repl_log.mutex.lock();
-        defer h.state.repl_log.mutex.unlock();
-        h.state.repl_log.cond.broadcast();
+    while (true) {
+        const work = h.state.repl_log.dequeueNext() orelse break;
+        h.state.repl_log.markCompleted(work.id);
     }
-
-    // Wait for consumers
-    for (threads[0..consumer_count]) |t| t.join();
 }
 
-test "fuzz: ReplLog concurrent enqueue/dequeue/complete" {
+test "fuzz: ReplLog enqueue/dequeue/complete" {
     try std.testing.fuzz({}, fuzzTestOneReplLog, .{
         .corpus = &.{ "abcdefghijklmnopqrstuvwxyz", "\x00\x01\x02\x03\x04\x05\x06\x07\x08\x09\x0a\x0b" },
     });
 }
 
-/// Worker for the end-to-end fuzz test.  Each byte drives a file operation
-/// (create + checksum+enqueue, replicate, or scrub) on a small set of paths.
-fn fuzzE2eWorker(state: *FsState, backing_dir: []const u8, input: []const u8) void {
+/// Each byte drives a file operation (create + checksum+enqueue, replicate,
+/// or delete) on a small set of paths, exploring the full replication pipeline
+/// in varied sequences.
+fn fuzzTestOneE2e(_: void, input: []const u8) anyerror!void {
+    var h = try TestHarness.init();
+    defer h.deinit();
+
     const paths = [_][]const u8{ "f1.txt", "f2.txt", "d/f3.txt" };
-    const allocator = state.allocator;
+    const allocator = h.state.allocator;
 
     for (input) |byte| {
         const rel_path = paths[byte % paths.len];
         switch ((byte / 3) % 4) {
             0 => {
                 // Create / overwrite a backing file, mark dirty, checksum+enqueue
-                const full = std.fs.path.join(allocator, &.{ backing_dir, rel_path }) catch continue;
+                const full = std.fs.path.join(allocator, &.{ h.backing_dir, rel_path }) catch continue;
                 defer allocator.free(full);
                 ensureParentDir(full) catch continue;
                 const f = std.fs.createFileAbsolute(full, .{}) catch continue;
-                // Write a few bytes so the checksum is non-trivial
                 f.writeAll("fuzz-data") catch {};
                 f.close();
-                state.path_state.setDirty(rel_path);
-                checksumAndEnqueue(state, rel_path) catch {};
+                h.state.path_state.setDirty(rel_path);
+                checksumAndEnqueue(h.state, rel_path) catch {};
             },
             1 => {
                 // Attempt replicatePut (may legitimately fail if the file
                 // doesn't exist yet — that's fine)
-                replicatePut(state, rel_path) catch {};
+                replicatePut(h.state, rel_path) catch {};
             },
             2 => {
                 // Attempt replicateDelete
-                replicateDelete(state, rel_path) catch {};
+                replicateDelete(h.state, rel_path) catch {};
             },
             3 => {
                 // Probe path-state methods
-                state.path_state.setDirty(rel_path);
-                _ = state.path_state.isDirty(rel_path);
-                state.path_state.clearDirty(rel_path);
+                h.state.path_state.setDirty(rel_path);
+                _ = h.state.path_state.isDirty(rel_path);
+                h.state.path_state.clearDirty(rel_path);
             },
             else => unreachable,
         }
     }
 }
 
-fn fuzzTestOneE2e(_: void, input: []const u8) anyerror!void {
-    var h = try TestHarness.init();
-    defer h.deinit();
-
-    const thread_count = 6;
-    var threads: [thread_count]std.Thread = undefined;
-    var started: usize = 0;
-
-    for (0..thread_count) |i| {
-        const chunk_start = if (input.len > 0) (i * input.len / thread_count) else 0;
-        const chunk_end = if (input.len > 0) ((i + 1) * input.len / thread_count) else 0;
-        const chunk = if (chunk_end > chunk_start) input[chunk_start..chunk_end] else input[0..0];
-        threads[i] = std.Thread.spawn(.{}, fuzzE2eWorker, .{ h.state, h.backing_dir, chunk }) catch
-            return error.ThreadSpawnFailed;
-        started += 1;
-    }
-
-    for (threads[0..started]) |t| t.join();
-}
-
-test "fuzz: end-to-end concurrent file operations" {
+test "fuzz: end-to-end file operations" {
     try std.testing.fuzz({}, fuzzTestOneE2e, .{
         .corpus = &.{ "abcdefghijklmnopqrstuvwxyz0123456789", "\x00\x03\x06\x09\x01\x04\x07\x0a\x02\x05\x08\x0b" },
     });
