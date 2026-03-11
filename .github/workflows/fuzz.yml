@@ -26,7 +26,34 @@ jobs:
 
       - name: Run fuzz tests (5 minutes)
         run: |
-          # Run the fuzzer for 5 minutes.  The fuzzer runs indefinitely, so
-          # we use `timeout` to cap the duration.  Exit code 124 means the
-          # timeout expired (success — no crash found).
-          timeout 300 zig build fuzz --fuzz || test $? -eq 124
+          # Run the fuzzer for 5 minutes, capturing output for crash detection.
+          # Disable errexit so the non-zero exit from `timeout` doesn't abort
+          # the script — we inspect the exit code explicitly below.
+          set +e
+          timeout 300 zig build fuzz --fuzz 2>&1 | tee /tmp/fuzz-output.log
+          FUZZ_EXIT=${PIPESTATUS[0]}
+          set -e
+
+          # A non-zero, non-124 exit means the build itself crashed.
+          if [ "$FUZZ_EXIT" -ne 0 ] && [ "$FUZZ_EXIT" -ne 124 ]; then
+            echo "::error::Fuzz tests crashed (exit code: $FUZZ_EXIT)"
+            exit 1
+          fi
+
+          # When the Zig fuzzer discovers a crash it prints error diagnostics
+          # immediately but does NOT exit — the build runner keeps running so
+          # `timeout` eventually kills it with exit code 124.  Scan the
+          # captured output for the error messages that the build runner emits
+          # on test-process crashes.
+          #
+          # In Zig 0.15.x, handleChildProcessTerm (lib/std/Build/Step.zig)
+          # formats these as:
+          #   "error: the following command terminated unexpectedly:\n..."
+          #   "error: the following command exited with error code N:\n..."
+          if grep -aq "error: the following command" /tmp/fuzz-output.log; then
+            echo "::error::Fuzz test failures were found during the run:"
+            grep -a "error:" /tmp/fuzz-output.log
+            exit 1
+          fi
+
+          echo "Fuzz tests ran for the full duration without finding crashes"
