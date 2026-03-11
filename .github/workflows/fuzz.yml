@@ -29,4 +29,4 @@ jobs:
           # Run the fuzzer for 5 minutes.  The fuzzer runs indefinitely, so
           # we use `timeout` to cap the duration.  Exit code 124 means the
           # timeout expired (success — no crash found).
-          timeout 300 zig build test --fuzz || test $? -eq 124
+          timeout 300 zig build fuzz --fuzz || test $? -eq 124
