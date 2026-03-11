@@ -1,0 +1,32 @@
+name: Fuzz Tests
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  fuzz:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install system dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libfuse3-dev
+
+      - name: Install Zig
+        uses: mlugg/setup-zig@v2
+        with:
+          version: 0.15.2
+
+      - name: Run fuzz tests (5 minutes)
+        run: |
+          # Run the fuzzer for 5 minutes.  The fuzzer runs indefinitely, so
+          # we use `timeout` to cap the duration.  Exit code 124 means the
+          # timeout expired (success — no crash found).
+          timeout 300 zig build test --fuzz || test $? -eq 124
