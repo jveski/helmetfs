@@ -30,6 +30,21 @@ pub fn build(b: *std.Build) void {
     const run_unit_tests = b.addRunArtifact(unit_tests);
     const test_step = b.step("test", "Run unit and integration tests");
     test_step.dependOn(&run_unit_tests.step);
+
+    // Fuzz tests — must use the LLVM backend so that sanitizer-coverage
+    // instrumentation (__sancov_pcs1 / __sancov_cntrs) is emitted.  The
+    // self-hosted x86 backend does not provide these sections, which causes
+    // the build-runner's fuzz infrastructure to crash (ziglang/zig#23423).
+    // ReleaseSafe also gives much better fuzzing throughput.
+    const fuzz_tests = b.addTest(.{
+        .root_module = createModule(b, target, .ReleaseSafe),
+        .filters = &.{"fuzz:"},
+        .use_llvm = true,
+    });
+
+    const run_fuzz_tests = b.addRunArtifact(fuzz_tests);
+    const fuzz_step = b.step("fuzz", "Run fuzz tests (use with --fuzz)");
+    fuzz_step.dependOn(&run_fuzz_tests.step);
 }
 
 fn createModule(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.builtin.OptimizeMode) *std.Build.Module {
