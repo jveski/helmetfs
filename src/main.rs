@@ -1,9 +1,9 @@
 //! CLI entry point: `helmetfs mount` and `helmetfs unmount`.
 
-use helmetfs::{fuse_ops, fuse_sys, replication, scrub, state};
+use helmetfs::{fuse_ops, replication, scrub, state};
 
 use clap::{Parser, Subcommand};
-use std::ffi::CString;
+use fuser::MountOption;
 use std::path::PathBuf;
 use std::process;
 use std::sync::atomic::Ordering;
@@ -137,84 +137,31 @@ fn cmd_mount(
         .spawn(move || scrub::scrub_thread(&scrub_state))
         .unwrap();
 
-    // Build FUSE args: program name + mount options
-    let prog = CString::new("helmetfs").unwrap();
-    let opt_nonempty = CString::new("-odefault_permissions").unwrap();
+    // Build FUSE filesystem
+    let helmet_fs = fuse_ops::HelmetFs::new(fs_state.clone());
 
-    let mut c_argv: Vec<*mut libc::c_char> = vec![
-        prog.as_ptr() as *mut _,
-        opt_nonempty.as_ptr() as *mut _,
+    // Mount options
+    let options = vec![
+        MountOption::DefaultPermissions,
+        MountOption::FSName("helmetfs".to_string()),
+        MountOption::AutoUnmount,
     ];
-
-    let mut fuse_args = fuse_sys::fuse_args {
-        argc: c_argv.len() as libc::c_int,
-        argv: c_argv.as_mut_ptr(),
-        allocated: 0,
-    };
-
-    // Create FUSE handle
-    let fuse = unsafe {
-        fuse_sys::fuse_new(
-            &mut fuse_args,
-            &fuse_ops::FUSE_OPS,
-            std::mem::size_of::<fuse_sys::fuse_operations>(),
-            std::ptr::null_mut(),
-        )
-    };
-    if fuse.is_null() {
-        eprintln!("fuse_new failed");
-        process::exit(3);
-    }
-
-    // Mount
-    let c_mountpoint = CString::new(mountpoint_path.as_os_str().as_encoded_bytes()).unwrap();
-    let ret = unsafe { fuse_sys::fuse_mount(fuse, c_mountpoint.as_ptr()) };
-    if ret != 0 {
-        eprintln!("fuse_mount failed");
-        unsafe { fuse_sys::fuse_destroy(fuse) };
-        process::exit(4);
-    }
-
-    // Set up signal handlers
-    let se = unsafe { fuse_sys::fuse_get_session(fuse) };
-    if unsafe { fuse_sys::fuse_set_signal_handlers(se) } != 0 {
-        eprintln!("Failed to set signal handlers");
-        unsafe {
-            fuse_sys::fuse_unmount(fuse);
-            fuse_sys::fuse_destroy(fuse);
-        }
-        process::exit(6);
-    }
-
-    // Create loop config
-    let loop_cfg = unsafe { fuse_sys::fuse_loop_cfg_create() };
-    if !loop_cfg.is_null() {
-        unsafe {
-            fuse_sys::fuse_loop_cfg_set_idle_threads(loop_cfg, 10);
-            fuse_sys::fuse_loop_cfg_set_clone_fd(loop_cfg, 0);
-        }
-    }
 
     log::info!("FUSE loop starting");
 
-    // Run the multi-threaded FUSE event loop (blocks until unmount/signal)
-    let loop_ret = unsafe { fuse_sys::fuse_loop_mt(fuse, loop_cfg) };
+    // Run the FUSE session (blocks until unmount/signal).
+    // fuser::mount2 handles multi-threading, signal handlers, and cleanup
+    // internally.
+    if let Err(e) = fuser::mount2(helmet_fs, &mountpoint_path, &options) {
+        eprintln!("FUSE mount failed: {}", e);
+        process::exit(3);
+    }
 
-    log::info!("FUSE loop exited with code {}", loop_ret);
+    log::info!("FUSE loop exited");
 
     // Shutdown: signal workers and scrub to stop
     fs_state.shutting_down.store(true, Ordering::Relaxed);
     fs_state.repl_log.notify_all();
-
-    // Clean up FUSE
-    unsafe {
-        fuse_sys::fuse_remove_signal_handlers(se);
-        fuse_sys::fuse_unmount(fuse);
-        fuse_sys::fuse_destroy(fuse);
-        if !loop_cfg.is_null() {
-            fuse_sys::fuse_loop_cfg_destroy(loop_cfg);
-        }
-    }
 
     // Wait for workers
     for handle in worker_handles {

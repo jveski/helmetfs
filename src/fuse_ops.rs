@@ -1,29 +1,41 @@
-//! FUSE operation callbacks and the `fuse_operations` constant.
+//! FUSE operation callbacks implemented via the `fuser` crate's `Filesystem`
+//! trait.
 //!
-//! Each callback is an `unsafe extern "C"` function that translates between the
-//! C FUSE interface and Rust.  State is accessed via `state::get_state()`.
+//! `HelmetFs` is a passthrough filesystem that maps FUSE inode numbers to
+//! paths in a backing directory.  An inode-to-path table is maintained so that
+//! the low-level (inode-based) `fuser` API can be bridged to the path-based
+//! operations on the backing store.
 //!
-//! File handle encoding (same as Zig):
+//! File handle encoding:
 //!   bit 63       = write flag (1 = opened for writing)
 //!   bits 0..62   = file descriptor
 
-use std::ffi::{CStr, CString};
+use std::collections::HashMap;
+use std::ffi::{CString, OsStr, OsString};
 use std::os::unix::ffi::OsStrExt;
+use std::path::Path;
+use std::sync::{Arc, RwLock};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use libc::{
-    c_char, c_int, c_uint, c_void, mode_t, off_t, size_t, EACCES, ENOENT,
-    ENOTSUP, O_APPEND, O_CREAT, O_RDWR, O_WRONLY,
+use fuser::{
+    FileAttr, FileType, Filesystem, INodeNo, MountOption, ReplyAttr, ReplyCreate, ReplyData,
+    ReplyDirectory, ReplyEmpty, ReplyEntry, ReplyOpen, ReplyStatfs, ReplyWrite, ReplyXattr,
+    Request,
 };
 
-use crate::fuse_sys;
 use crate::helpers;
 use crate::state::{self, checksum_and_enqueue, FsState};
 
 // ---------------------------------------------------------------------------
-// File handle helpers
+// Constants
 // ---------------------------------------------------------------------------
 
+const TTL: Duration = Duration::from_secs(1);
 const WRITE_FLAG: u64 = 1 << 63;
+
+// ---------------------------------------------------------------------------
+// File handle helpers
+// ---------------------------------------------------------------------------
 
 fn encode_fh(fd: i32, writing: bool) -> u64 {
     let fh = fd as u64 & 0x7FFF_FFFF_FFFF_FFFF;
@@ -43,694 +55,1221 @@ fn is_write_fh(fh: u64) -> bool {
 }
 
 // ---------------------------------------------------------------------------
-// Helpers
+// Inode table
 // ---------------------------------------------------------------------------
 
-fn get_state() -> &'static FsState {
-    state::get_state()
+/// Bidirectional mapping between inode numbers and relative paths.
+///
+/// For a passthrough filesystem we use the real inode numbers from the
+/// backing filesystem.  `lookup` populates the map; `forget` could be used
+/// to clean it up (we keep entries indefinitely since they are cheap).
+struct InodeTable {
+    /// inode -> relative path (empty string = root)
+    ino_to_path: HashMap<u64, String>,
+    /// relative path -> inode
+    path_to_ino: HashMap<String, u64>,
 }
 
-/// Convert a C FUSE path to a relative path string.
-unsafe fn c_path_to_rel(path: *const c_char) -> String {
-    let cstr = CStr::from_ptr(path);
-    let s = cstr.to_str().unwrap_or("");
-    helpers::fuse_path_to_rel(s).to_string()
+impl InodeTable {
+    fn new() -> Self {
+        Self {
+            ino_to_path: HashMap::new(),
+            path_to_ino: HashMap::new(),
+        }
+    }
+
+    fn insert(&mut self, ino: u64, rel: String) {
+        self.ino_to_path.insert(ino, rel.clone());
+        self.path_to_ino.insert(rel, ino);
+    }
+
+    fn get_path(&self, ino: u64) -> Option<&str> {
+        self.ino_to_path.get(&ino).map(|s| s.as_str())
+    }
+
+    fn get_ino(&self, rel: &str) -> Option<u64> {
+        self.path_to_ino.get(rel).copied()
+    }
+
+    fn remove_path(&mut self, rel: &str) {
+        if let Some(ino) = self.path_to_ino.remove(rel) {
+            self.ino_to_path.remove(&ino);
+        }
+    }
+
+    fn rename(&mut self, from: &str, to: &str) {
+        if let Some(ino) = self.path_to_ino.remove(from) {
+            self.ino_to_path.insert(ino, to.to_string());
+            self.path_to_ino.insert(to.to_string(), ino);
+        }
+    }
 }
 
-/// Convert a relative path to the absolute backing path as a CString.
+// ---------------------------------------------------------------------------
+// stat helpers
+// ---------------------------------------------------------------------------
+
+fn filetype_from_mode(mode: u32) -> FileType {
+    let fmt = mode & libc::S_IFMT;
+    match fmt {
+        libc::S_IFDIR => FileType::Directory,
+        libc::S_IFREG => FileType::RegularFile,
+        libc::S_IFLNK => FileType::Symlink,
+        libc::S_IFBLK => FileType::BlockDevice,
+        libc::S_IFCHR => FileType::CharDevice,
+        libc::S_IFIFO => FileType::NamedPipe,
+        libc::S_IFSOCK => FileType::Socket,
+        _ => FileType::RegularFile,
+    }
+}
+
+fn system_time_from_ts(sec: i64, nsec: i64) -> SystemTime {
+    if sec >= 0 {
+        UNIX_EPOCH + Duration::new(sec as u64, nsec as u32)
+    } else {
+        UNIX_EPOCH - Duration::new((-sec) as u64, nsec as u32)
+    }
+}
+
+fn stat_to_file_attr(st: &libc::stat) -> FileAttr {
+    FileAttr {
+        ino: INodeNo(st.st_ino),
+        size: st.st_size as u64,
+        blocks: st.st_blocks as u64,
+        atime: system_time_from_ts(st.st_atime, st.st_atime_nsec),
+        mtime: system_time_from_ts(st.st_mtime, st.st_mtime_nsec),
+        ctime: system_time_from_ts(st.st_ctime, st.st_ctime_nsec),
+        crtime: UNIX_EPOCH,
+        kind: filetype_from_mode(st.st_mode),
+        perm: (st.st_mode & 0o7777) as u16,
+        nlink: st.st_nlink as u32,
+        uid: st.st_uid,
+        gid: st.st_gid,
+        rdev: st.st_rdev as u32,
+        blksize: st.st_blksize as u32,
+        flags: 0,
+    }
+}
+
+/// lstat a backing-directory path, returning the raw libc::stat.
+fn lstat_backing(state: &FsState, rel: &str) -> Result<libc::stat, libc::c_int> {
+    let abs = state.backing_path(rel);
+    let c_path =
+        CString::new(abs.as_os_str().as_bytes()).map_err(|_| libc::EINVAL)?;
+    unsafe {
+        let mut st: libc::stat = std::mem::zeroed();
+        if libc::lstat(c_path.as_ptr(), &mut st) == -1 {
+            Err(*libc::__errno_location())
+        } else {
+            Ok(st)
+        }
+    }
+}
+
+/// Like lstat_backing but uses fstat on a file descriptor.
+fn fstat_fd(fd: i32) -> Result<libc::stat, libc::c_int> {
+    unsafe {
+        let mut st: libc::stat = std::mem::zeroed();
+        if libc::fstat(fd, &mut st) == -1 {
+            Err(*libc::__errno_location())
+        } else {
+            Ok(st)
+        }
+    }
+}
+
+fn neg_errno() -> libc::c_int {
+    unsafe { *libc::__errno_location() }
+}
+
+/// Build a CString from a backing-directory relative path.
 fn backing_cpath(state: &FsState, rel: &str) -> CString {
     let abs = state.backing_path(rel);
     CString::new(abs.as_os_str().as_bytes()).unwrap_or_default()
 }
 
-fn neg_errno() -> c_int {
-    -unsafe { *libc::__errno_location() }
+// ---------------------------------------------------------------------------
+// HelmetFs
+// ---------------------------------------------------------------------------
+
+/// The main FUSE filesystem struct.
+pub struct HelmetFs {
+    state: Arc<FsState>,
+    inodes: RwLock<InodeTable>,
+}
+
+impl HelmetFs {
+    pub fn new(state: Arc<FsState>) -> Self {
+        let mut table = InodeTable::new();
+        // Seed root inode by statting the backing directory.
+        let c_path =
+            CString::new(state.backing_dir.as_os_str().as_bytes()).unwrap();
+        let root_ino = unsafe {
+            let mut st: libc::stat = std::mem::zeroed();
+            if libc::lstat(c_path.as_ptr(), &mut st) == 0 {
+                st.st_ino
+            } else {
+                1 // fallback
+            }
+        };
+        table.insert(root_ino, String::new());
+        Self {
+            state,
+            inodes: RwLock::new(table),
+        }
+    }
+
+    /// Resolve an inode to a relative path.  Returns None if unknown.
+    fn inode_path(&self, ino: INodeNo) -> Option<String> {
+        let table = self.inodes.read().unwrap();
+        table.get_path(ino.0).map(|s| s.to_string())
+    }
+
+    /// Register (or update) an inode <-> path mapping.
+    fn register_inode(&self, ino: u64, rel: String) {
+        let mut table = self.inodes.write().unwrap();
+        table.insert(ino, rel);
+    }
+
+    /// Build the child relative path from parent inode + child name.
+    fn child_rel(&self, parent: INodeNo, name: &OsStr) -> Option<String> {
+        let parent_rel = self.inode_path(parent)?;
+        let name_str = name.to_string_lossy();
+        if parent_rel.is_empty() {
+            Some(name_str.to_string())
+        } else {
+            Some(format!("{}/{}", parent_rel, name_str))
+        }
+    }
+
+    /// Perform a lookup: stat the file, register the inode, return FileAttr.
+    fn do_lookup(&self, parent: INodeNo, name: &OsStr) -> Result<FileAttr, libc::c_int> {
+        let rel = self.child_rel(parent, name).ok_or(libc::ENOENT)?;
+
+        if helpers::is_hidden_path(&rel, &self.state.backing_dir) {
+            return Err(libc::ENOENT);
+        }
+
+        let st = lstat_backing(&self.state, &rel)?;
+        let attr = stat_to_file_attr(&st);
+        self.register_inode(st.st_ino, rel);
+        Ok(attr)
+    }
 }
 
 // ---------------------------------------------------------------------------
-// FUSE callbacks
+// Filesystem trait implementation
 // ---------------------------------------------------------------------------
 
-unsafe extern "C" fn op_getattr(
-    path: *const c_char,
-    stbuf: *mut libc::stat,
-    _fi: *mut fuse_sys::fuse_file_info,
-) -> c_int {
-    let rel = c_path_to_rel(path);
-    let st = get_state();
+impl Filesystem for HelmetFs {
+    // -- init / destroy -----------------------------------------------------
 
-    if helpers::is_hidden_path(&rel, &st.backing_dir) {
-        return -ENOENT;
+    fn init(
+        &mut self,
+        _req: &Request,
+        _config: &mut fuser::KernelConfig,
+    ) -> Result<(), libc::c_int> {
+        Ok(())
     }
 
-    let abs = backing_cpath(st, &rel);
-    if libc::lstat(abs.as_ptr(), stbuf) == -1 {
-        return neg_errno();
-    }
-    0
-}
+    fn destroy(&mut self) {}
 
-unsafe extern "C" fn op_readlink(
-    path: *const c_char,
-    buf: *mut c_char,
-    size: size_t,
-) -> c_int {
-    let rel = c_path_to_rel(path);
-    let st = get_state();
-    let abs = backing_cpath(st, &rel);
-    let ret = libc::readlink(abs.as_ptr(), buf, size - 1);
-    if ret == -1 {
-        return neg_errno();
-    }
-    *buf.add(ret as usize) = 0; // null terminate
-    0
-}
+    // -- lookup --------------------------------------------------------------
 
-unsafe extern "C" fn op_mknod(
-    path: *const c_char,
-    mode: mode_t,
-    rdev: libc::dev_t,
-) -> c_int {
-    let rel = c_path_to_rel(path);
-    let st = get_state();
-    if helpers::is_hidden_path(&rel, &st.backing_dir) {
-        return -EACCES;
-    }
-    let abs = backing_cpath(st, &rel);
-    if libc::mknod(abs.as_ptr(), mode, rdev) == -1 {
-        return neg_errno();
-    }
-    0
-}
-
-unsafe extern "C" fn op_mkdir(path: *const c_char, mode: mode_t) -> c_int {
-    let rel = c_path_to_rel(path);
-    let st = get_state();
-    if helpers::is_hidden_path(&rel, &st.backing_dir) {
-        return -EACCES;
-    }
-    let abs = backing_cpath(st, &rel);
-    if libc::mkdir(abs.as_ptr(), mode) == -1 {
-        return neg_errno();
-    }
-    0
-}
-
-unsafe extern "C" fn op_unlink(path: *const c_char) -> c_int {
-    let rel = c_path_to_rel(path);
-    let st = get_state();
-
-    if helpers::is_hidden_path(&rel, &st.backing_dir) {
-        return -ENOENT;
-    }
-
-    let abs = backing_cpath(st, &rel);
-    if libc::unlink(abs.as_ptr()) == -1 {
-        return neg_errno();
-    }
-
-    // Remove .sum sidecar
-    let sum = helpers::sum_path_for(&st.backing_path(&rel));
-    let _ = std::fs::remove_file(&sum);
-
-    // Clean up path state
-    st.remove_path_state(&rel);
-
-    // Enqueue delete to replica
-    st.repl_log.enqueue_delete(&rel);
-
-    0
-}
-
-unsafe extern "C" fn op_rmdir(path: *const c_char) -> c_int {
-    let rel = c_path_to_rel(path);
-    let st = get_state();
-    let abs = backing_cpath(st, &rel);
-    if libc::rmdir(abs.as_ptr()) == -1 {
-        return neg_errno();
-    }
-    0
-}
-
-unsafe extern "C" fn op_symlink(
-    target: *const c_char,
-    linkpath: *const c_char,
-) -> c_int {
-    let rel = c_path_to_rel(linkpath);
-    let st = get_state();
-
-    if helpers::is_hidden_path(&rel, &st.backing_dir) {
-        return -EACCES;
-    }
-
-    let abs = backing_cpath(st, &rel);
-    if libc::symlink(target, abs.as_ptr()) == -1 {
-        return neg_errno();
-    }
-
-    // Enqueue symlink for replication (as a put — the replication worker
-    // handles symlinks specially).
-    st.repl_log.enqueue_put(&rel);
-
-    0
-}
-
-unsafe extern "C" fn op_rename(
-    from: *const c_char,
-    to: *const c_char,
-    _flags: c_uint,
-) -> c_int {
-    let rel_from = c_path_to_rel(from);
-    let rel_to = c_path_to_rel(to);
-    let st = get_state();
-
-    let abs_from = backing_cpath(st, &rel_from);
-    let abs_to = backing_cpath(st, &rel_to);
-
-    if libc::rename(abs_from.as_ptr(), abs_to.as_ptr()) == -1 {
-        return neg_errno();
-    }
-
-    // Move .sum sidecar if it exists
-    let sum_from = helpers::sum_path_for(&st.backing_path(&rel_from));
-    let sum_to = helpers::sum_path_for(&st.backing_path(&rel_to));
-    if sum_from.exists() {
-        let _ = std::fs::rename(&sum_from, &sum_to);
-    }
-
-    // Transfer path state
-    {
-        let mut map = st.path_state.write().unwrap();
-        if let Some(info) = map.remove(&rel_from) {
-            map.insert(rel_to.clone(), info);
+    fn lookup(&self, _req: &Request, parent: INodeNo, name: &OsStr, reply: ReplyEntry) {
+        match self.do_lookup(parent, name) {
+            Ok(attr) => reply.entry(&TTL, &attr, 0),
+            Err(e) => reply.error(e),
         }
     }
 
-    // Enqueue delete for old path, put for new path
-    st.repl_log.enqueue_delete(&rel_from);
+    // -- getattr / setattr ---------------------------------------------------
 
-    // If the renamed file has a .sum, enqueue put directly.
-    // Otherwise, checksum and enqueue.
-    if sum_to.exists() {
-        st.repl_log.enqueue_put(&rel_to);
-    } else {
-        // Regular file without .sum — compute checksum first
-        let backing_to = st.backing_path(&rel_to);
-        if backing_to.is_file() {
-            checksum_and_enqueue(st, &rel_to);
+    fn getattr(&self, _req: &Request, ino: INodeNo, fh: Option<fuser::FileHandle>, reply: ReplyAttr) {
+        // If we have an open file handle, use fstat
+        if let Some(fh) = fh {
+            let fd = decode_fd(u64::from(fh));
+            match fstat_fd(fd) {
+                Ok(st) => {
+                    reply.attr(&TTL, &stat_to_file_attr(&st));
+                    return;
+                }
+                Err(e) => {
+                    reply.error(e);
+                    return;
+                }
+            }
+        }
+
+        let rel = match self.inode_path(ino) {
+            Some(r) => r,
+            None => {
+                reply.error(libc::ENOENT);
+                return;
+            }
+        };
+
+        if helpers::is_hidden_path(&rel, &self.state.backing_dir) {
+            reply.error(libc::ENOENT);
+            return;
+        }
+
+        match lstat_backing(&self.state, &rel) {
+            Ok(st) => reply.attr(&TTL, &stat_to_file_attr(&st)),
+            Err(e) => reply.error(e),
         }
     }
 
-    0
-}
+    fn setattr(
+        &self,
+        _req: &Request,
+        ino: INodeNo,
+        mode: Option<u32>,
+        uid: Option<u32>,
+        gid: Option<u32>,
+        size: Option<u64>,
+        atime: Option<fuser::TimeOrNow>,
+        mtime: Option<fuser::TimeOrNow>,
+        _ctime: Option<SystemTime>,
+        fh: Option<fuser::FileHandle>,
+        _crtime: Option<SystemTime>,
+        _chgtime: Option<SystemTime>,
+        _bkuptime: Option<SystemTime>,
+        _flags: Option<fuser::BsdFileFlags>,
+        reply: ReplyAttr,
+    ) {
+        let rel = match self.inode_path(ino) {
+            Some(r) => r,
+            None => {
+                reply.error(libc::ENOENT);
+                return;
+            }
+        };
 
-unsafe extern "C" fn op_link(
-    _from: *const c_char,
-    _to: *const c_char,
-) -> c_int {
-    -ENOTSUP
-}
+        let fd = fh.map(|h| decode_fd(u64::from(h)));
+        let abs = backing_cpath(&self.state, &rel);
 
-unsafe extern "C" fn op_chmod(
-    path: *const c_char,
-    mode: mode_t,
-    fi: *mut fuse_sys::fuse_file_info,
-) -> c_int {
-    let rel = c_path_to_rel(path);
-    let st = get_state();
-
-    if !fi.is_null() {
-        let fd = decode_fd((*fi).fh);
-        if libc::fchmod(fd, mode) == -1 {
-            return neg_errno();
+        // chmod
+        if let Some(mode) = mode {
+            let ret = if let Some(fd) = fd {
+                unsafe { libc::fchmod(fd, mode) }
+            } else {
+                unsafe { libc::chmod(abs.as_ptr(), mode) }
+            };
+            if ret == -1 {
+                reply.error(neg_errno());
+                return;
+            }
+            // chmod triggers re-replication
+            let backing = self.state.backing_path(&rel);
+            if backing.is_file() {
+                self.state.mark_dirty(&rel);
+                state::checksum_if_idle(&self.state, &rel);
+            }
         }
-    } else {
-        let abs = backing_cpath(st, &rel);
-        if libc::chmod(abs.as_ptr(), mode) == -1 {
-            return neg_errno();
+
+        // chown
+        if uid.is_some() || gid.is_some() {
+            let u = uid.unwrap_or(u32::MAX);
+            let g = gid.unwrap_or(u32::MAX);
+            let ret = if let Some(fd) = fd {
+                unsafe { libc::fchown(fd, u, g) }
+            } else {
+                unsafe { libc::lchown(abs.as_ptr(), u, g) }
+            };
+            if ret == -1 {
+                reply.error(neg_errno());
+                return;
+            }
+        }
+
+        // truncate
+        if let Some(size) = size {
+            let ret = if let Some(fd) = fd {
+                unsafe { libc::ftruncate(fd, size as libc::off_t) }
+            } else {
+                unsafe { libc::truncate(abs.as_ptr(), size as libc::off_t) }
+            };
+            if ret == -1 {
+                reply.error(neg_errno());
+                return;
+            }
+            self.state.mark_dirty(&rel);
+            state::checksum_if_idle(&self.state, &rel);
+        }
+
+        // utimens
+        if atime.is_some() || mtime.is_some() {
+            let to_timespec = |t: Option<fuser::TimeOrNow>| -> libc::timespec {
+                match t {
+                    Some(fuser::TimeOrNow::SpecificTime(st)) => {
+                        let d = st.duration_since(UNIX_EPOCH).unwrap_or_default();
+                        libc::timespec {
+                            tv_sec: d.as_secs() as libc::time_t,
+                            tv_nsec: d.subsec_nanos() as libc::c_long,
+                        }
+                    }
+                    Some(fuser::TimeOrNow::Now) => libc::timespec {
+                        tv_sec: 0,
+                        tv_nsec: libc::UTIME_NOW,
+                    },
+                    None => libc::timespec {
+                        tv_sec: 0,
+                        tv_nsec: libc::UTIME_OMIT,
+                    },
+                }
+            };
+            let times = [to_timespec(atime), to_timespec(mtime)];
+            let ret = if let Some(fd) = fd {
+                unsafe { libc::futimens(fd, times.as_ptr()) }
+            } else {
+                unsafe {
+                    libc::utimensat(
+                        libc::AT_FDCWD,
+                        abs.as_ptr(),
+                        times.as_ptr(),
+                        libc::AT_SYMLINK_NOFOLLOW,
+                    )
+                }
+            };
+            if ret == -1 {
+                reply.error(neg_errno());
+                return;
+            }
+        }
+
+        // Return updated attrs
+        match lstat_backing(&self.state, &rel) {
+            Ok(st) => reply.attr(&TTL, &stat_to_file_attr(&st)),
+            Err(e) => reply.error(e),
         }
     }
 
-    // chmod triggers re-replication (permissions changed)
-    let backing = st.backing_path(&rel);
-    if backing.is_file() {
-        st.mark_dirty(&rel);
-        state::checksum_if_idle(st, &rel);
-    }
+    // -- readlink ------------------------------------------------------------
 
-    0
-}
+    fn readlink(&self, _req: &Request, ino: INodeNo, reply: ReplyData) {
+        let rel = match self.inode_path(ino) {
+            Some(r) => r,
+            None => {
+                reply.error(libc::ENOENT);
+                return;
+            }
+        };
 
-unsafe extern "C" fn op_chown(
-    path: *const c_char,
-    uid: libc::uid_t,
-    gid: libc::gid_t,
-    fi: *mut fuse_sys::fuse_file_info,
-) -> c_int {
-    let rel = c_path_to_rel(path);
-    let st = get_state();
-
-    if !fi.is_null() {
-        let fd = decode_fd((*fi).fh);
-        if libc::fchown(fd, uid, gid) == -1 {
-            return neg_errno();
-        }
-    } else {
-        let abs = backing_cpath(st, &rel);
-        if libc::lchown(abs.as_ptr(), uid, gid) == -1 {
-            return neg_errno();
-        }
-    }
-    0
-}
-
-unsafe extern "C" fn op_truncate(
-    path: *const c_char,
-    size: off_t,
-    fi: *mut fuse_sys::fuse_file_info,
-) -> c_int {
-    let rel = c_path_to_rel(path);
-    let st = get_state();
-
-    if !fi.is_null() {
-        let fd = decode_fd((*fi).fh);
-        if libc::ftruncate(fd, size) == -1 {
-            return neg_errno();
-        }
-    } else {
-        let abs = backing_cpath(st, &rel);
-        if libc::truncate(abs.as_ptr(), size) == -1 {
-            return neg_errno();
+        let abs = backing_cpath(&self.state, &rel);
+        let mut buf = vec![0u8; libc::PATH_MAX as usize];
+        let len =
+            unsafe { libc::readlink(abs.as_ptr(), buf.as_mut_ptr() as *mut _, buf.len()) };
+        if len == -1 {
+            reply.error(neg_errno());
+        } else {
+            reply.data(&buf[..len as usize]);
         }
     }
 
-    st.mark_dirty(&rel);
-    state::checksum_if_idle(st, &rel);
+    // -- mknod ---------------------------------------------------------------
 
-    0
-}
-
-unsafe extern "C" fn op_open(
-    path: *const c_char,
-    fi: *mut fuse_sys::fuse_file_info,
-) -> c_int {
-    let rel = c_path_to_rel(path);
-    let st = get_state();
-
-    if helpers::is_hidden_path(&rel, &st.backing_dir) {
-        return -ENOENT;
+    fn mknod(
+        &self,
+        _req: &Request,
+        parent: INodeNo,
+        name: &OsStr,
+        mode: u32,
+        _umask: u32,
+        rdev: u32,
+        reply: ReplyEntry,
+    ) {
+        let rel = match self.child_rel(parent, name) {
+            Some(r) => r,
+            None => {
+                reply.error(libc::ENOENT);
+                return;
+            }
+        };
+        if helpers::is_hidden_path(&rel, &self.state.backing_dir) {
+            reply.error(libc::EACCES);
+            return;
+        }
+        let abs = backing_cpath(&self.state, &rel);
+        if unsafe { libc::mknod(abs.as_ptr(), mode, rdev as libc::dev_t) } == -1 {
+            reply.error(neg_errno());
+            return;
+        }
+        match lstat_backing(&self.state, &rel) {
+            Ok(st) => {
+                let attr = stat_to_file_attr(&st);
+                self.register_inode(st.st_ino, rel);
+                reply.entry(&TTL, &attr, 0);
+            }
+            Err(e) => reply.error(e),
+        }
     }
 
-    let abs = backing_cpath(st, &rel);
-    let flags = (*fi).flags;
-    let fd = libc::open(abs.as_ptr(), flags);
-    if fd == -1 {
-        return neg_errno();
+    // -- mkdir ---------------------------------------------------------------
+
+    fn mkdir(
+        &self,
+        _req: &Request,
+        parent: INodeNo,
+        name: &OsStr,
+        mode: u32,
+        _umask: u32,
+        reply: ReplyEntry,
+    ) {
+        let rel = match self.child_rel(parent, name) {
+            Some(r) => r,
+            None => {
+                reply.error(libc::ENOENT);
+                return;
+            }
+        };
+        if helpers::is_hidden_path(&rel, &self.state.backing_dir) {
+            reply.error(libc::EACCES);
+            return;
+        }
+        let abs = backing_cpath(&self.state, &rel);
+        if unsafe { libc::mkdir(abs.as_ptr(), mode) } == -1 {
+            reply.error(neg_errno());
+            return;
+        }
+        match lstat_backing(&self.state, &rel) {
+            Ok(st) => {
+                let attr = stat_to_file_attr(&st);
+                self.register_inode(st.st_ino, rel);
+                reply.entry(&TTL, &attr, 0);
+            }
+            Err(e) => reply.error(e),
+        }
     }
 
-    let acc_mode = flags & libc::O_ACCMODE;
-    let writing = acc_mode == O_WRONLY || acc_mode == O_RDWR || (flags & O_APPEND) != 0;
+    // -- unlink --------------------------------------------------------------
 
-    if writing {
-        st.inc_write_ref(&rel);
+    fn unlink(&self, _req: &Request, parent: INodeNo, name: &OsStr, reply: ReplyEmpty) {
+        let rel = match self.child_rel(parent, name) {
+            Some(r) => r,
+            None => {
+                reply.error(libc::ENOENT);
+                return;
+            }
+        };
+        if helpers::is_hidden_path(&rel, &self.state.backing_dir) {
+            reply.error(libc::ENOENT);
+            return;
+        }
+
+        let abs = backing_cpath(&self.state, &rel);
+        if unsafe { libc::unlink(abs.as_ptr()) } == -1 {
+            reply.error(neg_errno());
+            return;
+        }
+
+        // Remove .sum sidecar
+        let sum = helpers::sum_path_for(&self.state.backing_path(&rel));
+        let _ = std::fs::remove_file(&sum);
+
+        // Clean up path state and inode table
+        self.state.remove_path_state(&rel);
+        {
+            let mut table = self.inodes.write().unwrap();
+            table.remove_path(&rel);
+        }
+
+        // Enqueue delete to replica
+        self.state.repl_log.enqueue_delete(&rel);
+
+        reply.ok();
     }
 
-    (*fi).fh = encode_fh(fd, writing);
-    0
-}
+    // -- rmdir ---------------------------------------------------------------
 
-unsafe extern "C" fn op_read(
-    _path: *const c_char,
-    buf: *mut c_char,
-    size: size_t,
-    offset: off_t,
-    fi: *mut fuse_sys::fuse_file_info,
-) -> c_int {
-    let fd = decode_fd((*fi).fh);
-    let ret = libc::pread(fd, buf as *mut c_void, size, offset);
-    if ret == -1 {
-        return neg_errno();
-    }
-    ret as c_int
-}
-
-unsafe extern "C" fn op_write(
-    path: *const c_char,
-    buf: *const c_char,
-    size: size_t,
-    offset: off_t,
-    fi: *mut fuse_sys::fuse_file_info,
-) -> c_int {
-    let fd = decode_fd((*fi).fh);
-    let ret = libc::pwrite(fd, buf as *const c_void, size, offset);
-    if ret == -1 {
-        return neg_errno();
+    fn rmdir(&self, _req: &Request, parent: INodeNo, name: &OsStr, reply: ReplyEmpty) {
+        let rel = match self.child_rel(parent, name) {
+            Some(r) => r,
+            None => {
+                reply.error(libc::ENOENT);
+                return;
+            }
+        };
+        let abs = backing_cpath(&self.state, &rel);
+        if unsafe { libc::rmdir(abs.as_ptr()) } == -1 {
+            reply.error(neg_errno());
+            return;
+        }
+        {
+            let mut table = self.inodes.write().unwrap();
+            table.remove_path(&rel);
+        }
+        reply.ok();
     }
 
-    let rel = c_path_to_rel(path);
-    get_state().mark_dirty(&rel);
+    // -- symlink -------------------------------------------------------------
 
-    ret as c_int
-}
+    fn symlink(
+        &self,
+        _req: &Request,
+        parent: INodeNo,
+        link_name: &OsStr,
+        target: &Path,
+        reply: ReplyEntry,
+    ) {
+        let rel = match self.child_rel(parent, link_name) {
+            Some(r) => r,
+            None => {
+                reply.error(libc::ENOENT);
+                return;
+            }
+        };
+        if helpers::is_hidden_path(&rel, &self.state.backing_dir) {
+            reply.error(libc::EACCES);
+            return;
+        }
 
-unsafe extern "C" fn op_statfs(
-    path: *const c_char,
-    stbuf: *mut libc::statvfs,
-) -> c_int {
-    let rel = c_path_to_rel(path);
-    let st = get_state();
-    let abs = backing_cpath(st, &rel);
-    if libc::statvfs(abs.as_ptr(), stbuf) == -1 {
-        return neg_errno();
+        let abs = backing_cpath(&self.state, &rel);
+        let c_target = match CString::new(target.as_os_str().as_bytes()) {
+            Ok(c) => c,
+            Err(_) => {
+                reply.error(libc::EINVAL);
+                return;
+            }
+        };
+        if unsafe { libc::symlink(c_target.as_ptr(), abs.as_ptr()) } == -1 {
+            reply.error(neg_errno());
+            return;
+        }
+
+        // Enqueue symlink for replication
+        self.state.repl_log.enqueue_put(&rel);
+
+        match lstat_backing(&self.state, &rel) {
+            Ok(st) => {
+                let attr = stat_to_file_attr(&st);
+                self.register_inode(st.st_ino, rel);
+                reply.entry(&TTL, &attr, 0);
+            }
+            Err(e) => reply.error(e),
+        }
     }
-    0
-}
 
-unsafe extern "C" fn op_flush(
-    _path: *const c_char,
-    fi: *mut fuse_sys::fuse_file_info,
-) -> c_int {
-    let fd = decode_fd((*fi).fh);
-    // flush = close(dup(fd)) to trigger any pending errors
-    let dup_fd = libc::dup(fd);
-    if dup_fd == -1 {
-        return neg_errno();
+    // -- rename --------------------------------------------------------------
+
+    fn rename(
+        &self,
+        _req: &Request,
+        parent: INodeNo,
+        name: &OsStr,
+        newparent: INodeNo,
+        newname: &OsStr,
+        _flags: u32,
+        reply: ReplyEmpty,
+    ) {
+        let rel_from = match self.child_rel(parent, name) {
+            Some(r) => r,
+            None => {
+                reply.error(libc::ENOENT);
+                return;
+            }
+        };
+        let rel_to = match self.child_rel(newparent, newname) {
+            Some(r) => r,
+            None => {
+                reply.error(libc::ENOENT);
+                return;
+            }
+        };
+
+        let abs_from = backing_cpath(&self.state, &rel_from);
+        let abs_to = backing_cpath(&self.state, &rel_to);
+
+        if unsafe { libc::rename(abs_from.as_ptr(), abs_to.as_ptr()) } == -1 {
+            reply.error(neg_errno());
+            return;
+        }
+
+        // Move .sum sidecar if it exists
+        let sum_from = helpers::sum_path_for(&self.state.backing_path(&rel_from));
+        let sum_to = helpers::sum_path_for(&self.state.backing_path(&rel_to));
+        if sum_from.exists() {
+            let _ = std::fs::rename(&sum_from, &sum_to);
+        }
+
+        // Transfer path state
+        {
+            let mut map = self.state.path_state.write().unwrap();
+            if let Some(info) = map.remove(&rel_from) {
+                map.insert(rel_to.clone(), info);
+            }
+        }
+
+        // Update inode table
+        {
+            let mut table = self.inodes.write().unwrap();
+            table.rename(&rel_from, &rel_to);
+        }
+
+        // Enqueue delete for old path, put for new path
+        self.state.repl_log.enqueue_delete(&rel_from);
+
+        if sum_to.exists() {
+            self.state.repl_log.enqueue_put(&rel_to);
+        } else {
+            let backing_to = self.state.backing_path(&rel_to);
+            if backing_to.is_file() {
+                checksum_and_enqueue(&self.state, &rel_to);
+            }
+        }
+
+        reply.ok();
     }
-    if libc::close(dup_fd) == -1 {
-        return neg_errno();
+
+    // -- link (unsupported) --------------------------------------------------
+
+    fn link(
+        &self,
+        _req: &Request,
+        _ino: INodeNo,
+        _newparent: INodeNo,
+        _newname: &OsStr,
+        reply: ReplyEntry,
+    ) {
+        reply.error(libc::ENOTSUP);
     }
-    0
-}
 
-unsafe extern "C" fn op_release(
-    path: *const c_char,
-    fi: *mut fuse_sys::fuse_file_info,
-) -> c_int {
-    let fh = (*fi).fh;
-    let fd = decode_fd(fh);
-    libc::close(fd);
+    // -- open ----------------------------------------------------------------
 
-    if is_write_fh(fh) {
-        let rel = c_path_to_rel(path);
-        let st = get_state();
-        st.dec_write_ref(&rel);
+    fn open(&self, _req: &Request, ino: INodeNo, flags: i32, reply: ReplyOpen) {
+        let rel = match self.inode_path(ino) {
+            Some(r) => r,
+            None => {
+                reply.error(libc::ENOENT);
+                return;
+            }
+        };
+        if helpers::is_hidden_path(&rel, &self.state.backing_dir) {
+            reply.error(libc::ENOENT);
+            return;
+        }
 
-        // If this was the last write handle and the file is dirty,
-        // checksum and enqueue for replication.
-        let info = st.get_path_info(&rel);
-        if let Some(info) = info {
-            if info.write_ref == 0 && info.dirty {
-                checksum_and_enqueue(st, &rel);
+        let abs = backing_cpath(&self.state, &rel);
+        let fd = unsafe { libc::open(abs.as_ptr(), flags) };
+        if fd == -1 {
+            reply.error(neg_errno());
+            return;
+        }
+
+        let acc_mode = flags & libc::O_ACCMODE;
+        let writing = acc_mode == libc::O_WRONLY
+            || acc_mode == libc::O_RDWR
+            || (flags & libc::O_APPEND) != 0;
+
+        if writing {
+            self.state.inc_write_ref(&rel);
+        }
+
+        reply.opened(encode_fh(fd, writing), 0);
+    }
+
+    // -- read ----------------------------------------------------------------
+
+    fn read(
+        &self,
+        _req: &Request,
+        _ino: INodeNo,
+        fh: u64,
+        offset: i64,
+        size: u32,
+        _flags: i32,
+        _lock_owner: Option<u64>,
+        reply: ReplyData,
+    ) {
+        let fd = decode_fd(fh);
+        let mut buf = vec![0u8; size as usize];
+        let ret =
+            unsafe { libc::pread(fd, buf.as_mut_ptr() as *mut _, buf.len(), offset) };
+        if ret == -1 {
+            reply.error(neg_errno());
+        } else {
+            reply.data(&buf[..ret as usize]);
+        }
+    }
+
+    // -- write ---------------------------------------------------------------
+
+    fn write(
+        &self,
+        _req: &Request,
+        ino: INodeNo,
+        fh: u64,
+        offset: i64,
+        data: &[u8],
+        _write_flags: u32,
+        _flags: i32,
+        _lock_owner: Option<u64>,
+        reply: ReplyWrite,
+    ) {
+        let fd = decode_fd(fh);
+        let ret = unsafe {
+            libc::pwrite(fd, data.as_ptr() as *const _, data.len(), offset)
+        };
+        if ret == -1 {
+            reply.error(neg_errno());
+            return;
+        }
+
+        if let Some(rel) = self.inode_path(ino) {
+            self.state.mark_dirty(&rel);
+        }
+
+        reply.written(ret as u32);
+    }
+
+    // -- statfs --------------------------------------------------------------
+
+    fn statfs(&self, _req: &Request, ino: INodeNo, reply: ReplyStatfs) {
+        let rel = self.inode_path(ino).unwrap_or_default();
+        let abs = backing_cpath(&self.state, &rel);
+        unsafe {
+            let mut stbuf: libc::statvfs = std::mem::zeroed();
+            if libc::statvfs(abs.as_ptr(), &mut stbuf) == -1 {
+                reply.error(neg_errno());
+                return;
+            }
+            reply.statfs(
+                stbuf.f_blocks,
+                stbuf.f_bfree,
+                stbuf.f_bavail,
+                stbuf.f_files,
+                stbuf.f_ffree,
+                stbuf.f_bsize as u32,
+                stbuf.f_namemax as u32,
+                stbuf.f_frsize as u32,
+            );
+        }
+    }
+
+    // -- flush ---------------------------------------------------------------
+
+    fn flush(&self, _req: &Request, _ino: INodeNo, fh: u64, _lock_owner: u64, reply: ReplyEmpty) {
+        let fd = decode_fd(fh);
+        let dup_fd = unsafe { libc::dup(fd) };
+        if dup_fd == -1 {
+            reply.error(neg_errno());
+            return;
+        }
+        if unsafe { libc::close(dup_fd) } == -1 {
+            reply.error(neg_errno());
+            return;
+        }
+        reply.ok();
+    }
+
+    // -- release -------------------------------------------------------------
+
+    fn release(
+        &self,
+        _req: &Request,
+        ino: INodeNo,
+        fh: u64,
+        _flags: i32,
+        _lock_owner: Option<u64>,
+        _flush: bool,
+        reply: ReplyEmpty,
+    ) {
+        let fd = decode_fd(fh);
+        unsafe {
+            libc::close(fd);
+        }
+
+        if is_write_fh(fh) {
+            if let Some(rel) = self.inode_path(ino) {
+                self.state.dec_write_ref(&rel);
+
+                let info = self.state.get_path_info(&rel);
+                if let Some(info) = info {
+                    if info.write_ref == 0 && info.dirty {
+                        checksum_and_enqueue(&self.state, &rel);
+                    }
+                }
+            }
+        }
+
+        reply.ok();
+    }
+
+    // -- fsync ---------------------------------------------------------------
+
+    fn fsync(&self, _req: &Request, _ino: INodeNo, fh: u64, datasync: bool, reply: ReplyEmpty) {
+        let fd = decode_fd(fh);
+        let ret = if datasync {
+            unsafe { libc::fdatasync(fd) }
+        } else {
+            unsafe { libc::fsync(fd) }
+        };
+        if ret == -1 {
+            reply.error(neg_errno());
+        } else {
+            reply.ok();
+        }
+    }
+
+    // -- opendir -------------------------------------------------------------
+
+    fn opendir(&self, _req: &Request, ino: INodeNo, _flags: i32, reply: ReplyOpen) {
+        let rel = match self.inode_path(ino) {
+            Some(r) => r,
+            None => {
+                reply.error(libc::ENOENT);
+                return;
+            }
+        };
+        if helpers::is_hidden_path(&rel, &self.state.backing_dir) {
+            reply.error(libc::ENOENT);
+            return;
+        }
+
+        let abs = backing_cpath(&self.state, &rel);
+        let dp = unsafe { libc::opendir(abs.as_ptr()) };
+        if dp.is_null() {
+            reply.error(neg_errno());
+            return;
+        }
+        reply.opened(dp as u64, 0);
+    }
+
+    // -- readdir -------------------------------------------------------------
+
+    fn readdir(
+        &self,
+        _req: &Request,
+        ino: INodeNo,
+        _fh: u64,
+        offset: i64,
+        mut reply: ReplyDirectory,
+    ) {
+        let rel = match self.inode_path(ino) {
+            Some(r) => r,
+            None => {
+                reply.error(libc::ENOENT);
+                return;
+            }
+        };
+        let abs_dir = self.state.backing_path(&rel);
+
+        let entries = match std::fs::read_dir(&abs_dir) {
+            Ok(e) => e,
+            Err(e) => {
+                reply.error(helpers::io_error_to_errno(&e));
+                return;
+            }
+        };
+
+        // Collect all entries (including . and ..) with filtering
+        let mut all_entries: Vec<(INodeNo, FileType, OsString)> = Vec::new();
+
+        // Add . and ..
+        // Use the directory's own inode for "."
+        all_entries.push((ino, FileType::Directory, OsString::from(".")));
+        // For ".." we use ino 1 (parent); the kernel handles this.
+        all_entries.push((INodeNo(1), FileType::Directory, OsString::from("..")));
+
+        for entry in entries {
+            let entry = match entry {
+                Ok(e) => e,
+                Err(_) => continue,
+            };
+
+            let name = entry.file_name();
+            let name_str = name.to_string_lossy();
+
+            // Build relative path for this entry
+            let entry_rel = if rel.is_empty() {
+                name_str.to_string()
+            } else {
+                format!("{}/{}", rel, name_str)
+            };
+
+            // Skip hidden entries
+            if helpers::is_hidden_path(&entry_rel, &self.state.backing_dir) {
+                continue;
+            }
+
+            // Get file type and inode
+            let ft = match entry.file_type() {
+                Ok(ft) => {
+                    if ft.is_dir() {
+                        FileType::Directory
+                    } else if ft.is_symlink() {
+                        FileType::Symlink
+                    } else {
+                        FileType::RegularFile
+                    }
+                }
+                Err(_) => FileType::RegularFile,
+            };
+
+            // Get real inode from metadata
+            let entry_ino = match entry.metadata() {
+                Ok(m) => {
+                    use std::os::unix::fs::MetadataExt;
+                    let ino_val = m.ino();
+                    // Register in inode table
+                    self.register_inode(ino_val, entry_rel);
+                    INodeNo(ino_val)
+                }
+                Err(_) => INodeNo(0),
+            };
+
+            all_entries.push((entry_ino, ft, name));
+        }
+
+        // Send entries starting from offset
+        for (i, (entry_ino, ft, name)) in all_entries.iter().enumerate().skip(offset as usize) {
+            // offset+1 means the next readdir call will start after this entry
+            let full = reply.add(*entry_ino, (i + 1) as i64, *ft, name);
+            if full {
+                break;
+            }
+        }
+
+        reply.ok();
+    }
+
+    // -- releasedir ----------------------------------------------------------
+
+    fn releasedir(&self, _req: &Request, _ino: INodeNo, fh: u64, _flags: i32, reply: ReplyEmpty) {
+        let dp = fh as *mut libc::DIR;
+        if !dp.is_null() {
+            unsafe {
+                libc::closedir(dp);
+            }
+        }
+        reply.ok();
+    }
+
+    // -- access --------------------------------------------------------------
+
+    fn access(&self, _req: &Request, ino: INodeNo, mask: i32, reply: ReplyEmpty) {
+        let rel = match self.inode_path(ino) {
+            Some(r) => r,
+            None => {
+                reply.error(libc::ENOENT);
+                return;
+            }
+        };
+        if helpers::is_hidden_path(&rel, &self.state.backing_dir) {
+            reply.error(libc::ENOENT);
+            return;
+        }
+
+        let abs = backing_cpath(&self.state, &rel);
+        if unsafe { libc::access(abs.as_ptr(), mask) } == -1 {
+            reply.error(neg_errno());
+        } else {
+            reply.ok();
+        }
+    }
+
+    // -- create --------------------------------------------------------------
+
+    fn create(
+        &self,
+        _req: &Request,
+        parent: INodeNo,
+        name: &OsStr,
+        mode: u32,
+        _umask: u32,
+        flags: i32,
+        reply: ReplyCreate,
+    ) {
+        let rel = match self.child_rel(parent, name) {
+            Some(r) => r,
+            None => {
+                reply.error(libc::ENOENT);
+                return;
+            }
+        };
+        if helpers::is_hidden_path(&rel, &self.state.backing_dir) {
+            reply.error(libc::EACCES);
+            return;
+        }
+
+        let abs = backing_cpath(&self.state, &rel);
+        let fd = unsafe { libc::open(abs.as_ptr(), flags | libc::O_CREAT, mode) };
+        if fd == -1 {
+            reply.error(neg_errno());
+            return;
+        }
+
+        self.state.inc_write_ref(&rel);
+        self.state.mark_dirty(&rel);
+
+        let fh = encode_fh(fd, true);
+
+        match lstat_backing(&self.state, &rel) {
+            Ok(st) => {
+                let attr = stat_to_file_attr(&st);
+                self.register_inode(st.st_ino, rel);
+                reply.created(&TTL, &attr, 0, fh, 0);
+            }
+            Err(e) => {
+                // Clean up fd on error
+                unsafe {
+                    libc::close(fd);
+                }
+                reply.error(e);
             }
         }
     }
 
-    0
-}
+    // -- xattr ---------------------------------------------------------------
 
-unsafe extern "C" fn op_fsync(
-    _path: *const c_char,
-    datasync: c_int,
-    fi: *mut fuse_sys::fuse_file_info,
-) -> c_int {
-    let fd = decode_fd((*fi).fh);
-    let ret = if datasync != 0 {
-        libc::fdatasync(fd)
-    } else {
-        libc::fsync(fd)
-    };
-    if ret == -1 {
-        return neg_errno();
-    }
-    0
-}
-
-unsafe extern "C" fn op_opendir(
-    path: *const c_char,
-    fi: *mut fuse_sys::fuse_file_info,
-) -> c_int {
-    let rel = c_path_to_rel(path);
-    let st = get_state();
-
-    if helpers::is_hidden_path(&rel, &st.backing_dir) {
-        return -ENOENT;
-    }
-
-    let abs = backing_cpath(st, &rel);
-    let dp = libc::opendir(abs.as_ptr());
-    if dp.is_null() {
-        return neg_errno();
-    }
-    (*fi).fh = dp as u64;
-    0
-}
-
-unsafe extern "C" fn op_readdir(
-    path: *const c_char,
-    buf: *mut c_void,
-    filler: fuse_sys::fuse_fill_dir_t,
-    _offset: off_t,
-    _fi: *mut fuse_sys::fuse_file_info,
-    _flags: c_int,
-) -> c_int {
-    let rel = c_path_to_rel(path);
-    let st = get_state();
-    let abs_dir = st.backing_path(&rel);
-
-    let filler = match filler {
-        Some(f) => f,
-        None => return -libc::EIO,
-    };
-
-    let entries = match std::fs::read_dir(&abs_dir) {
-        Ok(e) => e,
-        Err(e) => return helpers::io_error_to_errno(&e),
-    };
-
-    // Add . and ..
-    let dot = CString::new(".").unwrap();
-    let dotdot = CString::new("..").unwrap();
-    filler(buf, dot.as_ptr(), std::ptr::null(), 0, 0);
-    filler(buf, dotdot.as_ptr(), std::ptr::null(), 0, 0);
-
-    for entry in entries {
-        let entry = match entry {
-            Ok(e) => e,
-            Err(_) => continue,
+    fn setxattr(
+        &self,
+        _req: &Request,
+        ino: INodeNo,
+        name: &OsStr,
+        value: &[u8],
+        flags: i32,
+        _position: u32,
+        reply: ReplyEmpty,
+    ) {
+        let rel = match self.inode_path(ino) {
+            Some(r) => r,
+            None => {
+                reply.error(libc::ENOENT);
+                return;
+            }
         };
-
-        let name = entry.file_name();
-        let name_str = name.to_string_lossy();
-
-        // Build relative path for this entry
-        let entry_rel = if rel.is_empty() {
-            name_str.to_string()
+        let abs = backing_cpath(&self.state, &rel);
+        let c_name = match CString::new(name.as_bytes()) {
+            Ok(c) => c,
+            Err(_) => {
+                reply.error(libc::EINVAL);
+                return;
+            }
+        };
+        if unsafe {
+            libc::setxattr(
+                abs.as_ptr(),
+                c_name.as_ptr(),
+                value.as_ptr() as *const _,
+                value.len(),
+                flags,
+            )
+        } == -1
+        {
+            reply.error(neg_errno());
         } else {
-            format!("{}/{}", rel, name_str)
+            reply.ok();
+        }
+    }
+
+    fn getxattr(
+        &self,
+        _req: &Request,
+        ino: INodeNo,
+        name: &OsStr,
+        size: u32,
+        reply: ReplyXattr,
+    ) {
+        let rel = match self.inode_path(ino) {
+            Some(r) => r,
+            None => {
+                reply.error(libc::ENOENT);
+                return;
+            }
+        };
+        let abs = backing_cpath(&self.state, &rel);
+        let c_name = match CString::new(name.as_bytes()) {
+            Ok(c) => c,
+            Err(_) => {
+                reply.error(libc::EINVAL);
+                return;
+            }
         };
 
-        // Skip hidden entries
-        if helpers::is_hidden_path(&entry_rel, &st.backing_dir) {
-            continue;
-        }
-
-        if let Ok(cname) = CString::new(name.as_bytes()) {
-            filler(buf, cname.as_ptr(), std::ptr::null(), 0, 0);
-        }
-    }
-
-    0
-}
-
-unsafe extern "C" fn op_releasedir(
-    _path: *const c_char,
-    fi: *mut fuse_sys::fuse_file_info,
-) -> c_int {
-    let dp = (*fi).fh as *mut libc::DIR;
-    if !dp.is_null() {
-        libc::closedir(dp);
-    }
-    0
-}
-
-unsafe extern "C" fn op_access(
-    path: *const c_char,
-    mask: c_int,
-) -> c_int {
-    let rel = c_path_to_rel(path);
-    let st = get_state();
-
-    if helpers::is_hidden_path(&rel, &st.backing_dir) {
-        return -ENOENT;
-    }
-
-    let abs = backing_cpath(st, &rel);
-    if libc::access(abs.as_ptr(), mask) == -1 {
-        return neg_errno();
-    }
-    0
-}
-
-unsafe extern "C" fn op_create(
-    path: *const c_char,
-    mode: mode_t,
-    fi: *mut fuse_sys::fuse_file_info,
-) -> c_int {
-    let rel = c_path_to_rel(path);
-    let st = get_state();
-
-    if helpers::is_hidden_path(&rel, &st.backing_dir) {
-        return -EACCES;
-    }
-
-    let abs = backing_cpath(st, &rel);
-    let fd = libc::open(abs.as_ptr(), (*fi).flags | O_CREAT, mode as c_uint);
-    if fd == -1 {
-        return neg_errno();
-    }
-
-    st.inc_write_ref(&rel);
-    st.mark_dirty(&rel);
-
-    (*fi).fh = encode_fh(fd, true);
-    0
-}
-
-unsafe extern "C" fn op_utimens(
-    path: *const c_char,
-    tv: *const libc::timespec,
-    fi: *mut fuse_sys::fuse_file_info,
-) -> c_int {
-    let rel = c_path_to_rel(path);
-    let st = get_state();
-
-    if !fi.is_null() {
-        let fd = decode_fd((*fi).fh);
-        if libc::futimens(fd, tv) == -1 {
-            return neg_errno();
-        }
-    } else {
-        let abs = backing_cpath(st, &rel);
-        if libc::utimensat(libc::AT_FDCWD, abs.as_ptr(), tv, libc::AT_SYMLINK_NOFOLLOW) == -1 {
-            return neg_errno();
+        if size == 0 {
+            // Return the size of the value
+            let ret = unsafe {
+                libc::getxattr(
+                    abs.as_ptr(),
+                    c_name.as_ptr(),
+                    std::ptr::null_mut(),
+                    0,
+                )
+            };
+            if ret == -1 {
+                reply.error(neg_errno());
+            } else {
+                reply.size(ret as u32);
+            }
+        } else {
+            let mut buf = vec![0u8; size as usize];
+            let ret = unsafe {
+                libc::getxattr(
+                    abs.as_ptr(),
+                    c_name.as_ptr(),
+                    buf.as_mut_ptr() as *mut _,
+                    buf.len(),
+                )
+            };
+            if ret == -1 {
+                reply.error(neg_errno());
+            } else {
+                reply.data(&buf[..ret as usize]);
+            }
         }
     }
-    0
-}
 
-unsafe extern "C" fn op_setxattr(
-    path: *const c_char,
-    name: *const c_char,
-    value: *const c_char,
-    size: size_t,
-    flags: c_int,
-) -> c_int {
-    let rel = c_path_to_rel(path);
-    let st = get_state();
-    let abs = backing_cpath(st, &rel);
-    if libc::setxattr(abs.as_ptr(), name, value as *const c_void, size, flags) == -1 {
-        return neg_errno();
+    fn listxattr(&self, _req: &Request, ino: INodeNo, size: u32, reply: ReplyXattr) {
+        let rel = match self.inode_path(ino) {
+            Some(r) => r,
+            None => {
+                reply.error(libc::ENOENT);
+                return;
+            }
+        };
+        let abs = backing_cpath(&self.state, &rel);
+
+        if size == 0 {
+            let ret = unsafe { libc::listxattr(abs.as_ptr(), std::ptr::null_mut(), 0) };
+            if ret == -1 {
+                reply.error(neg_errno());
+            } else {
+                reply.size(ret as u32);
+            }
+        } else {
+            let mut buf = vec![0u8; size as usize];
+            let ret = unsafe {
+                libc::listxattr(abs.as_ptr(), buf.as_mut_ptr() as *mut _, buf.len())
+            };
+            if ret == -1 {
+                reply.error(neg_errno());
+            } else {
+                reply.data(&buf[..ret as usize]);
+            }
+        }
     }
-    0
-}
 
-unsafe extern "C" fn op_getxattr(
-    path: *const c_char,
-    name: *const c_char,
-    value: *mut c_char,
-    size: size_t,
-) -> c_int {
-    let rel = c_path_to_rel(path);
-    let st = get_state();
-    let abs = backing_cpath(st, &rel);
-    let ret = libc::getxattr(abs.as_ptr(), name, value as *mut c_void, size);
-    if ret == -1 {
-        return neg_errno();
+    fn removexattr(&self, _req: &Request, ino: INodeNo, name: &OsStr, reply: ReplyEmpty) {
+        let rel = match self.inode_path(ino) {
+            Some(r) => r,
+            None => {
+                reply.error(libc::ENOENT);
+                return;
+            }
+        };
+        let abs = backing_cpath(&self.state, &rel);
+        let c_name = match CString::new(name.as_bytes()) {
+            Ok(c) => c,
+            Err(_) => {
+                reply.error(libc::EINVAL);
+                return;
+            }
+        };
+        if unsafe { libc::removexattr(abs.as_ptr(), c_name.as_ptr()) } == -1 {
+            reply.error(neg_errno());
+        } else {
+            reply.ok();
+        }
     }
-    ret as c_int
 }
-
-unsafe extern "C" fn op_listxattr(
-    path: *const c_char,
-    list: *mut c_char,
-    size: size_t,
-) -> c_int {
-    let rel = c_path_to_rel(path);
-    let st = get_state();
-    let abs = backing_cpath(st, &rel);
-    let ret = libc::listxattr(abs.as_ptr(), list, size);
-    if ret == -1 {
-        return neg_errno();
-    }
-    ret as c_int
-}
-
-unsafe extern "C" fn op_removexattr(
-    path: *const c_char,
-    name: *const c_char,
-) -> c_int {
-    let rel = c_path_to_rel(path);
-    let st = get_state();
-    let abs = backing_cpath(st, &rel);
-    if libc::removexattr(abs.as_ptr(), name) == -1 {
-        return neg_errno();
-    }
-    0
-}
-
-unsafe extern "C" fn op_init(
-    _conn: *mut fuse_sys::fuse_conn_info,
-    _cfg: *mut fuse_sys::fuse_config,
-) -> *mut c_void {
-    std::ptr::null_mut()
-}
-
-// ---------------------------------------------------------------------------
-// fuse_operations constant
-// ---------------------------------------------------------------------------
-
-/// The static `fuse_operations` struct passed to `fuse_new`.
-pub static FUSE_OPS: fuse_sys::fuse_operations = fuse_sys::fuse_operations {
-    getattr: Some(op_getattr),
-    readlink: Some(op_readlink),
-    mknod: Some(op_mknod),
-    mkdir: Some(op_mkdir),
-    unlink: Some(op_unlink),
-    rmdir: Some(op_rmdir),
-    symlink: Some(op_symlink),
-    rename: Some(op_rename),
-    link: Some(op_link),
-    chmod: Some(op_chmod),
-    chown: Some(op_chown),
-    truncate: Some(op_truncate),
-    open: Some(op_open),
-    read: Some(op_read),
-    write: Some(op_write),
-    statfs: Some(op_statfs),
-    flush: Some(op_flush),
-    release: Some(op_release),
-    fsync: Some(op_fsync),
-    setxattr: Some(op_setxattr),
-    getxattr: Some(op_getxattr),
-    listxattr: Some(op_listxattr),
-    removexattr: Some(op_removexattr),
-    opendir: Some(op_opendir),
-    readdir: Some(op_readdir),
-    releasedir: Some(op_releasedir),
-    fsyncdir: None,
-    init: Some(op_init),
-    destroy: None,
-    access: Some(op_access),
-    create: Some(op_create),
-    lock: None,
-    utimens: Some(op_utimens),
-    bmap: None,
-    ioctl: None,
-    poll: None,
-    write_buf: None,
-    read_buf: None,
-    flock: None,
-    fallocate: None,
-    copy_file_range: None,
-    lseek: None,
-};
