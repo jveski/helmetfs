@@ -1,20 +1,50 @@
 //! CLI entry point: `helmetfs mount` and `helmetfs unmount`.
-//!
-//! Usage:
-//!   helmetfs mount <source> <mountpoint> --replica <path> [options]
-//!   helmetfs unmount <mountpoint>
-//!
-//! Options:
-//!   --replication-workers <N>   Number of replication worker threads (default: 2)
-//!   --scrub-interval <secs>    Seconds between scrub runs (default: 86400)
 
 use helmetfs::{fuse_ops, fuse_sys, replication, scrub, state};
 
+use clap::{Parser, Subcommand};
 use std::ffi::CString;
 use std::path::PathBuf;
 use std::process;
 use std::sync::atomic::Ordering;
 use std::sync::Arc;
+
+#[derive(Parser)]
+#[command(name = "helmetfs")]
+struct Cli {
+    #[command(subcommand)]
+    command: Command,
+}
+
+#[derive(Subcommand)]
+enum Command {
+    /// Mount a FUSE filesystem with replication
+    Mount {
+        /// Source directory
+        source: String,
+
+        /// Mount point
+        mountpoint: String,
+
+        /// Replica directory path
+        #[arg(long)]
+        replica: String,
+
+        /// Number of replication worker threads
+        #[arg(long, default_value_t = 2)]
+        replication_workers: usize,
+
+        /// Seconds between scrub runs
+        #[arg(long, default_value_t = 86400)]
+        scrub_interval: u64,
+    },
+
+    /// Unmount a FUSE filesystem
+    Unmount {
+        /// Mount point to unmount
+        mountpoint: String,
+    },
+}
 
 fn main() {
     env_logger::Builder::from_env(
@@ -23,102 +53,31 @@ fn main() {
     .format_timestamp_millis()
     .init();
 
-    let args: Vec<String> = std::env::args().collect();
+    let cli = Cli::parse();
 
-    if args.len() < 2 {
-        usage();
-        process::exit(1);
+    match cli.command {
+        Command::Mount {
+            source,
+            mountpoint,
+            replica,
+            replication_workers,
+            scrub_interval,
+        } => cmd_mount(source, mountpoint, replica, replication_workers, scrub_interval),
+        Command::Unmount { mountpoint } => cmd_unmount(mountpoint),
     }
-
-    match args[1].as_str() {
-        "mount" => cmd_mount(&args[2..]),
-        "unmount" => cmd_unmount(&args[2..]),
-        "--help" | "-h" | "help" => {
-            usage();
-            process::exit(0);
-        }
-        other => {
-            eprintln!("Unknown command: {}", other);
-            usage();
-            process::exit(1);
-        }
-    }
-}
-
-fn usage() {
-    eprintln!("Usage:");
-    eprintln!("  helmetfs mount <source> <mountpoint> --replica <path> [options]");
-    eprintln!("  helmetfs unmount <mountpoint>");
-    eprintln!();
-    eprintln!("Options:");
-    eprintln!("  --replication-workers <N>   Worker threads (default: 2)");
-    eprintln!("  --scrub-interval <secs>     Scrub interval in seconds (default: 86400)");
 }
 
 // ---------------------------------------------------------------------------
 // mount command
 // ---------------------------------------------------------------------------
 
-fn cmd_mount(args: &[String]) {
-    // Parse arguments
-    let mut source: Option<String> = None;
-    let mut mountpoint: Option<String> = None;
-    let mut replica: Option<String> = None;
-    let mut repl_workers: usize = 2;
-    let mut scrub_interval: u64 = 86400;
-
-    let mut i = 0;
-    while i < args.len() {
-        match args[i].as_str() {
-            "--replica" => {
-                i += 1;
-                replica = Some(args.get(i).cloned().unwrap_or_default());
-            }
-            "--replication-workers" => {
-                i += 1;
-                repl_workers = args
-                    .get(i)
-                    .and_then(|s| s.parse().ok())
-                    .unwrap_or(2);
-            }
-            "--scrub-interval" => {
-                i += 1;
-                scrub_interval = args
-                    .get(i)
-                    .and_then(|s| s.parse().ok())
-                    .unwrap_or(86400);
-            }
-            s if !s.starts_with('-') => {
-                if source.is_none() {
-                    source = Some(s.to_string());
-                } else if mountpoint.is_none() {
-                    mountpoint = Some(s.to_string());
-                } else {
-                    eprintln!("Unexpected argument: {}", s);
-                    process::exit(1);
-                }
-            }
-            other => {
-                eprintln!("Unknown option: {}", other);
-                process::exit(1);
-            }
-        }
-        i += 1;
-    }
-
-    let source = source.unwrap_or_else(|| {
-        eprintln!("Missing <source> argument");
-        process::exit(1);
-    });
-    let mountpoint = mountpoint.unwrap_or_else(|| {
-        eprintln!("Missing <mountpoint> argument");
-        process::exit(1);
-    });
-    let replica = replica.unwrap_or_else(|| {
-        eprintln!("Missing --replica argument");
-        process::exit(1);
-    });
-
+fn cmd_mount(
+    source: String,
+    mountpoint: String,
+    replica: String,
+    repl_workers: usize,
+    scrub_interval: u64,
+) {
     let source = PathBuf::from(&source)
         .canonicalize()
         .unwrap_or_else(|e| {
@@ -270,15 +229,9 @@ fn cmd_mount(args: &[String]) {
 // unmount command
 // ---------------------------------------------------------------------------
 
-fn cmd_unmount(args: &[String]) {
-    if args.is_empty() {
-        eprintln!("Missing <mountpoint> argument");
-        process::exit(1);
-    }
-
-    let mountpoint = &args[0];
+fn cmd_unmount(mountpoint: String) {
     let status = process::Command::new("fusermount3")
-        .args(["-u", mountpoint])
+        .args(["-u", &mountpoint])
         .status();
 
     match status {
