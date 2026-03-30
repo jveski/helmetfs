@@ -1,0 +1,24 @@
+[package]
+name = "helmetfs"
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+repository = "https://github.com/jveski/helmetfs"
+
+[[bin]]
+name = "helmetfs"
+path = "src/main.rs"
+
+[lib]
+name = "helmetfs"
+path = "src/lib.rs"
+
+[dependencies]
+blake3 = "1"
+libc = "0.2"
+log = "0.4"
+env_logger = "0.11"
+
+
+[dev-dependencies]
+tempfile = "3"

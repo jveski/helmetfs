@@ -7,7 +7,7 @@
 #
 # Requirements:
 #   - Linux with libfuse3 and fusermount3
-#   - Zig toolchain (builds helmetfs)
+#   - Rust toolchain (builds helmetfs via cargo)
 #   - FUSE kernel module loaded (modprobe fuse)
 #
 # Usage:
@@ -19,7 +19,7 @@ set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 PROJECT_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
-HELMETFS="$PROJECT_DIR/zig-out/bin/helmetfs"
+HELMETFS="$PROJECT_DIR/target/debug/helmetfs"
 
 # ── Color output ─────────────────────────────────────────────────────────────
 
@@ -49,7 +49,7 @@ info() {
 # ── Build ────────────────────────────────────────────────────────────────────
 
 info "Building helmetfs..."
-(cd "$PROJECT_DIR" && zig build) || {
+(cd "$PROJECT_DIR" && cargo build) || {
 	echo "Build failed"
 	exit 1
 }

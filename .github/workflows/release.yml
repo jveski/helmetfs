@@ -25,15 +25,13 @@ jobs:
       - name: Install system dependencies
         run: |
           sudo apt-get update
-          sudo apt-get install -y libfuse3-dev
+          sudo apt-get install -y libfuse3-dev pkg-config
 
-      - name: Install Zig
-        uses: mlugg/setup-zig@v2
-        with:
-          version: 0.15.2
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
 
       - name: Build helmetfs
-        run: zig build -Doptimize=ReleaseSafe -Dcpu=baseline
+        run: cargo build --release
 
       - name: Upload binary to release
         uses: actions/upload-release-asset@v1
@@ -41,6 +39,6 @@ jobs:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         with:
           upload_url: ${{ github.event.release.upload_url }}
-          asset_path: zig-out/bin/helmetfs
+          asset_path: target/release/helmetfs
           asset_name: ${{ matrix.asset_name }}
           asset_content_type: application/octet-stream

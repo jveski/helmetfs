@@ -17,7 +17,7 @@ jobs:
       - name: Install system dependencies
         run: |
           sudo apt-get update
-          sudo apt-get install -y libfuse3-dev fuse3
+          sudo apt-get install -y libfuse3-dev fuse3 pkg-config
 
       - name: Enable FUSE for unprivileged users
         run: |
@@ -26,13 +26,11 @@ jobs:
           # Load the FUSE kernel module
           sudo modprobe fuse
 
-      - name: Install Zig
-        uses: mlugg/setup-zig@v2
-        with:
-          version: 0.15.2
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
 
       - name: Build helmetfs
-        run: zig build
+        run: cargo build
 
       - name: Run E2E tests
         run: |
