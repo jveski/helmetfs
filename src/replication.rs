@@ -21,17 +21,17 @@ pub fn replication_worker(state: &Arc<FsState>) {
     loop {
         // Try to get next entry. wait_next() returns None after a timeout
         // if no entries are pending, allowing us to check shutdown.
-        let (idx, entry) = match state.repl_log.wait_next() {
+        let (id, entry) = match state.repl_log.wait_next() {
             Some(pair) => pair,
             None => {
                 if state.shutting_down.load(Ordering::Relaxed) {
                     // Drain any stragglers
-                    while let Some((idx, entry)) = state.repl_log.try_next() {
+                    while let Some((id, entry)) = state.repl_log.try_next() {
                         let _ = match entry.op {
                             ReplOp::Put => replicate_put(state, &entry.path),
                             ReplOp::Delete => replicate_delete(state, &entry.path),
                         };
-                        state.repl_log.mark_completed(idx);
+                        state.repl_log.mark_completed(id);
                     }
                     break;
                 }
@@ -53,7 +53,7 @@ pub fn replication_worker(state: &Arc<FsState>) {
             }
         }
 
-        state.repl_log.mark_completed(idx);
+        state.repl_log.mark_completed(id);
     }
     log::info!("Replication worker stopped");
 }
@@ -104,7 +104,26 @@ fn replicate_put(state: &FsState, rel: &str) -> io::Result<()> {
 }
 
 /// Remove a file (and its .sum sidecar) from the replica.
+///
+/// Guard: if the backing file currently exists with a `.sum` sidecar, the file
+/// was re-created (and checksummed) since this delete entry was enqueued.
+/// Deleting the replica copy would lose the latest version, so we skip the
+/// delete.  With multiple worker threads, this prevents an older delete from
+/// executing after a newer put for the same path has already replicated the
+/// re-created file.  (In normal operation, FUSE `unlink` removes the backing
+/// file and .sum before enqueuing the delete, so this guard only fires when
+/// the file was truly re-created.)
 fn replicate_delete(state: &FsState, rel: &str) -> io::Result<()> {
+    let src = state.backing_path(rel);
+    let src_sum = helpers::sum_path_for(&src);
+    if src.exists() && src_sum.exists() {
+        log::debug!(
+            "Skipping replica delete for {} — file was re-created",
+            rel
+        );
+        return Ok(());
+    }
+
     let dst = state.replica_file_path(rel);
     let dst_sum = helpers::sum_path_for(&dst);
 
@@ -132,7 +151,9 @@ fn replicate_delete(state: &FsState, rel: &str) -> io::Result<()> {
 
 /// Copy `src` to `dst` via temp file + rename, with fsync.
 pub fn copy_file_with_sync(src: &Path, dst: &Path) -> io::Result<()> {
-    let tmp = dst.with_extension("tmp");
+    let mut tmp_name = dst.as_os_str().to_os_string();
+    tmp_name.push(".helmetfs-tmp");
+    let tmp = std::path::PathBuf::from(tmp_name);
     {
         let mut reader = fs::File::open(src)?;
         let mut writer = fs::File::create(&tmp)?;

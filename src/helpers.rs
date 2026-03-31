@@ -84,17 +84,12 @@ pub fn is_hidden_path(rel_path: &str, backing_dir: &Path) -> bool {
     false
 }
 
-/// Convert a FUSE path (starts with '/') to a relative path (no leading '/').
-pub fn fuse_path_to_rel(fuse_path: &str) -> &str {
-    fuse_path.strip_prefix('/').unwrap_or(fuse_path)
-}
-
 // ---------------------------------------------------------------------------
 // Errno mapping
 // ---------------------------------------------------------------------------
 
-/// Map a `std::io::Error` to a negative errno value suitable for returning
-/// from a FUSE callback.
+/// Map a `std::io::Error` to a positive errno value suitable for passing
+/// to a FUSE `reply.error()` call.
 pub fn io_error_to_errno(e: &io::Error) -> libc::c_int {
-    -(e.raw_os_error().unwrap_or(libc::EIO))
+    e.raw_os_error().unwrap_or(libc::EIO)
 }

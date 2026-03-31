@@ -18,9 +18,10 @@ use std::sync::{Arc, RwLock};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use fuser::{
-    FileAttr, FileType, Filesystem, INodeNo, MountOption, ReplyAttr, ReplyCreate, ReplyData,
+    FileAttr, FileType, Filesystem, INodeNo, ReplyAttr, ReplyCreate, ReplyData,
     ReplyDirectory, ReplyEmpty, ReplyEntry, ReplyOpen, ReplyStatfs, ReplyWrite, ReplyXattr,
-    Request,
+    Request, FileHandle, Generation, Errno, FopenFlags, OpenFlags, RenameFlags, AccessFlags,
+    WriteFlags, LockOwner,
 };
 
 use crate::helpers;
@@ -52,6 +53,11 @@ fn decode_fd(fh: u64) -> i32 {
 
 fn is_write_fh(fh: u64) -> bool {
     fh & WRITE_FLAG != 0
+}
+
+/// Convert a raw `libc::c_int` errno to `fuser::Errno`.
+fn to_errno(e: libc::c_int) -> Errno {
+    Errno::from_i32(e)
 }
 
 // ---------------------------------------------------------------------------
@@ -87,6 +93,7 @@ impl InodeTable {
         self.ino_to_path.get(&ino).map(|s| s.as_str())
     }
 
+    #[allow(dead_code)]
     fn get_ino(&self, rel: &str) -> Option<u64> {
         self.path_to_ino.get(rel).copied()
     }
@@ -98,9 +105,28 @@ impl InodeTable {
     }
 
     fn rename(&mut self, from: &str, to: &str) {
-        if let Some(ino) = self.path_to_ino.remove(from) {
-            self.ino_to_path.insert(ino, to.to_string());
-            self.path_to_ino.insert(to.to_string(), ino);
+        // Collect all paths that need updating (the entry itself + children)
+        let prefix = format!("{}/", from);
+        let mut renames: Vec<(String, String, u64)> = Vec::new();
+
+        // The entry itself
+        if let Some(ino) = self.path_to_ino.get(from).copied() {
+            renames.push((from.to_string(), to.to_string(), ino));
+        }
+
+        // Children: paths starting with "from/"
+        for (path, &ino) in &self.path_to_ino {
+            if path.starts_with(&prefix) {
+                let new_path = format!("{}/{}", to, &path[prefix.len()..]);
+                renames.push((path.clone(), new_path, ino));
+            }
+        }
+
+        // Apply all renames
+        for (old_path, new_path, ino) in renames {
+            self.path_to_ino.remove(&old_path);
+            self.ino_to_path.insert(ino, new_path.clone());
+            self.path_to_ino.insert(new_path, ino);
         }
     }
 }
@@ -124,10 +150,18 @@ fn filetype_from_mode(mode: u32) -> FileType {
 }
 
 fn system_time_from_ts(sec: i64, nsec: i64) -> SystemTime {
-    if sec >= 0 {
-        UNIX_EPOCH + Duration::new(sec as u64, nsec as u32)
+    let total_nanos = (sec as i128) * 1_000_000_000 + (nsec as i128);
+    if total_nanos >= 0 {
+        UNIX_EPOCH + Duration::new(
+            (total_nanos / 1_000_000_000) as u64,
+            (total_nanos % 1_000_000_000) as u32,
+        )
     } else {
-        UNIX_EPOCH - Duration::new((-sec) as u64, nsec as u32)
+        let abs_nanos = (-total_nanos) as u128;
+        UNIX_EPOCH - Duration::new(
+            (abs_nanos / 1_000_000_000) as u64,
+            (abs_nanos % 1_000_000_000) as u32,
+        )
     }
 }
 
@@ -185,7 +219,8 @@ fn neg_errno() -> libc::c_int {
 /// Build a CString from a backing-directory relative path.
 fn backing_cpath(state: &FsState, rel: &str) -> CString {
     let abs = state.backing_path(rel);
-    CString::new(abs.as_os_str().as_bytes()).unwrap_or_default()
+    CString::new(abs.as_os_str().as_bytes())
+        .expect("path contains interior null byte")
 }
 
 // ---------------------------------------------------------------------------
@@ -268,7 +303,7 @@ impl Filesystem for HelmetFs {
         &mut self,
         _req: &Request,
         _config: &mut fuser::KernelConfig,
-    ) -> Result<(), libc::c_int> {
+    ) -> Result<(), std::io::Error> {
         Ok(())
     }
 
@@ -278,14 +313,14 @@ impl Filesystem for HelmetFs {
 
     fn lookup(&self, _req: &Request, parent: INodeNo, name: &OsStr, reply: ReplyEntry) {
         match self.do_lookup(parent, name) {
-            Ok(attr) => reply.entry(&TTL, &attr, 0),
-            Err(e) => reply.error(e),
+            Ok(attr) => reply.entry(&TTL, &attr, Generation(0)),
+            Err(e) => reply.error(to_errno(e)),
         }
     }
 
     // -- getattr / setattr ---------------------------------------------------
 
-    fn getattr(&self, _req: &Request, ino: INodeNo, fh: Option<fuser::FileHandle>, reply: ReplyAttr) {
+    fn getattr(&self, _req: &Request, ino: INodeNo, fh: Option<FileHandle>, reply: ReplyAttr) {
         // If we have an open file handle, use fstat
         if let Some(fh) = fh {
             let fd = decode_fd(u64::from(fh));
@@ -295,7 +330,7 @@ impl Filesystem for HelmetFs {
                     return;
                 }
                 Err(e) => {
-                    reply.error(e);
+                    reply.error(to_errno(e));
                     return;
                 }
             }
@@ -304,19 +339,19 @@ impl Filesystem for HelmetFs {
         let rel = match self.inode_path(ino) {
             Some(r) => r,
             None => {
-                reply.error(libc::ENOENT);
+                reply.error(to_errno(libc::ENOENT));
                 return;
             }
         };
 
         if helpers::is_hidden_path(&rel, &self.state.backing_dir) {
-            reply.error(libc::ENOENT);
+            reply.error(to_errno(libc::ENOENT));
             return;
         }
 
         match lstat_backing(&self.state, &rel) {
             Ok(st) => reply.attr(&TTL, &stat_to_file_attr(&st)),
-            Err(e) => reply.error(e),
+            Err(e) => reply.error(to_errno(e)),
         }
     }
 
@@ -331,7 +366,7 @@ impl Filesystem for HelmetFs {
         atime: Option<fuser::TimeOrNow>,
         mtime: Option<fuser::TimeOrNow>,
         _ctime: Option<SystemTime>,
-        fh: Option<fuser::FileHandle>,
+        fh: Option<FileHandle>,
         _crtime: Option<SystemTime>,
         _chgtime: Option<SystemTime>,
         _bkuptime: Option<SystemTime>,
@@ -341,7 +376,7 @@ impl Filesystem for HelmetFs {
         let rel = match self.inode_path(ino) {
             Some(r) => r,
             None => {
-                reply.error(libc::ENOENT);
+                reply.error(to_errno(libc::ENOENT));
                 return;
             }
         };
@@ -357,7 +392,7 @@ impl Filesystem for HelmetFs {
                 unsafe { libc::chmod(abs.as_ptr(), mode) }
             };
             if ret == -1 {
-                reply.error(neg_errno());
+                reply.error(to_errno(neg_errno()));
                 return;
             }
             // chmod triggers re-replication
@@ -378,7 +413,7 @@ impl Filesystem for HelmetFs {
                 unsafe { libc::lchown(abs.as_ptr(), u, g) }
             };
             if ret == -1 {
-                reply.error(neg_errno());
+                reply.error(to_errno(neg_errno()));
                 return;
             }
         }
@@ -391,7 +426,7 @@ impl Filesystem for HelmetFs {
                 unsafe { libc::truncate(abs.as_ptr(), size as libc::off_t) }
             };
             if ret == -1 {
-                reply.error(neg_errno());
+                reply.error(to_errno(neg_errno()));
                 return;
             }
             self.state.mark_dirty(&rel);
@@ -433,7 +468,7 @@ impl Filesystem for HelmetFs {
                 }
             };
             if ret == -1 {
-                reply.error(neg_errno());
+                reply.error(to_errno(neg_errno()));
                 return;
             }
         }
@@ -441,7 +476,7 @@ impl Filesystem for HelmetFs {
         // Return updated attrs
         match lstat_backing(&self.state, &rel) {
             Ok(st) => reply.attr(&TTL, &stat_to_file_attr(&st)),
-            Err(e) => reply.error(e),
+            Err(e) => reply.error(to_errno(e)),
         }
     }
 
@@ -451,7 +486,7 @@ impl Filesystem for HelmetFs {
         let rel = match self.inode_path(ino) {
             Some(r) => r,
             None => {
-                reply.error(libc::ENOENT);
+                reply.error(to_errno(libc::ENOENT));
                 return;
             }
         };
@@ -461,7 +496,7 @@ impl Filesystem for HelmetFs {
         let len =
             unsafe { libc::readlink(abs.as_ptr(), buf.as_mut_ptr() as *mut _, buf.len()) };
         if len == -1 {
-            reply.error(neg_errno());
+            reply.error(to_errno(neg_errno()));
         } else {
             reply.data(&buf[..len as usize]);
         }
@@ -482,26 +517,26 @@ impl Filesystem for HelmetFs {
         let rel = match self.child_rel(parent, name) {
             Some(r) => r,
             None => {
-                reply.error(libc::ENOENT);
+                reply.error(to_errno(libc::ENOENT));
                 return;
             }
         };
         if helpers::is_hidden_path(&rel, &self.state.backing_dir) {
-            reply.error(libc::EACCES);
+            reply.error(to_errno(libc::EACCES));
             return;
         }
         let abs = backing_cpath(&self.state, &rel);
         if unsafe { libc::mknod(abs.as_ptr(), mode, rdev as libc::dev_t) } == -1 {
-            reply.error(neg_errno());
+            reply.error(to_errno(neg_errno()));
             return;
         }
         match lstat_backing(&self.state, &rel) {
             Ok(st) => {
                 let attr = stat_to_file_attr(&st);
                 self.register_inode(st.st_ino, rel);
-                reply.entry(&TTL, &attr, 0);
+                reply.entry(&TTL, &attr, Generation(0));
             }
-            Err(e) => reply.error(e),
+            Err(e) => reply.error(to_errno(e)),
         }
     }
 
@@ -519,26 +554,26 @@ impl Filesystem for HelmetFs {
         let rel = match self.child_rel(parent, name) {
             Some(r) => r,
             None => {
-                reply.error(libc::ENOENT);
+                reply.error(to_errno(libc::ENOENT));
                 return;
             }
         };
         if helpers::is_hidden_path(&rel, &self.state.backing_dir) {
-            reply.error(libc::EACCES);
+            reply.error(to_errno(libc::EACCES));
             return;
         }
         let abs = backing_cpath(&self.state, &rel);
         if unsafe { libc::mkdir(abs.as_ptr(), mode) } == -1 {
-            reply.error(neg_errno());
+            reply.error(to_errno(neg_errno()));
             return;
         }
         match lstat_backing(&self.state, &rel) {
             Ok(st) => {
                 let attr = stat_to_file_attr(&st);
                 self.register_inode(st.st_ino, rel);
-                reply.entry(&TTL, &attr, 0);
+                reply.entry(&TTL, &attr, Generation(0));
             }
-            Err(e) => reply.error(e),
+            Err(e) => reply.error(to_errno(e)),
         }
     }
 
@@ -548,18 +583,18 @@ impl Filesystem for HelmetFs {
         let rel = match self.child_rel(parent, name) {
             Some(r) => r,
             None => {
-                reply.error(libc::ENOENT);
+                reply.error(to_errno(libc::ENOENT));
                 return;
             }
         };
         if helpers::is_hidden_path(&rel, &self.state.backing_dir) {
-            reply.error(libc::ENOENT);
+            reply.error(to_errno(libc::ENOENT));
             return;
         }
 
         let abs = backing_cpath(&self.state, &rel);
         if unsafe { libc::unlink(abs.as_ptr()) } == -1 {
-            reply.error(neg_errno());
+            reply.error(to_errno(neg_errno()));
             return;
         }
 
@@ -586,13 +621,13 @@ impl Filesystem for HelmetFs {
         let rel = match self.child_rel(parent, name) {
             Some(r) => r,
             None => {
-                reply.error(libc::ENOENT);
+                reply.error(to_errno(libc::ENOENT));
                 return;
             }
         };
         let abs = backing_cpath(&self.state, &rel);
         if unsafe { libc::rmdir(abs.as_ptr()) } == -1 {
-            reply.error(neg_errno());
+            reply.error(to_errno(neg_errno()));
             return;
         }
         {
@@ -615,12 +650,12 @@ impl Filesystem for HelmetFs {
         let rel = match self.child_rel(parent, link_name) {
             Some(r) => r,
             None => {
-                reply.error(libc::ENOENT);
+                reply.error(to_errno(libc::ENOENT));
                 return;
             }
         };
         if helpers::is_hidden_path(&rel, &self.state.backing_dir) {
-            reply.error(libc::EACCES);
+            reply.error(to_errno(libc::EACCES));
             return;
         }
 
@@ -628,12 +663,12 @@ impl Filesystem for HelmetFs {
         let c_target = match CString::new(target.as_os_str().as_bytes()) {
             Ok(c) => c,
             Err(_) => {
-                reply.error(libc::EINVAL);
+                reply.error(to_errno(libc::EINVAL));
                 return;
             }
         };
         if unsafe { libc::symlink(c_target.as_ptr(), abs.as_ptr()) } == -1 {
-            reply.error(neg_errno());
+            reply.error(to_errno(neg_errno()));
             return;
         }
 
@@ -644,9 +679,9 @@ impl Filesystem for HelmetFs {
             Ok(st) => {
                 let attr = stat_to_file_attr(&st);
                 self.register_inode(st.st_ino, rel);
-                reply.entry(&TTL, &attr, 0);
+                reply.entry(&TTL, &attr, Generation(0));
             }
-            Err(e) => reply.error(e),
+            Err(e) => reply.error(to_errno(e)),
         }
     }
 
@@ -659,20 +694,20 @@ impl Filesystem for HelmetFs {
         name: &OsStr,
         newparent: INodeNo,
         newname: &OsStr,
-        _flags: u32,
+        _flags: RenameFlags,
         reply: ReplyEmpty,
     ) {
         let rel_from = match self.child_rel(parent, name) {
             Some(r) => r,
             None => {
-                reply.error(libc::ENOENT);
+                reply.error(to_errno(libc::ENOENT));
                 return;
             }
         };
         let rel_to = match self.child_rel(newparent, newname) {
             Some(r) => r,
             None => {
-                reply.error(libc::ENOENT);
+                reply.error(to_errno(libc::ENOENT));
                 return;
             }
         };
@@ -681,7 +716,7 @@ impl Filesystem for HelmetFs {
         let abs_to = backing_cpath(&self.state, &rel_to);
 
         if unsafe { libc::rename(abs_from.as_ptr(), abs_to.as_ptr()) } == -1 {
-            reply.error(neg_errno());
+            reply.error(to_errno(neg_errno()));
             return;
         }
 
@@ -731,41 +766,42 @@ impl Filesystem for HelmetFs {
         _newname: &OsStr,
         reply: ReplyEntry,
     ) {
-        reply.error(libc::ENOTSUP);
+        reply.error(to_errno(libc::ENOTSUP));
     }
 
     // -- open ----------------------------------------------------------------
 
-    fn open(&self, _req: &Request, ino: INodeNo, flags: i32, reply: ReplyOpen) {
+    fn open(&self, _req: &Request, ino: INodeNo, flags: OpenFlags, reply: ReplyOpen) {
         let rel = match self.inode_path(ino) {
             Some(r) => r,
             None => {
-                reply.error(libc::ENOENT);
+                reply.error(to_errno(libc::ENOENT));
                 return;
             }
         };
         if helpers::is_hidden_path(&rel, &self.state.backing_dir) {
-            reply.error(libc::ENOENT);
+            reply.error(to_errno(libc::ENOENT));
             return;
         }
 
+        let raw_flags = flags.0;
         let abs = backing_cpath(&self.state, &rel);
-        let fd = unsafe { libc::open(abs.as_ptr(), flags) };
+        let fd = unsafe { libc::open(abs.as_ptr(), raw_flags) };
         if fd == -1 {
-            reply.error(neg_errno());
+            reply.error(to_errno(neg_errno()));
             return;
         }
 
-        let acc_mode = flags & libc::O_ACCMODE;
+        let acc_mode = raw_flags & libc::O_ACCMODE;
         let writing = acc_mode == libc::O_WRONLY
             || acc_mode == libc::O_RDWR
-            || (flags & libc::O_APPEND) != 0;
+            || (raw_flags & libc::O_APPEND) != 0;
 
         if writing {
             self.state.inc_write_ref(&rel);
         }
 
-        reply.opened(encode_fh(fd, writing), 0);
+        reply.opened(FileHandle(encode_fh(fd, writing)), FopenFlags::empty());
     }
 
     // -- read ----------------------------------------------------------------
@@ -774,19 +810,19 @@ impl Filesystem for HelmetFs {
         &self,
         _req: &Request,
         _ino: INodeNo,
-        fh: u64,
-        offset: i64,
+        fh: FileHandle,
+        offset: u64,
         size: u32,
-        _flags: i32,
-        _lock_owner: Option<u64>,
+        _flags: OpenFlags,
+        _lock_owner: Option<LockOwner>,
         reply: ReplyData,
     ) {
-        let fd = decode_fd(fh);
+        let fd = decode_fd(u64::from(fh));
         let mut buf = vec![0u8; size as usize];
         let ret =
-            unsafe { libc::pread(fd, buf.as_mut_ptr() as *mut _, buf.len(), offset) };
+            unsafe { libc::pread(fd, buf.as_mut_ptr() as *mut _, buf.len(), offset as i64) };
         if ret == -1 {
-            reply.error(neg_errno());
+            reply.error(to_errno(neg_errno()));
         } else {
             reply.data(&buf[..ret as usize]);
         }
@@ -798,20 +834,20 @@ impl Filesystem for HelmetFs {
         &self,
         _req: &Request,
         ino: INodeNo,
-        fh: u64,
-        offset: i64,
+        fh: FileHandle,
+        offset: u64,
         data: &[u8],
-        _write_flags: u32,
-        _flags: i32,
-        _lock_owner: Option<u64>,
+        _write_flags: WriteFlags,
+        _flags: OpenFlags,
+        _lock_owner: Option<LockOwner>,
         reply: ReplyWrite,
     ) {
-        let fd = decode_fd(fh);
+        let fd = decode_fd(u64::from(fh));
         let ret = unsafe {
-            libc::pwrite(fd, data.as_ptr() as *const _, data.len(), offset)
+            libc::pwrite(fd, data.as_ptr() as *const _, data.len(), offset as i64)
         };
         if ret == -1 {
-            reply.error(neg_errno());
+            reply.error(to_errno(neg_errno()));
             return;
         }
 
@@ -830,7 +866,7 @@ impl Filesystem for HelmetFs {
         unsafe {
             let mut stbuf: libc::statvfs = std::mem::zeroed();
             if libc::statvfs(abs.as_ptr(), &mut stbuf) == -1 {
-                reply.error(neg_errno());
+                reply.error(to_errno(neg_errno()));
                 return;
             }
             reply.statfs(
@@ -848,15 +884,15 @@ impl Filesystem for HelmetFs {
 
     // -- flush ---------------------------------------------------------------
 
-    fn flush(&self, _req: &Request, _ino: INodeNo, fh: u64, _lock_owner: u64, reply: ReplyEmpty) {
-        let fd = decode_fd(fh);
+    fn flush(&self, _req: &Request, _ino: INodeNo, fh: FileHandle, _lock_owner: LockOwner, reply: ReplyEmpty) {
+        let fd = decode_fd(u64::from(fh));
         let dup_fd = unsafe { libc::dup(fd) };
         if dup_fd == -1 {
-            reply.error(neg_errno());
+            reply.error(to_errno(neg_errno()));
             return;
         }
         if unsafe { libc::close(dup_fd) } == -1 {
-            reply.error(neg_errno());
+            reply.error(to_errno(neg_errno()));
             return;
         }
         reply.ok();
@@ -868,18 +904,19 @@ impl Filesystem for HelmetFs {
         &self,
         _req: &Request,
         ino: INodeNo,
-        fh: u64,
-        _flags: i32,
-        _lock_owner: Option<u64>,
+        fh: FileHandle,
+        _flags: OpenFlags,
+        _lock_owner: Option<LockOwner>,
         _flush: bool,
         reply: ReplyEmpty,
     ) {
-        let fd = decode_fd(fh);
+        let fh_raw = u64::from(fh);
+        let fd = decode_fd(fh_raw);
         unsafe {
             libc::close(fd);
         }
 
-        if is_write_fh(fh) {
+        if is_write_fh(fh_raw) {
             if let Some(rel) = self.inode_path(ino) {
                 self.state.dec_write_ref(&rel);
 
@@ -897,15 +934,15 @@ impl Filesystem for HelmetFs {
 
     // -- fsync ---------------------------------------------------------------
 
-    fn fsync(&self, _req: &Request, _ino: INodeNo, fh: u64, datasync: bool, reply: ReplyEmpty) {
-        let fd = decode_fd(fh);
+    fn fsync(&self, _req: &Request, _ino: INodeNo, fh: FileHandle, datasync: bool, reply: ReplyEmpty) {
+        let fd = decode_fd(u64::from(fh));
         let ret = if datasync {
             unsafe { libc::fdatasync(fd) }
         } else {
             unsafe { libc::fsync(fd) }
         };
         if ret == -1 {
-            reply.error(neg_errno());
+            reply.error(to_errno(neg_errno()));
         } else {
             reply.ok();
         }
@@ -913,26 +950,26 @@ impl Filesystem for HelmetFs {
 
     // -- opendir -------------------------------------------------------------
 
-    fn opendir(&self, _req: &Request, ino: INodeNo, _flags: i32, reply: ReplyOpen) {
+    fn opendir(&self, _req: &Request, ino: INodeNo, _flags: OpenFlags, reply: ReplyOpen) {
         let rel = match self.inode_path(ino) {
             Some(r) => r,
             None => {
-                reply.error(libc::ENOENT);
+                reply.error(to_errno(libc::ENOENT));
                 return;
             }
         };
         if helpers::is_hidden_path(&rel, &self.state.backing_dir) {
-            reply.error(libc::ENOENT);
+            reply.error(to_errno(libc::ENOENT));
             return;
         }
 
         let abs = backing_cpath(&self.state, &rel);
         let dp = unsafe { libc::opendir(abs.as_ptr()) };
         if dp.is_null() {
-            reply.error(neg_errno());
+            reply.error(to_errno(neg_errno()));
             return;
         }
-        reply.opened(dp as u64, 0);
+        reply.opened(FileHandle(dp as u64), FopenFlags::empty());
     }
 
     // -- readdir -------------------------------------------------------------
@@ -941,14 +978,14 @@ impl Filesystem for HelmetFs {
         &self,
         _req: &Request,
         ino: INodeNo,
-        _fh: u64,
-        offset: i64,
+        _fh: FileHandle,
+        offset: u64,
         mut reply: ReplyDirectory,
     ) {
         let rel = match self.inode_path(ino) {
             Some(r) => r,
             None => {
-                reply.error(libc::ENOENT);
+                reply.error(to_errno(libc::ENOENT));
                 return;
             }
         };
@@ -957,7 +994,7 @@ impl Filesystem for HelmetFs {
         let entries = match std::fs::read_dir(&abs_dir) {
             Ok(e) => e,
             Err(e) => {
-                reply.error(helpers::io_error_to_errno(&e));
+                reply.error(to_errno(helpers::io_error_to_errno(&e)));
                 return;
             }
         };
@@ -1024,7 +1061,7 @@ impl Filesystem for HelmetFs {
         // Send entries starting from offset
         for (i, (entry_ino, ft, name)) in all_entries.iter().enumerate().skip(offset as usize) {
             // offset+1 means the next readdir call will start after this entry
-            let full = reply.add(*entry_ino, (i + 1) as i64, *ft, name);
+            let full = reply.add(*entry_ino, (i + 1) as u64, *ft, name);
             if full {
                 break;
             }
@@ -1035,8 +1072,8 @@ impl Filesystem for HelmetFs {
 
     // -- releasedir ----------------------------------------------------------
 
-    fn releasedir(&self, _req: &Request, _ino: INodeNo, fh: u64, _flags: i32, reply: ReplyEmpty) {
-        let dp = fh as *mut libc::DIR;
+    fn releasedir(&self, _req: &Request, _ino: INodeNo, fh: FileHandle, _flags: OpenFlags, reply: ReplyEmpty) {
+        let dp = u64::from(fh) as *mut libc::DIR;
         if !dp.is_null() {
             unsafe {
                 libc::closedir(dp);
@@ -1047,22 +1084,22 @@ impl Filesystem for HelmetFs {
 
     // -- access --------------------------------------------------------------
 
-    fn access(&self, _req: &Request, ino: INodeNo, mask: i32, reply: ReplyEmpty) {
+    fn access(&self, _req: &Request, ino: INodeNo, mask: AccessFlags, reply: ReplyEmpty) {
         let rel = match self.inode_path(ino) {
             Some(r) => r,
             None => {
-                reply.error(libc::ENOENT);
+                reply.error(to_errno(libc::ENOENT));
                 return;
             }
         };
         if helpers::is_hidden_path(&rel, &self.state.backing_dir) {
-            reply.error(libc::ENOENT);
+            reply.error(to_errno(libc::ENOENT));
             return;
         }
 
         let abs = backing_cpath(&self.state, &rel);
-        if unsafe { libc::access(abs.as_ptr(), mask) } == -1 {
-            reply.error(neg_errno());
+        if unsafe { libc::access(abs.as_ptr(), mask.bits()) } == -1 {
+            reply.error(to_errno(neg_errno()));
         } else {
             reply.ok();
         }
@@ -1083,19 +1120,19 @@ impl Filesystem for HelmetFs {
         let rel = match self.child_rel(parent, name) {
             Some(r) => r,
             None => {
-                reply.error(libc::ENOENT);
+                reply.error(to_errno(libc::ENOENT));
                 return;
             }
         };
         if helpers::is_hidden_path(&rel, &self.state.backing_dir) {
-            reply.error(libc::EACCES);
+            reply.error(to_errno(libc::EACCES));
             return;
         }
 
         let abs = backing_cpath(&self.state, &rel);
         let fd = unsafe { libc::open(abs.as_ptr(), flags | libc::O_CREAT, mode) };
         if fd == -1 {
-            reply.error(neg_errno());
+            reply.error(to_errno(neg_errno()));
             return;
         }
 
@@ -1108,14 +1145,14 @@ impl Filesystem for HelmetFs {
             Ok(st) => {
                 let attr = stat_to_file_attr(&st);
                 self.register_inode(st.st_ino, rel);
-                reply.created(&TTL, &attr, 0, fh, 0);
+                reply.created(&TTL, &attr, Generation(0), FileHandle(fh), FopenFlags::empty());
             }
             Err(e) => {
                 // Clean up fd on error
                 unsafe {
                     libc::close(fd);
                 }
-                reply.error(e);
+                reply.error(to_errno(e));
             }
         }
     }
@@ -1135,7 +1172,7 @@ impl Filesystem for HelmetFs {
         let rel = match self.inode_path(ino) {
             Some(r) => r,
             None => {
-                reply.error(libc::ENOENT);
+                reply.error(to_errno(libc::ENOENT));
                 return;
             }
         };
@@ -1143,7 +1180,7 @@ impl Filesystem for HelmetFs {
         let c_name = match CString::new(name.as_bytes()) {
             Ok(c) => c,
             Err(_) => {
-                reply.error(libc::EINVAL);
+                reply.error(to_errno(libc::EINVAL));
                 return;
             }
         };
@@ -1157,7 +1194,7 @@ impl Filesystem for HelmetFs {
             )
         } == -1
         {
-            reply.error(neg_errno());
+            reply.error(to_errno(neg_errno()));
         } else {
             reply.ok();
         }
@@ -1174,7 +1211,7 @@ impl Filesystem for HelmetFs {
         let rel = match self.inode_path(ino) {
             Some(r) => r,
             None => {
-                reply.error(libc::ENOENT);
+                reply.error(to_errno(libc::ENOENT));
                 return;
             }
         };
@@ -1182,7 +1219,7 @@ impl Filesystem for HelmetFs {
         let c_name = match CString::new(name.as_bytes()) {
             Ok(c) => c,
             Err(_) => {
-                reply.error(libc::EINVAL);
+                reply.error(to_errno(libc::EINVAL));
                 return;
             }
         };
@@ -1198,7 +1235,7 @@ impl Filesystem for HelmetFs {
                 )
             };
             if ret == -1 {
-                reply.error(neg_errno());
+                reply.error(to_errno(neg_errno()));
             } else {
                 reply.size(ret as u32);
             }
@@ -1213,7 +1250,7 @@ impl Filesystem for HelmetFs {
                 )
             };
             if ret == -1 {
-                reply.error(neg_errno());
+                reply.error(to_errno(neg_errno()));
             } else {
                 reply.data(&buf[..ret as usize]);
             }
@@ -1224,7 +1261,7 @@ impl Filesystem for HelmetFs {
         let rel = match self.inode_path(ino) {
             Some(r) => r,
             None => {
-                reply.error(libc::ENOENT);
+                reply.error(to_errno(libc::ENOENT));
                 return;
             }
         };
@@ -1233,7 +1270,7 @@ impl Filesystem for HelmetFs {
         if size == 0 {
             let ret = unsafe { libc::listxattr(abs.as_ptr(), std::ptr::null_mut(), 0) };
             if ret == -1 {
-                reply.error(neg_errno());
+                reply.error(to_errno(neg_errno()));
             } else {
                 reply.size(ret as u32);
             }
@@ -1243,7 +1280,7 @@ impl Filesystem for HelmetFs {
                 libc::listxattr(abs.as_ptr(), buf.as_mut_ptr() as *mut _, buf.len())
             };
             if ret == -1 {
-                reply.error(neg_errno());
+                reply.error(to_errno(neg_errno()));
             } else {
                 reply.data(&buf[..ret as usize]);
             }
@@ -1254,7 +1291,7 @@ impl Filesystem for HelmetFs {
         let rel = match self.inode_path(ino) {
             Some(r) => r,
             None => {
-                reply.error(libc::ENOENT);
+                reply.error(to_errno(libc::ENOENT));
                 return;
             }
         };
@@ -1262,12 +1299,12 @@ impl Filesystem for HelmetFs {
         let c_name = match CString::new(name.as_bytes()) {
             Ok(c) => c,
             Err(_) => {
-                reply.error(libc::EINVAL);
+                reply.error(to_errno(libc::EINVAL));
                 return;
             }
         };
         if unsafe { libc::removexattr(abs.as_ptr(), c_name.as_ptr()) } == -1 {
-            reply.error(neg_errno());
+            reply.error(to_errno(neg_errno()));
         } else {
             reply.ok();
         }

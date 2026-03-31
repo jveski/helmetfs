@@ -49,9 +49,10 @@ pub fn scrub_thread(state: &Arc<FsState>) {
             update_scrub_timestamp(state);
         }
 
-        // Sleep in small increments so we can respond to shutdown
-        let sleep_secs = state.scrub_interval_secs;
-        for _ in 0..sleep_secs {
+        // Sleep in small increments so we can respond to shutdown.
+        // Use wall-clock target to avoid drift from scrub execution time.
+        let target = std::time::Instant::now() + Duration::from_secs(state.scrub_interval_secs);
+        while std::time::Instant::now() < target {
             if state.shutting_down.load(Ordering::Relaxed) {
                 break;
             }

@@ -3,7 +3,7 @@
 use helmetfs::{fuse_ops, replication, scrub, state};
 
 use clap::{Parser, Subcommand};
-use fuser::MountOption;
+use fuser::{Config, MountOption};
 use std::path::PathBuf;
 use std::process;
 use std::sync::atomic::Ordering;
@@ -141,7 +141,8 @@ fn cmd_mount(
     let helmet_fs = fuse_ops::HelmetFs::new(fs_state.clone());
 
     // Mount options
-    let options = vec![
+    let mut options = Config::default();
+    options.mount_options = vec![
         MountOption::DefaultPermissions,
         MountOption::FSName("helmetfs".to_string()),
         MountOption::AutoUnmount,

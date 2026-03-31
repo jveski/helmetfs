@@ -166,17 +166,17 @@ fn test_repl_log_persistence() {
 
     // Reload and verify entries are recovered
     let state2 = make_state(&backing, &replica);
-    let (idx, entry) = state2.repl_log.try_next().expect("Should have pending entry");
+    let (id, entry) = state2.repl_log.try_next().expect("Should have pending entry");
     assert_eq!(entry.path, "file1.txt");
-    state2.repl_log.mark_completed(idx);
+    state2.repl_log.mark_completed(id);
 
-    let (idx, entry) = state2.repl_log.try_next().expect("Should have pending entry");
+    let (id, entry) = state2.repl_log.try_next().expect("Should have pending entry");
     assert_eq!(entry.path, "file2.txt");
-    state2.repl_log.mark_completed(idx);
+    state2.repl_log.mark_completed(id);
 
-    let (idx, entry) = state2.repl_log.try_next().expect("Should have pending entry");
+    let (id, entry) = state2.repl_log.try_next().expect("Should have pending entry");
     assert_eq!(entry.path, "old.txt");
-    state2.repl_log.mark_completed(idx);
+    state2.repl_log.mark_completed(id);
 
     assert!(state2.repl_log.try_next().is_none(), "Should be empty now");
 }
@@ -197,11 +197,11 @@ fn test_put_coalescing() {
 
     // Only the last one should be uncompleted
     // First should be coalesced (completed)
-    let (idx1, entry1) = state.repl_log.try_next().unwrap();
+    let (id1, entry1) = state.repl_log.try_next().unwrap();
     assert_eq!(entry1.path, "data.txt");
     // This should be the last enqueued put (the non-coalesced one)
 
-    state.repl_log.mark_completed(idx1);
+    state.repl_log.mark_completed(id1);
 
     // After marking the one pending entry completed, there should be none left
     assert!(
@@ -391,7 +391,8 @@ fn test_delete_idempotency() {
 
     assert!(replica.join("files/delme.txt").exists());
 
-    // Enqueue delete twice
+    // Enqueue delete twice — first remove the backing file and its .sum,
+    // matching the real FUSE unlink flow.
     let state2 = Arc::new(
         helmetfs::state::FsState::new(
             backing.to_path_buf(),
@@ -400,6 +401,8 @@ fn test_delete_idempotency() {
         )
         .unwrap(),
     );
+    let _ = std::fs::remove_file(backing.join("delme.txt"));
+    let _ = std::fs::remove_file(backing.join("delme.txt.sum"));
     state2.repl_log.enqueue_delete("delme.txt");
     state2.repl_log.enqueue_delete("delme.txt");
 

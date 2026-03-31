@@ -27,6 +27,6 @@ helmetfs unmount <mountpoint>
 | Flag | Description | Default |
 |---|---|---|
 | `--replica <path>` | Replica directory (required) | -- |
-| `--replication-workers <n>` | Number of background worker threads | `4` |
-| `--scrub-time HH:MM` | Daily scrub schedule (24-hour format) | `01:00` |
+| `--replication-workers <n>` | Number of background worker threads | `2` |
+| `--scrub-interval <seconds>` | Seconds between scrub runs | `86400` |
 

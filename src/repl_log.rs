@@ -29,6 +29,10 @@ pub enum ReplOp {
 pub struct ReplEntry {
     pub op: ReplOp,
     pub path: String,
+    /// Stable identifier that never changes once assigned.
+    pub id: u64,
+    /// Set to true when a worker has claimed this entry via wait_next/try_next.
+    pub in_progress: bool,
     /// Set to true when the entry has been processed (or coalesced away).
     pub completed: bool,
 }
@@ -45,6 +49,8 @@ pub struct ReplLog {
 
 struct ReplLogInner {
     entries: VecDeque<ReplEntry>,
+    /// Monotonically increasing counter for assigning stable entry IDs.
+    next_id: u64,
 }
 
 impl ReplLog {
@@ -56,6 +62,7 @@ impl ReplLog {
         let log_path = helmetfs_dir.join("repl.log");
 
         let mut entries = VecDeque::new();
+        let mut next_id: u64 = 0;
         if log_path.exists() {
             let file = fs::File::open(&log_path)?;
             for line in io::BufReader::new(file).lines() {
@@ -68,14 +75,20 @@ impl ReplLog {
                     entries.push_back(ReplEntry {
                         op: ReplOp::Put,
                         path: path.to_string(),
+                        id: next_id,
+                        in_progress: false,
                         completed: false,
                     });
+                    next_id += 1;
                 } else if let Some(path) = line.strip_prefix("delete ") {
                     entries.push_back(ReplEntry {
                         op: ReplOp::Delete,
                         path: path.to_string(),
+                        id: next_id,
+                        in_progress: false,
                         completed: false,
                     });
+                    next_id += 1;
                 }
             }
             if !entries.is_empty() {
@@ -84,7 +97,7 @@ impl ReplLog {
         }
 
         Ok(Self {
-            inner: Mutex::new(ReplLogInner { entries }),
+            inner: Mutex::new(ReplLogInner { entries, next_id }),
             cond: Condvar::new(),
             log_path,
         })
@@ -94,42 +107,67 @@ impl ReplLog {
     /// the same path (marks the earlier one completed).
     pub fn enqueue_put(&self, path: &str) {
         let mut inner = self.inner.lock().unwrap();
-        // Coalesce: mark earlier pending puts for same path as completed
+        // Coalesce: mark earlier pending entries for the same path as completed,
+        // but only if they are not currently in_progress (being actively processed).
+        //
+        // This coalesces both earlier puts (same-op) AND earlier deletes (cross-op).
+        // A put copies the current backing content, so it fully subsumes an
+        // earlier delete—the replica will end up with the latest file regardless.
+        // Without cross-op coalescing, multi-worker out-of-order processing can
+        // cause an earlier delete to execute after this put, leaving the replica
+        // empty.
         for entry in inner.entries.iter_mut() {
-            if !entry.completed && entry.op == ReplOp::Put && entry.path == path {
+            if !entry.completed && !entry.in_progress && entry.path == path {
                 entry.completed = true;
             }
         }
+        let id = inner.next_id;
+        inner.next_id += 1;
         inner.entries.push_back(ReplEntry {
             op: ReplOp::Put,
             path: path.to_string(),
+            id,
+            in_progress: false,
             completed: false,
         });
         self.persist_locked(&inner);
         self.cond.notify_one();
     }
 
-    /// Enqueue a `delete` entry. Deletes are never coalesced.
+    /// Enqueue a `delete` entry. Cross-op coalescing: mark earlier pending
+    /// (not in_progress) puts for the same path as completed—there is no point
+    /// copying a file we are about to remove.
     pub fn enqueue_delete(&self, path: &str) {
         let mut inner = self.inner.lock().unwrap();
+        for entry in inner.entries.iter_mut() {
+            if !entry.completed && !entry.in_progress && entry.op == ReplOp::Put && entry.path == path {
+                entry.completed = true;
+            }
+        }
+        let id = inner.next_id;
+        inner.next_id += 1;
         inner.entries.push_back(ReplEntry {
             op: ReplOp::Delete,
             path: path.to_string(),
+            id,
+            in_progress: false,
             completed: false,
         });
         self.persist_locked(&inner);
         self.cond.notify_one();
     }
 
-    /// Block until there is an uncompleted entry, then return a clone of it
-    /// (and its index). The caller must call `mark_completed` after processing.
+    /// Block until there is an uncompleted, not-in-progress entry, then mark it
+    /// as in_progress and return a clone of it (and its stable id). The caller
+    /// must call `mark_completed` after processing.
     /// Returns `None` if woken up with no entries (e.g. shutdown signal).
-    pub fn wait_next(&self) -> Option<(usize, ReplEntry)> {
+    pub fn wait_next(&self) -> Option<(u64, ReplEntry)> {
         let mut inner = self.inner.lock().unwrap();
         loop {
-            for (i, entry) in inner.entries.iter().enumerate() {
-                if !entry.completed {
-                    return Some((i, entry.clone()));
+            for entry in inner.entries.iter_mut() {
+                if !entry.completed && !entry.in_progress {
+                    entry.in_progress = true;
+                    return Some((entry.id, entry.clone()));
                 }
             }
             // Use wait_timeout to avoid permanent blocking
@@ -141,31 +179,36 @@ impl ReplLog {
 
             // After wakeup, check again — if still nothing, return None
             // so the caller can check for shutdown
-            let has_pending = inner.entries.iter().any(|e| !e.completed);
+            let has_pending = inner.entries.iter().any(|e| !e.completed && !e.in_progress);
             if !has_pending {
                 return None;
             }
         }
     }
 
-    /// Try to get next uncompleted entry without blocking. Returns None if
-    /// there are no pending entries.
-    pub fn try_next(&self) -> Option<(usize, ReplEntry)> {
-        let inner = self.inner.lock().unwrap();
-        for (i, entry) in inner.entries.iter().enumerate() {
-            if !entry.completed {
-                return Some((i, entry.clone()));
+    /// Try to get next uncompleted, not-in-progress entry without blocking.
+    /// Marks it as in_progress. Returns None if there are no available entries.
+    pub fn try_next(&self) -> Option<(u64, ReplEntry)> {
+        let mut inner = self.inner.lock().unwrap();
+        for entry in inner.entries.iter_mut() {
+            if !entry.completed && !entry.in_progress {
+                entry.in_progress = true;
+                return Some((entry.id, entry.clone()));
             }
         }
         None
     }
 
-    /// Mark entry at index `idx` as completed and garbage-collect leading
-    /// completed entries.
-    pub fn mark_completed(&self, idx: usize) {
+    /// Mark entry with the given stable `id` as completed and garbage-collect
+    /// leading completed entries.
+    pub fn mark_completed(&self, id: u64) {
         let mut inner = self.inner.lock().unwrap();
-        if idx < inner.entries.len() {
-            inner.entries[idx].completed = true;
+        for entry in inner.entries.iter_mut() {
+            if entry.id == id {
+                entry.completed = true;
+                entry.in_progress = false;
+                break;
+            }
         }
         // GC: remove completed entries from the front
         while inner
@@ -179,6 +222,7 @@ impl ReplLog {
     }
 
     /// Check if there is a pending (uncompleted) `put` for the given path.
+    /// Entries that are in_progress are also considered pending (being processed).
     pub fn has_pending_put(&self, path: &str) -> bool {
         let inner = self.inner.lock().unwrap();
         inner
