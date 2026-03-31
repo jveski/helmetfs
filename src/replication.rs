@@ -12,7 +12,7 @@ use std::sync::Arc;
 
 use crate::helpers;
 use crate::repl_log::ReplOp;
-use crate::state::FsState;
+use crate::state::{self, FsState};
 
 /// Run the replication worker loop. Returns when `state.shutting_down` is set
 /// and there are no more pending entries.
@@ -116,7 +116,7 @@ fn replicate_put(state: &FsState, rel: &str) -> io::Result<()> {
 fn replicate_delete(state: &FsState, rel: &str) -> io::Result<()> {
     let src = state.backing_path(rel);
     let src_sum = helpers::sum_path_for(&src);
-    if src.exists() && src_sum.exists() {
+    if state::should_skip_delete(src.exists(), src_sum.exists()) {
         log::debug!(
             "Skipping replica delete for {} — file was re-created",
             rel

@@ -4,6 +4,17 @@
 //! (FUSE callbacks, replication workers, scrub thread) and exhaustively
 //! explore all interleavings to verify safety properties.
 //!
+//! # Shared business logic
+//!
+//! The model uses the **same types and logic** as the real implementation:
+//! - `PathStateMap` for write-ref tracking, dirty flags, busy checks
+//! - `ReplQueue` for replication log coalescing, claiming, completion, GC
+//! - `ReplOp`, `ReplEntry`, `PathInfo` — the exact production types
+//! - `should_skip_delete` and `can_heal` — the exact production predicates
+//!
+//! Only the abstract file stores (backing, replica, checksums) are
+//! model-specific, since the real implementation uses actual filesystem I/O.
+//!
 //! # What is modeled
 //!
 //! The model captures the abstract interactions between:
@@ -14,11 +25,8 @@
 //! - **Scrub thread**: detect corrupt/untracked files and heal from replica
 //!
 //! File *content* is modeled as an abstract version counter (u8). The backing
-//! store, replica store, checksum sidecar (.sum), and replication log are all
-//! modeled as in-memory data structures within the Stateright state.
-//!
-//! Entries are identified by their stable `id` (u64), matching the real
-//! implementation, NOT by their position in the vector.
+//! store, replica store, checksum sidecar (.sum), and replica checksums are
+//! modeled as in-memory BTreeMaps.
 //!
 //! # Safety properties verified
 //!
@@ -27,7 +35,7 @@
 //!    for every file that has been checksummed.
 //! 2. **No healing during active writes**: scrub never heals a file that has
 //!    open write handles or a dirty flag.
-//! 3. **Write-ref integrity**: write_ref is never negative (modeled as u8,
+//! 3. **Write-ref integrity**: write_ref is never negative (modeled as u32,
 //!    so never wraps past 0).
 //! 4. **Coalescing correctness**: after coalescing and processing, the replica
 //!    always ends up with the latest version of the file.
@@ -41,6 +49,10 @@
 use stateright::*;
 use std::collections::BTreeMap;
 
+// Import shared types and logic from the real helmetfs crate.
+use helmetfs::repl_log::{ReplOp, ReplQueue};
+use helmetfs::state::{can_heal, should_skip_delete, PathStateMap};
+
 // =========================================================================
 // Abstract file content
 // =========================================================================
@@ -48,44 +60,6 @@ use std::collections::BTreeMap;
 /// Abstract file version. 0 = file does not exist (or was never written).
 /// Incremented on each write.
 type Version = u8;
-
-// =========================================================================
-// Replication log entry (abstract)
-// =========================================================================
-
-#[derive(Clone, Debug, Eq, PartialEq, Hash, Ord, PartialOrd)]
-enum ReplOp {
-    Put,
-    Delete,
-}
-
-#[derive(Clone, Debug, Eq, PartialEq, Hash, Ord, PartialOrd)]
-struct ReplEntry {
-    op: ReplOp,
-    path: String,
-    id: u64,
-    in_progress: bool,
-    completed: bool,
-}
-
-// =========================================================================
-// Per-path metadata (mirrors state.rs PathInfo)
-// =========================================================================
-
-#[derive(Clone, Debug, Eq, PartialEq, Hash, Ord, PartialOrd)]
-struct PathInfo {
-    write_ref: u8,
-    dirty: bool,
-}
-
-impl Default for PathInfo {
-    fn default() -> Self {
-        Self {
-            write_ref: 0,
-            dirty: false,
-        }
-    }
-}
 
 // =========================================================================
 // System state (the Stateright "State")
@@ -105,14 +79,11 @@ struct FsModelState {
     /// Replica sidecar checksums: path -> version.
     replica_sums: BTreeMap<String, Version>,
 
-    /// Per-path metadata (write_ref, dirty).
-    path_state: BTreeMap<String, PathInfo>,
+    /// Per-path metadata (write_ref, dirty) — shared with real code.
+    path_state: PathStateMap,
 
-    /// Replication log queue.
-    repl_log: Vec<ReplEntry>,
-
-    /// Next repl log entry id.
-    next_repl_id: u64,
+    /// Replication log queue — shared with real code.
+    repl_log: ReplQueue,
 
     /// Whether the system is shutting down.
     shutting_down: bool,
@@ -122,6 +93,11 @@ struct FsModelState {
 
     /// Track total number of FUSE operations completed (for boundary).
     fuse_ops_done: u8,
+
+    /// Track total number of corruption events (for boundary).
+    /// Corruption is an environment action, not a FUSE operation, so it needs
+    /// its own counter to prevent unbounded corruption-heal cycles.
+    corruption_count: u8,
 }
 
 impl FsModelState {
@@ -131,193 +107,34 @@ impl FsModelState {
             sums: BTreeMap::new(),
             replica: BTreeMap::new(),
             replica_sums: BTreeMap::new(),
-            path_state: BTreeMap::new(),
-            repl_log: Vec::new(),
-            next_repl_id: 0,
+            path_state: PathStateMap::new(),
+            repl_log: ReplQueue::new(),
             shutting_down: false,
             scrub_ran: false,
             fuse_ops_done: 0,
+            corruption_count: 0,
         }
     }
-
-    // -- path_state helpers (mirror state.rs) --
-
-    fn inc_write_ref(&mut self, path: &str) {
-        let info = self.path_state.entry(path.to_string()).or_default();
-        info.write_ref += 1;
-    }
-
-    fn dec_write_ref(&mut self, path: &str) {
-        if let Some(info) = self.path_state.get_mut(path) {
-            info.write_ref = info.write_ref.saturating_sub(1);
-        }
-    }
-
-    fn mark_dirty(&mut self, path: &str) {
-        let info = self.path_state.entry(path.to_string()).or_default();
-        info.dirty = true;
-    }
-
-    fn clear_dirty(&mut self, path: &str) {
-        if let Some(info) = self.path_state.get_mut(path) {
-            info.dirty = false;
-        }
-    }
-
-    fn is_busy(&self, path: &str) -> bool {
-        if let Some(info) = self.path_state.get(path) {
-            info.write_ref > 0 || info.dirty
-        } else {
-            false
-        }
-    }
-
-    fn get_write_ref(&self, path: &str) -> u8 {
-        self.path_state
-            .get(path)
-            .map(|i| i.write_ref)
-            .unwrap_or(0)
-    }
-
-    fn remove_path_state(&mut self, path: &str) {
-        self.path_state.remove(path);
-    }
-
-    // -- repl_log helpers (mirror repl_log.rs) --
-
-    fn enqueue_put(&mut self, path: &str) {
-        // Coalesce: mark earlier pending (not in_progress) entries for the same
-        // path as completed.  This includes both earlier puts (same-op coalescing,
-        // matching the real code) AND earlier deletes (cross-op coalescing).
-        //
-        // Cross-op rationale: a put copies the *current* backing content, so it
-        // fully subsumes an earlier delete—the replica will end up with the
-        // latest file regardless.  Without this, multi-worker out-of-order
-        // processing can cause the earlier delete to execute *after* this put,
-        // leaving the replica empty.  This was discovered by the model checker.
-        for entry in self.repl_log.iter_mut() {
-            if !entry.completed
-                && !entry.in_progress
-                && entry.path == path
-            {
-                entry.completed = true;
-            }
-        }
-        let id = self.next_repl_id;
-        self.next_repl_id += 1;
-        self.repl_log.push(ReplEntry {
-            op: ReplOp::Put,
-            path: path.to_string(),
-            id,
-            in_progress: false,
-            completed: false,
-        });
-    }
-
-    fn enqueue_delete(&mut self, path: &str) {
-        // Cross-op coalescing: mark earlier pending (not in_progress) puts for
-        // the same path as completed.  A delete supersedes an earlier put—there
-        // is no point copying a file we are about to remove.  Without this, a
-        // multi-worker race could process the put *after* the delete, leaving a
-        // stale file in the replica.
-        for entry in self.repl_log.iter_mut() {
-            if !entry.completed
-                && !entry.in_progress
-                && entry.op == ReplOp::Put
-                && entry.path == path
-            {
-                entry.completed = true;
-            }
-        }
-        let id = self.next_repl_id;
-        self.next_repl_id += 1;
-        self.repl_log.push(ReplEntry {
-            op: ReplOp::Delete,
-            path: path.to_string(),
-            id,
-            in_progress: false,
-            completed: false,
-        });
-    }
-
-    fn has_pending_put(&self, path: &str) -> bool {
-        self.repl_log
-            .iter()
-            .any(|e| !e.completed && e.op == ReplOp::Put && e.path == path)
-    }
-
-    /// Claim next available entry by stable id (not completed, not in_progress).
-    /// Returns the stable id of the claimed entry, if found.
-    fn claim_next_entry(&mut self) -> Option<u64> {
-        for entry in self.repl_log.iter_mut() {
-            if !entry.completed && !entry.in_progress {
-                entry.in_progress = true;
-                return Some(entry.id);
-            }
-        }
-        None
-    }
-
-    /// Find entry by stable id.
-    fn find_entry(&self, id: u64) -> Option<&ReplEntry> {
-        self.repl_log.iter().find(|e| e.id == id)
-    }
-
-    /// Mark entry completed and GC leading completed entries.
-    fn mark_completed(&mut self, id: u64) {
-        for entry in self.repl_log.iter_mut() {
-            if entry.id == id {
-                entry.completed = true;
-                entry.in_progress = false;
-                break;
-            }
-        }
-        // GC leading completed entries
-        while self
-            .repl_log
-            .first()
-            .map_or(false, |e| e.completed)
-        {
-            self.repl_log.remove(0);
-        }
-    }
-
-    /// Number of pending (uncompleted) entries.
-    fn pending_count(&self) -> usize {
-        self.repl_log.iter().filter(|e| !e.completed).count()
-    }
-
-    /// IDs of in-progress entries (used for action generation).
-    fn in_progress_ids(&self) -> Vec<u64> {
-        self.repl_log
-            .iter()
-            .filter(|e| e.in_progress && !e.completed)
-            .map(|e| e.id)
-            .collect()
-    }
-
-    // -- checksum helpers (mirror state.rs checksum_and_enqueue) --
 
     /// Abstract checksum_and_enqueue: record the current backing version as
     /// the .sum, clear dirty, enqueue put.
+    ///
+    /// The real code does actual BLAKE3 + .sum file I/O here; the model
+    /// abstracts file content as a version counter.  The coordination logic
+    /// (clear_dirty, enqueue_put) is shared via PathStateMap and ReplQueue.
     fn checksum_and_enqueue(&mut self, path: &str) {
         if let Some(&ver) = self.backing.get(path) {
             if ver > 0 {
                 self.sums.insert(path.to_string(), ver);
-                self.clear_dirty(path);
-                self.enqueue_put(path);
+                self.path_state.clear_dirty(path);
+                self.repl_log.enqueue_put(path);
             }
         }
     }
 
     /// Is the system quiescent? No open writers, nothing dirty, no pending repl.
     fn is_quiescent(&self) -> bool {
-        let no_writers = self
-            .path_state
-            .values()
-            .all(|info| info.write_ref == 0 && !info.dirty);
-        let no_pending = self.pending_count() == 0;
-        no_writers && no_pending
+        self.path_state.all_idle() && self.repl_log.pending_count() == 0
     }
 }
 
@@ -358,8 +175,8 @@ fn apply_action(s: &mut FsModelState, action: &Action) -> bool {
     match action {
         Action::Create { ref path } => {
             s.backing.insert(path.clone(), 1);
-            s.inc_write_ref(path);
-            s.mark_dirty(path);
+            s.path_state.inc_write_ref(path);
+            s.path_state.mark_dirty(path);
             s.fuse_ops_done += 1;
         }
 
@@ -367,18 +184,14 @@ fn apply_action(s: &mut FsModelState, action: &Action) -> bool {
             if let Some(ver) = s.backing.get_mut(path) {
                 *ver += 1;
             }
-            s.mark_dirty(path);
+            s.path_state.mark_dirty(path);
             s.fuse_ops_done += 1;
         }
 
         Action::Release { ref path } => {
-            s.dec_write_ref(path);
-            let should_checksum = s
-                .path_state
-                .get(path)
-                .map(|info| info.write_ref == 0 && info.dirty)
-                .unwrap_or(false);
-            if should_checksum {
+            s.path_state.dec_write_ref(path);
+            // Shared predicate: checksum if write_ref==0 && dirty
+            if s.path_state.should_checksum(path) {
                 s.checksum_and_enqueue(path);
             }
             s.fuse_ops_done += 1;
@@ -387,8 +200,8 @@ fn apply_action(s: &mut FsModelState, action: &Action) -> bool {
         Action::Unlink { ref path } => {
             s.backing.remove(path);
             s.sums.remove(path);
-            s.remove_path_state(path);
-            s.enqueue_delete(path);
+            s.path_state.remove(path);
+            s.repl_log.enqueue_delete(path);
             s.fuse_ops_done += 1;
         }
 
@@ -400,12 +213,11 @@ fn apply_action(s: &mut FsModelState, action: &Action) -> bool {
             if let Some(sum_ver) = s.sums.remove(from) {
                 s.sums.insert(to.clone(), sum_ver);
             }
-            if let Some(info) = s.path_state.remove(from) {
-                s.path_state.insert(to.clone(), info);
-            }
-            s.enqueue_delete(from);
+            // Shared: transfer path state from old to new path
+            s.path_state.transfer(from, to);
+            s.repl_log.enqueue_delete(from);
             if had_sum {
-                s.enqueue_put(to);
+                s.repl_log.enqueue_put(to);
             } else if s.backing.get(to).copied().unwrap_or(0) > 0 {
                 s.checksum_and_enqueue(to);
             }
@@ -413,11 +225,12 @@ fn apply_action(s: &mut FsModelState, action: &Action) -> bool {
         }
 
         Action::WorkerClaim => {
-            s.claim_next_entry();
+            // Shared: claim next entry from the replication queue
+            s.repl_log.claim_next_id();
         }
 
         Action::WorkerProcess { id } => {
-            let entry = match s.find_entry(*id) {
+            let entry = match s.repl_log.find_entry(*id) {
                 Some(e) => e.clone(),
                 None => return false, // Entry already GC'd, no-op
             };
@@ -440,40 +253,33 @@ fn apply_action(s: &mut FsModelState, action: &Action) -> bool {
                     // If backing file doesn't exist, real code errors. We just skip.
                 }
                 ReplOp::Delete => {
-                    // Guard: skip the delete if the backing file currently
-                    // exists AND has a checksum.  This means the file was
-                    // re-created (and checksummed) since the delete was
-                    // enqueued, so removing the replica copy would lose the
-                    // latest version.
-                    //
-                    // This is necessary because with N>1 workers, a delete
-                    // entry claimed before a subsequent re-create+put can
-                    // execute *after* the put, wiping out the replica copy.
-                    // The model checker discovered this race condition.
-                    let file_exists_and_tracked = s
+                    // Shared predicate: skip delete if file was re-created
+                    let file_exists = s
                         .backing
                         .get(path)
-                        .map_or(false, |&v| v > 0)
-                        && s.sums.contains_key(path);
-                    if !file_exists_and_tracked {
+                        .map_or(false, |&v| v > 0);
+                    let sum_exists = s.sums.contains_key(path);
+                    if !should_skip_delete(file_exists, sum_exists) {
                         s.replica.remove(path);
                         s.replica_sums.remove(path);
                     }
                 }
             }
-            s.mark_completed(entry.id);
+            // Shared: mark completed and GC
+            s.repl_log.mark_completed(entry.id);
         }
 
         Action::ScrubAdopt { ref path } => {
             let ver = s.backing.get(path).copied().unwrap_or(0);
-            if ver > 0 && !s.sums.contains_key(path) && !s.is_busy(path) {
+            if ver > 0 && !s.sums.contains_key(path) && !s.path_state.is_busy(path) {
                 s.checksum_and_enqueue(path);
                 s.scrub_ran = true;
             }
         }
 
         Action::ScrubHeal { ref path } => {
-            if s.has_pending_put(path) || s.is_busy(path) {
+            // Shared predicate: can_heal checks pending put + busy
+            if !can_heal(s.repl_log.has_pending_put(path), s.path_state.is_busy(path)) {
                 return true; // Can't heal, no state change
             }
             let replica_ver = s.replica.get(path).copied();
@@ -491,7 +297,9 @@ fn apply_action(s: &mut FsModelState, action: &Action) -> bool {
             if let Some(ver) = s.backing.get_mut(path) {
                 *ver += 1;
             }
-            s.fuse_ops_done += 1;
+            // Note: corruption is an environment action, not a FUSE operation,
+            // so we increment corruption_count instead of fuse_ops_done.
+            s.corruption_count += 1;
         }
     }
     true
@@ -499,17 +307,13 @@ fn apply_action(s: &mut FsModelState, action: &Action) -> bool {
 
 /// Generate worker actions for the current state.
 fn add_worker_actions(state: &FsModelState, actions: &mut Vec<Action>) {
-    // Claim next available
-    if state
-        .repl_log
-        .iter()
-        .any(|e| !e.completed && !e.in_progress)
-    {
+    // Claim next available (shared: has_claimable)
+    if state.repl_log.has_claimable() {
         actions.push(Action::WorkerClaim);
     }
 
-    // Process any in-progress entry by stable id
-    for id in state.in_progress_ids() {
+    // Process any in-progress entry by stable id (shared: in_progress_ids)
+    for id in state.repl_log.in_progress_ids() {
         actions.push(Action::WorkerProcess { id });
     }
 }
@@ -524,6 +328,7 @@ struct HelmetFsModel {
     rename_target: String,
     max_fuse_ops: u8,
     max_version: u8,
+    max_corruptions: u8,
 }
 
 impl HelmetFsModel {
@@ -533,6 +338,7 @@ impl HelmetFsModel {
             rename_target: "b.txt".to_string(),
             max_fuse_ops: 6,
             max_version: 3,
+            max_corruptions: 2,
         }
     }
 
@@ -542,6 +348,7 @@ impl HelmetFsModel {
             rename_target: "c.txt".to_string(),
             max_fuse_ops: 5,
             max_version: 3,
+            max_corruptions: 2,
         }
     }
 }
@@ -571,7 +378,7 @@ impl Model for HelmetFsModel {
 
             for name in &all_paths {
                 let ver = state.backing.get(name).copied().unwrap_or(0);
-                let wr = state.get_write_ref(name);
+                let wr = state.path_state.get_write_ref(name);
 
                 // Create: file doesn't exist and no open writers
                 if ver == 0 && wr == 0 {
@@ -605,10 +412,10 @@ impl Model for HelmetFsModel {
             // Rename: from file_names to rename_target
             for name in &self.file_names {
                 let ver = state.backing.get(name).copied().unwrap_or(0);
-                let wr = state.get_write_ref(name);
+                let wr = state.path_state.get_write_ref(name);
                 let target = &self.rename_target;
                 let target_ver = state.backing.get(target).copied().unwrap_or(0);
-                let target_wr = state.get_write_ref(target);
+                let target_wr = state.path_state.get_write_ref(target);
                 if ver > 0 && wr == 0 && target_ver == 0 && target_wr == 0 {
                     actions.push(Action::Rename {
                         from: name.clone(),
@@ -617,23 +424,27 @@ impl Model for HelmetFsModel {
                 }
             }
 
-            // Corruption injection
-            let all_paths2: Vec<String> = self
-                .file_names
-                .iter()
-                .cloned()
-                .chain(std::iter::once(self.rename_target.clone()))
-                .collect();
-            for path in &all_paths2 {
-                let ver = state.backing.get(path).copied().unwrap_or(0);
-                if ver > 0
-                    && !state.is_busy(path)
-                    && state.sums.contains_key(path)
-                    && ver < self.max_version
-                {
-                    actions.push(Action::CorruptBacking {
-                        path: path.clone(),
-                    });
+            // Corruption injection — not gated by within_fuse_budget since
+            // corruption is an environment action (bitrot/hardware), not a
+            // FUSE operation.  Bounded by max_corruptions instead.
+            if state.corruption_count < self.max_corruptions {
+                let all_paths2: Vec<String> = self
+                    .file_names
+                    .iter()
+                    .cloned()
+                    .chain(std::iter::once(self.rename_target.clone()))
+                    .collect();
+                for path in &all_paths2 {
+                    let ver = state.backing.get(path).copied().unwrap_or(0);
+                    if ver > 0
+                        && !state.path_state.is_busy(path)
+                        && state.sums.contains_key(path)
+                        && ver < self.max_version
+                    {
+                        actions.push(Action::CorruptBacking {
+                            path: path.clone(),
+                        });
+                    }
                 }
             }
         }
@@ -653,7 +464,7 @@ impl Model for HelmetFsModel {
             let ver = state.backing.get(path).copied().unwrap_or(0);
 
             // Adopt untracked files
-            if ver > 0 && !state.sums.contains_key(path) && !state.is_busy(path) {
+            if ver > 0 && !state.sums.contains_key(path) && !state.path_state.is_busy(path) {
                 actions.push(Action::ScrubAdopt {
                     path: path.clone(),
                 });
@@ -752,7 +563,7 @@ impl Model for HelmetFsModel {
             Property::<Self>::always(
                 "busy files not reverted by scrub",
                 |_model, state| {
-                    for (path, info) in &state.path_state {
+                    for (path, info) in state.path_state.iter() {
                         if info.write_ref > 0 {
                             let backing_ver = state.backing.get(path).copied().unwrap_or(0);
                             let sum_ver = state.sums.get(path).copied().unwrap_or(0);
@@ -793,8 +604,9 @@ impl Model for HelmetFsModel {
 
     fn within_boundary(&self, state: &Self::State) -> bool {
         state.fuse_ops_done <= self.max_fuse_ops
-            && state.repl_log.len() <= 8
-            && state.next_repl_id <= 12
+            && state.corruption_count <= self.max_corruptions
+            && state.repl_log.entries.len() <= 8
+            && state.repl_log.next_id <= 12
     }
 }
 
@@ -834,15 +646,15 @@ impl Model for CoalescingModel {
     fn init_states(&self) -> Vec<Self::State> {
         let mut s = FsModelState::new();
         s.backing.insert("data.txt".to_string(), 1);
-        s.inc_write_ref("data.txt");
-        s.mark_dirty("data.txt");
+        s.path_state.inc_write_ref("data.txt");
+        s.path_state.mark_dirty("data.txt");
         vec![s]
     }
 
     fn actions(&self, state: &Self::State, actions: &mut Vec<Self::Action>) {
         let path = "data.txt".to_string();
         let ver = state.backing.get(&path).copied().unwrap_or(0);
-        let wr = state.get_write_ref(&path);
+        let wr = state.path_state.get_write_ref(&path);
 
         if ver > 0 && wr > 0 && ver < 4 {
             actions.push(Action::Write { path: path.clone() });
@@ -862,8 +674,8 @@ impl Model for CoalescingModel {
         // For Create of an existing file, just reopen (inc write_ref, mark dirty)
         if let Action::Create { ref path } = action {
             if s.backing.get(path).copied().unwrap_or(0) > 0 {
-                s.inc_write_ref(path);
-                s.mark_dirty(path);
+                s.path_state.inc_write_ref(path);
+                s.path_state.mark_dirty(path);
                 s.fuse_ops_done += 1;
                 return Some(s);
             }
@@ -901,7 +713,7 @@ impl Model for CoalescingModel {
     }
 
     fn within_boundary(&self, state: &Self::State) -> bool {
-        state.fuse_ops_done <= 8 && state.repl_log.len() <= 6 && state.next_repl_id <= 10
+        state.fuse_ops_done <= 8 && state.repl_log.entries.len() <= 6 && state.repl_log.next_id <= 10
     }
 }
 
@@ -936,24 +748,24 @@ impl Model for RenameModel {
         let old_ver = state.backing.get("old.txt").copied().unwrap_or(0);
         let new_ver = state.backing.get("new.txt").copied().unwrap_or(0);
 
-        if old_ver > 0 && state.get_write_ref("old.txt") == 0 && new_ver == 0 {
+        if old_ver > 0 && state.path_state.get_write_ref("old.txt") == 0 && new_ver == 0 {
             actions.push(Action::Rename {
                 from: "old.txt".to_string(),
                 to: "new.txt".to_string(),
             });
         }
 
-        if new_ver > 0 && state.get_write_ref("new.txt") > 0 && new_ver < 3 {
+        if new_ver > 0 && state.path_state.get_write_ref("new.txt") > 0 && new_ver < 3 {
             actions.push(Action::Write {
                 path: "new.txt".to_string(),
             });
         }
-        if state.get_write_ref("new.txt") > 0 {
+        if state.path_state.get_write_ref("new.txt") > 0 {
             actions.push(Action::Release {
                 path: "new.txt".to_string(),
             });
         }
-        if new_ver > 0 && state.get_write_ref("new.txt") == 0 {
+        if new_ver > 0 && state.path_state.get_write_ref("new.txt") == 0 {
             actions.push(Action::Unlink {
                 path: "new.txt".to_string(),
             });
@@ -1011,7 +823,7 @@ impl Model for RenameModel {
     }
 
     fn within_boundary(&self, state: &Self::State) -> bool {
-        state.fuse_ops_done <= 6 && state.repl_log.len() <= 6 && state.next_repl_id <= 10
+        state.fuse_ops_done <= 6 && state.repl_log.entries.len() <= 6 && state.repl_log.next_id <= 10
     }
 }
 
@@ -1045,10 +857,12 @@ impl Model for ScrubHealModel {
     fn actions(&self, state: &Self::State, actions: &mut Vec<Self::Action>) {
         let path = "data.txt".to_string();
         let ver = state.backing.get(&path).copied().unwrap_or(0);
-        let wr = state.get_write_ref(&path);
+        let wr = state.path_state.get_write_ref(&path);
 
-        // Corrupt
-        if ver > 0 && !state.is_busy(&path) && state.sums.contains_key(&path) && ver < 3 {
+        // Corrupt (bounded by corruption_count to prevent corruption-heal cycles)
+        if ver > 0 && !state.path_state.is_busy(&path) && state.sums.contains_key(&path) && ver < 3
+            && state.corruption_count < 2
+        {
             actions.push(Action::CorruptBacking { path: path.clone() });
         }
 
@@ -1082,8 +896,8 @@ impl Model for ScrubHealModel {
         // For Create of an existing file, just reopen
         if let Action::Create { ref path } = action {
             if s.backing.get(path).copied().unwrap_or(0) > 0 {
-                s.inc_write_ref(path);
-                s.mark_dirty(path);
+                s.path_state.inc_write_ref(path);
+                s.path_state.mark_dirty(path);
                 s.fuse_ops_done += 1;
                 return Some(s);
             }
@@ -1137,7 +951,8 @@ impl Model for ScrubHealModel {
     }
 
     fn within_boundary(&self, state: &Self::State) -> bool {
-        state.fuse_ops_done <= 6 && state.repl_log.len() <= 6 && state.next_repl_id <= 10
+        state.fuse_ops_done <= 6 && state.corruption_count <= 2
+            && state.repl_log.entries.len() <= 6 && state.repl_log.next_id <= 10
     }
 }
 
@@ -1165,8 +980,8 @@ impl Model for MultiWorkerModel {
         s.sums.insert("a.txt".to_string(), 1);
         s.backing.insert("b.txt".to_string(), 2);
         s.sums.insert("b.txt".to_string(), 2);
-        s.enqueue_put("a.txt");
-        s.enqueue_put("b.txt");
+        s.repl_log.enqueue_put("a.txt");
+        s.repl_log.enqueue_put("b.txt");
         vec![s]
     }
 
@@ -1190,7 +1005,7 @@ impl Model for MultiWorkerModel {
                 }
                 if let Some(&ver) = s.backing.get(path) {
                     s.sums.insert(path.clone(), ver);
-                    s.enqueue_put(path);
+                    s.repl_log.enqueue_put(path);
                 }
                 s.fuse_ops_done += 1;
             }
@@ -1208,6 +1023,7 @@ impl Model for MultiWorkerModel {
                 |_model, state| {
                     state
                         .repl_log
+                        .entries
                         .iter()
                         .all(|e| !(e.in_progress && e.completed))
                 },
@@ -1215,7 +1031,7 @@ impl Model for MultiWorkerModel {
             Property::<Self>::always(
                 "multi-worker replica converges",
                 |_model, state| {
-                    if state.pending_count() > 0 {
+                    if state.repl_log.pending_count() > 0 {
                         return true;
                     }
                     for (path, &ver) in &state.backing {
@@ -1235,7 +1051,7 @@ impl Model for MultiWorkerModel {
             Property::<Self>::sometimes(
                 "both files replicated",
                 |_model, state| {
-                    state.pending_count() == 0
+                    state.repl_log.pending_count() == 0
                         && state.replica.get("a.txt").copied().unwrap_or(0) > 0
                         && state.replica.get("b.txt").copied().unwrap_or(0) > 0
                 },
@@ -1244,7 +1060,7 @@ impl Model for MultiWorkerModel {
     }
 
     fn within_boundary(&self, state: &Self::State) -> bool {
-        state.repl_log.len() <= 6 && state.next_repl_id <= 8
+        state.repl_log.entries.len() <= 6 && state.repl_log.next_id <= 8
     }
 }
 
@@ -1276,34 +1092,30 @@ impl Model for CrashRecoveryModel {
         let mut s = FsModelState::new();
         s.backing.insert("a.txt".to_string(), 1);
         s.sums.insert("a.txt".to_string(), 1);
-        s.enqueue_put("a.txt");
+        s.repl_log.enqueue_put("a.txt");
         vec![s]
     }
 
     fn actions(&self, state: &Self::State, actions: &mut Vec<Self::Action>) {
         // Worker claim
-        if state
-            .repl_log
-            .iter()
-            .any(|e| !e.completed && !e.in_progress)
-        {
+        if state.repl_log.has_claimable() {
             actions.push(CrashAction::Normal(Action::WorkerClaim));
         }
 
         // Worker process
-        for id in state.in_progress_ids() {
+        for id in state.repl_log.in_progress_ids() {
             actions.push(CrashAction::Normal(Action::WorkerProcess { id }));
         }
 
         // Crash
-        if state.pending_count() > 0 && state.fuse_ops_done < 3 {
+        if state.repl_log.pending_count() > 0 && state.fuse_ops_done < 3 {
             actions.push(CrashAction::Crash);
         }
 
         // File operations after potential recovery
         if state.fuse_ops_done < 3 {
             let ver = state.backing.get("a.txt").copied().unwrap_or(0);
-            let wr = state.get_write_ref("a.txt");
+            let wr = state.path_state.get_write_ref("a.txt");
             if ver > 0 && wr == 0 && ver < 3 {
                 actions.push(CrashAction::Normal(Action::Create {
                     path: "a.txt".to_string(),
@@ -1326,9 +1138,8 @@ impl Model for CrashRecoveryModel {
         let mut s = state.clone();
         match action {
             CrashAction::Crash => {
-                for entry in s.repl_log.iter_mut() {
-                    entry.in_progress = false;
-                }
+                // Shared: reset in-progress flags
+                s.repl_log.reset_in_progress();
                 s.path_state.clear();
                 s.fuse_ops_done += 1;
             }
@@ -1336,8 +1147,8 @@ impl Model for CrashRecoveryModel {
                 // For Create of existing file, reopen
                 if let Action::Create { ref path } = action {
                     if s.backing.get(path).copied().unwrap_or(0) > 0 {
-                        s.inc_write_ref(path);
-                        s.mark_dirty(path);
+                        s.path_state.inc_write_ref(path);
+                        s.path_state.mark_dirty(path);
                         s.fuse_ops_done += 1;
                         return Some(s);
                     }
@@ -1353,7 +1164,7 @@ impl Model for CrashRecoveryModel {
             Property::<Self>::always(
                 "crash preserves pending entries",
                 |_model, state| {
-                    for entry in &state.repl_log {
+                    for entry in &state.repl_log.entries {
                         if entry.in_progress && entry.completed {
                             return false;
                         }
@@ -1392,7 +1203,7 @@ impl Model for CrashRecoveryModel {
     }
 
     fn within_boundary(&self, state: &Self::State) -> bool {
-        state.repl_log.len() <= 6 && state.next_repl_id <= 10 && state.fuse_ops_done <= 5
+        state.repl_log.entries.len() <= 6 && state.repl_log.next_id <= 10 && state.fuse_ops_done <= 5
     }
 }
 
@@ -1426,7 +1237,7 @@ impl Model for DeleteRecreateModel {
     fn actions(&self, state: &Self::State, actions: &mut Vec<Self::Action>) {
         let path = "f.txt".to_string();
         let ver = state.backing.get(&path).copied().unwrap_or(0);
-        let wr = state.get_write_ref(&path);
+        let wr = state.path_state.get_write_ref(&path);
 
         if state.fuse_ops_done < 6 {
             if ver > 0 && wr == 0 {
@@ -1486,7 +1297,7 @@ impl Model for DeleteRecreateModel {
     }
 
     fn within_boundary(&self, state: &Self::State) -> bool {
-        state.fuse_ops_done <= 6 && state.repl_log.len() <= 8 && state.next_repl_id <= 10
+        state.fuse_ops_done <= 6 && state.repl_log.entries.len() <= 8 && state.repl_log.next_id <= 10
     }
 }
 

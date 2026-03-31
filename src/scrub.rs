@@ -26,7 +26,7 @@ use std::time::{Duration, SystemTime};
 
 use crate::helpers;
 use crate::replication::copy_file_with_sync;
-use crate::state::{checksum_and_enqueue, FsState};
+use crate::state::{self, checksum_and_enqueue, FsState};
 
 /// Run the scrub thread. Performs an initial scrub if needed, then sleeps for
 /// `scrub_interval_secs` between runs.
@@ -207,7 +207,7 @@ fn walk_dir(
         // Corrupt — attempt self-healing
         log::warn!("Scrub: corruption detected in {}", rel);
 
-        if !can_heal(state, &rel) {
+        if !can_heal_file(state, &rel) {
             log::warn!("Scrub: cannot heal {} (busy or pending replication)", rel);
             continue;
         }
@@ -222,18 +222,8 @@ fn walk_dir(
 }
 
 /// Check if a file is eligible for healing.
-fn can_heal(state: &FsState, rel: &str) -> bool {
-    // No pending put
-    if state.repl_log.has_pending_put(rel) {
-        return false;
-    }
-
-    // No write refs, not dirty
-    if state.is_busy(rel) {
-        return false;
-    }
-
-    true
+fn can_heal_file(state: &FsState, rel: &str) -> bool {
+    state::can_heal(state.repl_log.has_pending_put(rel), state.is_busy(rel))
 }
 
 /// Attempt to heal a corrupted file from the replica.

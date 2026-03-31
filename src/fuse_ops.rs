@@ -728,12 +728,7 @@ impl Filesystem for HelmetFs {
         }
 
         // Transfer path state
-        {
-            let mut map = self.state.path_state.write().unwrap();
-            if let Some(info) = map.remove(&rel_from) {
-                map.insert(rel_to.clone(), info);
-            }
-        }
+        self.state.transfer_path_state(&rel_from, &rel_to);
 
         // Update inode table
         {
@@ -920,11 +915,8 @@ impl Filesystem for HelmetFs {
             if let Some(rel) = self.inode_path(ino) {
                 self.state.dec_write_ref(&rel);
 
-                let info = self.state.get_path_info(&rel);
-                if let Some(info) = info {
-                    if info.write_ref == 0 && info.dirty {
-                        checksum_and_enqueue(&self.state, &rel);
-                    }
+                if self.state.should_checksum(&rel) {
+                    checksum_and_enqueue(&self.state, &rel);
                 }
             }
         }
