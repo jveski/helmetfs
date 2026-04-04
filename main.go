@@ -1,7 +1,9 @@
 package main
 
 import (
+	"encoding/hex"
 	"fmt"
+	"io"
 	"log"
 	"os"
 	"os/exec"
@@ -10,19 +12,59 @@ import (
 	"runtime"
 	"strconv"
 	"strings"
+	"sync"
+	"sync/atomic"
 	"syscall"
+	"time"
 
 	"github.com/hanwen/go-fuse/v2/fs"
 	"github.com/hanwen/go-fuse/v2/fuse"
+	"lukechampine.com/blake3"
 )
+
+// ---------------------------------------------------------------------------
+// FsState: central filesystem state
+// ---------------------------------------------------------------------------
+
+// FsState holds all shared state for the helmetfs instance.
+type FsState struct {
+	backingDir    string
+	replicaDir    string
+	scrubHour     int
+	scrubMinute   int
+	replWorkers   int
+	noRemoteMkdir bool
+	pathState     *PathStateMap
+	replLog       *ReplLog
+	shutdown      atomic.Bool
+	scrubWg       sync.WaitGroup
+	replWg        sync.WaitGroup
+}
+
+// NewFsState creates and initializes the filesystem state.
+func NewFsState(backingDir, replicaDir string, scrubHour, scrubMinute, replWorkers int, noRemoteMkdir bool) *FsState {
+	s := &FsState{
+		backingDir:    backingDir,
+		replicaDir:    replicaDir,
+		scrubHour:     scrubHour,
+		scrubMinute:   scrubMinute,
+		replWorkers:   replWorkers,
+		noRemoteMkdir: noRemoteMkdir,
+		pathState:     NewPathStateMap(),
+	}
+	s.replLog = NewReplLog(backingDir, &s.shutdown)
+	return s
+}
+
+// ---------------------------------------------------------------------------
+// CLI entry point
+// ---------------------------------------------------------------------------
 
 func main() {
 	log.SetFlags(log.Ldate | log.Ltime)
-
 	if len(os.Args) < 2 {
 		usage()
 	}
-
 	switch os.Args[1] {
 	case "mount":
 		doMount(os.Args[2:])
@@ -52,8 +94,7 @@ func doMount(args []string) {
 	scrubTime := "01:00"
 	noRemoteMkdir := false
 
-	i := 2
-	for i < len(args) {
+	for i := 2; i < len(args); i++ {
 		switch args[i] {
 		case "--replica":
 			i++
@@ -82,46 +123,22 @@ func doMount(args []string) {
 		default:
 			log.Fatalf("unknown option: %s", args[i])
 		}
-		i++
 	}
 
 	if replicaDir == "" {
 		log.Fatal("--replica is required")
 	}
 
-	sourceDir, err := filepath.Abs(sourceDir)
-	if err != nil {
-		log.Fatalf("realpath source: %v", err)
-	}
-	sourceDir, err = filepath.EvalSymlinks(sourceDir)
-	if err != nil {
-		log.Fatalf("realpath source: %v", err)
-	}
-
-	mountpoint, err = filepath.Abs(mountpoint)
-	if err != nil {
-		log.Fatalf("realpath mountpoint: %v", err)
-	}
-	mountpoint, err = filepath.EvalSymlinks(mountpoint)
-	if err != nil {
-		log.Fatalf("realpath mountpoint: %v", err)
-	}
-
-	replicaDir, err = filepath.Abs(replicaDir)
-	if err != nil {
-		log.Fatalf("realpath replica: %v", err)
-	}
-	replicaDir, err = filepath.EvalSymlinks(replicaDir)
-	if err != nil {
-		log.Fatalf("realpath replica: %v", err)
-	}
+	sourceDir = resolveAbsPath(sourceDir, "source")
+	mountpoint = resolveAbsPath(mountpoint, "mountpoint")
+	replicaDir = resolveAbsPath(replicaDir, "replica")
 
 	scrubHour, scrubMinute := parseScrubTime(scrubTime)
 
 	state := NewFsState(sourceDir, replicaDir, scrubHour, scrubMinute, replWorkers, noRemoteMkdir)
-	initState(state)
+	os.MkdirAll(filepath.Join(state.backingDir, ".helmetfs"), 0755)
 
-	for i := 0; i < replWorkers; i++ {
+	for range replWorkers {
 		state.replWg.Add(1)
 		go replWorkerLoop(state)
 	}
@@ -133,17 +150,15 @@ func doMount(args []string) {
 		log.Fatalf("NewHelmetRoot: %v", err)
 	}
 
-	opts := &fs.Options{
+	server, err := fs.Mount(mountpoint, rootNode, &fs.Options{
 		MountOptions: fuse.MountOptions{
-			AllowOther: false,
-			FsName:     "helmetfs",
-			Name:       "helmetfs",
+			AllowOther:    false,
+			FsName:        "helmetfs",
+			Name:          "helmetfs",
 			MaxBackground: 10,
 		},
 		NullPermissions: true,
-	}
-
-	server, err := fs.Mount(mountpoint, rootNode, opts)
+	})
 	if err != nil {
 		log.Fatalf("mount failed: %v", err)
 	}
@@ -168,18 +183,30 @@ func doUnmount(args []string) {
 	if len(args) < 1 {
 		usage()
 	}
-	mountpoint := args[0]
 	var cmd *exec.Cmd
 	if runtime.GOOS == "darwin" {
-		cmd = exec.Command("umount", mountpoint)
+		cmd = exec.Command("umount", args[0])
 	} else {
-		cmd = exec.Command("fusermount3", "-u", mountpoint)
+		cmd = exec.Command("fusermount3", "-u", args[0])
 	}
 	cmd.Stdout = os.Stdout
 	cmd.Stderr = os.Stderr
 	if err := cmd.Run(); err != nil {
 		log.Fatalf("unmount failed: %v", err)
 	}
+}
+
+// resolveAbsPath resolves a path to an absolute, symlink-free path.
+func resolveAbsPath(path, label string) string {
+	abs, err := filepath.Abs(path)
+	if err != nil {
+		log.Fatalf("resolve %s path: %v", label, err)
+	}
+	resolved, err := filepath.EvalSymlinks(abs)
+	if err != nil {
+		log.Fatalf("resolve %s path: %v", label, err)
+	}
+	return resolved
 }
 
 func parseScrubTime(s string) (int, int) {
@@ -196,4 +223,335 @@ func parseScrubTime(s string) (int, int) {
 		log.Fatalf("invalid scrub minute: %s", parts[1])
 	}
 	return h, m
+}
+
+// ---------------------------------------------------------------------------
+// Checksum-and-enqueue orchestration, shutdown helpers
+// ---------------------------------------------------------------------------
+
+// checksumAndEnqueue computes a BLAKE3 checksum and enqueues replication,
+// unless the file still has open writers.
+func checksumAndEnqueue(state *FsState, relPath string) error {
+	if state.pathState.HasWriteRef(relPath) {
+		return nil
+	}
+	return checksumAndEnqueueForced(state, relPath)
+}
+
+// checksumAndEnqueueForced computes a BLAKE3 checksum and enqueues replication
+// regardless of open writers (used on fsync).
+func checksumAndEnqueueForced(state *FsState, relPath string) error {
+	gen := state.pathState.GetDirtyGen(relPath)
+	backingPath := filepath.Join(state.backingDir, relPath)
+	hexDigest, err := computeBlake3(backingPath)
+	if err != nil {
+		return fmt.Errorf("checksum %s: %w", relPath, err)
+	}
+	if err := writeSumFile(backingPath+".sum", hexDigest); err != nil {
+		return fmt.Errorf("write sum %s: %w", relPath, err)
+	}
+	state.replLog.Enqueue(ReplPut, relPath)
+	state.pathState.ClearDirtyIfGen(relPath, gen)
+	return nil
+}
+
+func flushDirtyFiles(state *FsState) {
+	for _, p := range state.pathState.CollectDirtyPaths() {
+		checksumAndEnqueue(state, p)
+	}
+}
+
+func stopWorkers(state *FsState) {
+	state.shutdown.Store(true)
+	state.replLog.Broadcast()
+	state.replWg.Wait()
+	state.scrubWg.Wait()
+}
+
+// ---------------------------------------------------------------------------
+// BLAKE3 checksum and file utilities
+// ---------------------------------------------------------------------------
+
+const checksumBufSize = 64 * 1024 // 64 KiB read buffer for hashing and copying.
+
+// computeBlake3 computes the BLAKE3-256 hex digest of a file, holding a
+// shared (advisory) file lock during the read.
+func computeBlake3(path string) (string, error) {
+	f, err := os.Open(path)
+	if err != nil {
+		return "", err
+	}
+	defer f.Close()
+
+	if err := syscall.Flock(int(f.Fd()), syscall.LOCK_SH); err != nil {
+		return "", err
+	}
+	defer syscall.Flock(int(f.Fd()), syscall.LOCK_UN)
+
+	h := blake3.New(32, nil)
+	buf := make([]byte, checksumBufSize)
+	for {
+		n, err := io.ReadFull(f, buf)
+		if n > 0 {
+			h.Write(buf[:n])
+		}
+		if err == io.EOF || err == io.ErrUnexpectedEOF {
+			break
+		}
+		if err != nil {
+			return "", err
+		}
+	}
+	return hex.EncodeToString(h.Sum(nil)), nil
+}
+
+// writeSumFile atomically writes a hex digest to a .sum sidecar file.
+func writeSumFile(path, hexDigest string) error {
+	f, err := os.Create(path)
+	if err != nil {
+		return err
+	}
+	defer f.Close()
+	if _, err := fmt.Fprintf(f, "%s\n", hexDigest); err != nil {
+		return err
+	}
+	return f.Sync()
+}
+
+// readSumFile reads the hex digest from a .sum sidecar file.
+func readSumFile(path string) (string, error) {
+	f, err := os.Open(path)
+	if err != nil {
+		return "", err
+	}
+	defer f.Close()
+	buf := make([]byte, 128)
+	n, err := io.ReadFull(f, buf)
+	if err != nil && err != io.EOF && err != io.ErrUnexpectedEOF {
+		return "", err
+	}
+	return strings.TrimRight(string(buf[:n]), "\n\r "), nil
+}
+
+// fsyncDir fsyncs a directory to ensure metadata durability (e.g. after rename).
+func fsyncDir(dirPath string) {
+	f, err := os.Open(dirPath)
+	if err != nil {
+		return
+	}
+	defer f.Close()
+	f.Sync()
+}
+
+// ensureParentDir creates all parent directories for the given path.
+func ensureParentDir(path string) error {
+	return os.MkdirAll(filepath.Dir(path), 0755)
+}
+
+// removeEmptyParentDirs removes empty ancestor directories up to (but not
+// including) stopAt.
+func removeEmptyParentDirs(path, stopAt string) {
+	dir := filepath.Dir(path)
+	for len(dir) > len(stopAt) {
+		if err := os.Remove(dir); err != nil {
+			return
+		}
+		dir = filepath.Dir(dir)
+	}
+}
+
+// copyFileWithSync atomically copies src to dst by writing to a temporary
+// file, fsyncing, and renaming into place.
+func copyFileWithSync(src, dst string) error {
+	sf, err := os.Open(src)
+	if err != nil {
+		return err
+	}
+	defer sf.Close()
+
+	tmpPath := dst + ".tmp"
+	df, err := os.Create(tmpPath)
+	if err != nil {
+		return err
+	}
+
+	buf := make([]byte, checksumBufSize)
+	if _, err := io.CopyBuffer(df, sf, buf); err != nil {
+		df.Close()
+		os.Remove(tmpPath)
+		return err
+	}
+	if err := df.Sync(); err != nil {
+		df.Close()
+		os.Remove(tmpPath)
+		return err
+	}
+	df.Close()
+
+	if err := os.Rename(tmpPath, dst); err != nil {
+		os.Remove(tmpPath)
+		return err
+	}
+	fsyncDir(filepath.Dir(dst))
+	return nil
+}
+
+// ---------------------------------------------------------------------------
+// Scrub: nightly integrity checking and self-healing
+// ---------------------------------------------------------------------------
+
+func scrubLoop(state *FsState) {
+	defer state.scrubWg.Done()
+	if shouldScrubImmediately(state) {
+		runScrub(state)
+	}
+	for !state.shutdown.Load() {
+		ns := nsUntilNextScrub(state.scrubHour, state.scrubMinute)
+		sleepWithShutdown(state, time.Duration(ns))
+		if !state.shutdown.Load() {
+			runScrub(state)
+		}
+	}
+}
+
+func sleepWithShutdown(state *FsState, d time.Duration) {
+	end := time.Now().Add(d)
+	for time.Now().Before(end) && !state.shutdown.Load() {
+		remaining := time.Until(end)
+		if remaining > time.Second {
+			remaining = time.Second
+		}
+		time.Sleep(remaining)
+	}
+}
+
+func shouldScrubImmediately(state *FsState) bool {
+	tsPath := filepath.Join(state.backingDir, ".helmetfs", "scrub.timestamp")
+	data, err := os.ReadFile(tsPath)
+	if err != nil {
+		return true
+	}
+	ts, err := strconv.ParseInt(strings.TrimSpace(string(data)), 10, 64)
+	if err != nil {
+		return true
+	}
+	const day = 86400
+	return time.Now().Unix()-ts > day
+}
+
+func nsUntilNextScrub(targetHour, targetMinute int) uint64 {
+	now := time.Now()
+	nowSecs := now.Hour()*3600 + now.Minute()*60 + now.Second()
+	targetSecs := targetHour*3600 + targetMinute*60
+	delta := targetSecs - nowSecs
+	if delta <= 0 {
+		delta += 86400
+	}
+	return uint64(delta) * 1_000_000_000
+}
+
+func runScrub(state *FsState) {
+	log.Println("scrub: starting")
+	var corruptions, repairs int
+	err := filepath.Walk(state.backingDir, func(path string, info os.FileInfo, err error) error {
+		if err != nil {
+			return nil
+		}
+		if state.shutdown.Load() {
+			return filepath.SkipAll
+		}
+		relPath, _ := filepath.Rel(state.backingDir, path)
+		if relPath == "." {
+			return nil
+		}
+		if info.IsDir() {
+			if strings.HasPrefix(relPath, ".helmetfs") {
+				return filepath.SkipDir
+			}
+			return nil
+		}
+		if strings.HasPrefix(relPath, ".helmetfs") || strings.HasSuffix(relPath, ".sum") {
+			return nil
+		}
+		if state.pathState.HasWriteRef(relPath) {
+			return nil
+		}
+		scrubFile(state, relPath, &corruptions, &repairs)
+		return nil
+	})
+	if err != nil {
+		log.Printf("scrub: walk error: %v", err)
+	}
+	writeScrubTimestamp(state, time.Now().Unix())
+	log.Printf("scrub: completed, corruptions=%d repairs=%d", corruptions, repairs)
+}
+
+func scrubFile(state *FsState, relPath string, corruptions, repairs *int) {
+	backingPath := filepath.Join(state.backingDir, relPath)
+	currentHex, err := computeBlake3(backingPath)
+	if err != nil {
+		log.Printf("scrub: checksum error for %s: %v", relPath, err)
+		return
+	}
+	storedHex, err := readSumFile(backingPath + ".sum")
+	if err != nil {
+		if os.IsNotExist(err) {
+			// No stored checksum yet; create one and enqueue replication.
+			writeSumFile(backingPath+".sum", currentHex)
+			state.replLog.Enqueue(ReplPut, relPath)
+			return
+		}
+		log.Printf("scrub: read sum error for %s: %v", relPath, err)
+		return
+	}
+
+	if currentHex == storedHex {
+		return // Integrity check passed.
+	}
+
+	*corruptions++
+	log.Printf("scrub: corruption detected in %s", relPath)
+
+	hasPending := state.replLog.HasPendingPut(relPath)
+	replicaPath := filepath.Join(state.replicaDir, "files", relPath)
+
+	replicaHex, err := readSumFile(replicaPath + ".sum")
+	if err != nil {
+		log.Printf("scrub: cannot read replica sum for %s: %v", relPath, err)
+		return
+	}
+	replicaComputed, err := computeBlake3(replicaPath)
+	if err != nil {
+		log.Printf("scrub: cannot compute replica hash for %s: %v", relPath, err)
+		return
+	}
+	if replicaComputed != replicaHex {
+		log.Printf("scrub: replica also corrupt for %s", relPath)
+		return
+	}
+	if hasPending {
+		log.Printf("scrub: replica is stale for %s, skipping repair", relPath)
+		return
+	}
+	if state.pathState.HasWriteRef(relPath) || state.pathState.IsDirty(relPath) {
+		return
+	}
+	if err := copyFileWithSync(replicaPath, backingPath); err != nil {
+		log.Printf("scrub: repair failed for %s: %v", relPath, err)
+		return
+	}
+	writeSumFile(backingPath+".sum", replicaComputed)
+	*repairs++
+	log.Printf("scrub: repaired %s", relPath)
+}
+
+func writeScrubTimestamp(state *FsState, ts int64) {
+	tsPath := filepath.Join(state.backingDir, ".helmetfs", "scrub.timestamp")
+	f, err := os.Create(tsPath)
+	if err != nil {
+		return
+	}
+	defer f.Close()
+	fmt.Fprintf(f, "%d\n", ts)
+	f.Sync()
 }
