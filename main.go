@@ -19,6 +19,7 @@ import (
 
 	"github.com/hanwen/go-fuse/v2/fs"
 	"github.com/hanwen/go-fuse/v2/fuse"
+	flag "github.com/spf13/pflag"
 	"lukechampine.com/blake3"
 )
 
@@ -77,7 +78,7 @@ func main() {
 
 func usage() {
 	fmt.Fprintf(os.Stderr, "Usage:\n")
-	fmt.Fprintf(os.Stderr, "  helmetfs mount <source-dir> <mountpoint> --replica <path> [options]\n")
+	fmt.Fprintf(os.Stderr, "  helmetfs mount <source-dir> <mountpoint> [flags]\n")
 	fmt.Fprintf(os.Stderr, "  helmetfs unmount <mountpoint>\n")
 	os.Exit(1)
 }
@@ -89,56 +90,28 @@ func doMount(args []string) {
 
 	sourceDir := args[0]
 	mountpoint := args[1]
-	var replicaDir string
-	replWorkers := 4
-	scrubTime := "01:00"
-	noRemoteMkdir := false
 
-	for i := 2; i < len(args); i++ {
-		switch args[i] {
-		case "--replica":
-			i++
-			if i >= len(args) {
-				usage()
-			}
-			replicaDir = args[i]
-		case "--replication-workers":
-			i++
-			if i >= len(args) {
-				usage()
-			}
-			n, err := strconv.Atoi(args[i])
-			if err != nil {
-				log.Fatalf("invalid --replication-workers: %s", args[i])
-			}
-			replWorkers = n
-		case "--scrub-time":
-			i++
-			if i >= len(args) {
-				usage()
-			}
-			scrubTime = args[i]
-		case "--no-remote-mkdir":
-			noRemoteMkdir = true
-		default:
-			log.Fatalf("unknown option: %s", args[i])
-		}
-	}
+	f := flag.NewFlagSet("mount", flag.ExitOnError)
+	replicaDir := f.String("replica", "", "path to replica directory (required)")
+	replWorkers := f.Int("replication-workers", 4, "number of replication workers")
+	scrubTime := f.String("scrub-time", "01:00", "daily scrub time in HH:MM format")
+	noRemoteMkdir := f.Bool("no-remote-mkdir", false, "do not create directories on the replica")
+	f.Parse(args[2:])
 
-	if replicaDir == "" {
+	if *replicaDir == "" {
 		log.Fatal("--replica is required")
 	}
 
 	sourceDir = resolveAbsPath(sourceDir, "source")
 	mountpoint = resolveAbsPath(mountpoint, "mountpoint")
-	replicaDir = resolveAbsPath(replicaDir, "replica")
+	*replicaDir = resolveAbsPath(*replicaDir, "replica")
 
-	scrubHour, scrubMinute := parseScrubTime(scrubTime)
+	scrubHour, scrubMinute := parseScrubTime(*scrubTime)
 
-	state := NewFsState(sourceDir, replicaDir, scrubHour, scrubMinute, replWorkers, noRemoteMkdir)
+	state := NewFsState(sourceDir, *replicaDir, scrubHour, scrubMinute, *replWorkers, *noRemoteMkdir)
 	os.MkdirAll(filepath.Join(state.backingDir, ".helmetfs"), 0755)
 
-	for range replWorkers {
+	for range *replWorkers {
 		state.replWg.Add(1)
 		go replWorkerLoop(state)
 	}
@@ -171,7 +144,7 @@ func doMount(args []string) {
 		server.Unmount()
 	}()
 
-	log.Printf("helmetfs mounted: source=%s mountpoint=%s replica=%s", sourceDir, mountpoint, replicaDir)
+	log.Printf("helmetfs mounted: source=%s mountpoint=%s replica=%s", sourceDir, mountpoint, *replicaDir)
 	server.Wait()
 
 	flushDirtyFiles(state)
@@ -272,8 +245,6 @@ func stopWorkers(state *FsState) {
 // BLAKE3 checksum and file utilities
 // ---------------------------------------------------------------------------
 
-const checksumBufSize = 64 * 1024 // 64 KiB read buffer for hashing and copying.
-
 // computeBlake3 computes the BLAKE3-256 hex digest of a file, holding a
 // shared (advisory) file lock during the read.
 func computeBlake3(path string) (string, error) {
@@ -289,48 +260,24 @@ func computeBlake3(path string) (string, error) {
 	defer syscall.Flock(int(f.Fd()), syscall.LOCK_UN)
 
 	h := blake3.New(32, nil)
-	buf := make([]byte, checksumBufSize)
-	for {
-		n, err := io.ReadFull(f, buf)
-		if n > 0 {
-			h.Write(buf[:n])
-		}
-		if err == io.EOF || err == io.ErrUnexpectedEOF {
-			break
-		}
-		if err != nil {
-			return "", err
-		}
+	if _, err := io.Copy(h, f); err != nil {
+		return "", err
 	}
 	return hex.EncodeToString(h.Sum(nil)), nil
 }
 
 // writeSumFile atomically writes a hex digest to a .sum sidecar file.
 func writeSumFile(path, hexDigest string) error {
-	f, err := os.Create(path)
-	if err != nil {
-		return err
-	}
-	defer f.Close()
-	if _, err := fmt.Fprintf(f, "%s\n", hexDigest); err != nil {
-		return err
-	}
-	return f.Sync()
+	return os.WriteFile(path, []byte(hexDigest+"\n"), 0644)
 }
 
 // readSumFile reads the hex digest from a .sum sidecar file.
 func readSumFile(path string) (string, error) {
-	f, err := os.Open(path)
+	data, err := os.ReadFile(path)
 	if err != nil {
 		return "", err
 	}
-	defer f.Close()
-	buf := make([]byte, 128)
-	n, err := io.ReadFull(f, buf)
-	if err != nil && err != io.EOF && err != io.ErrUnexpectedEOF {
-		return "", err
-	}
-	return strings.TrimRight(string(buf[:n]), "\n\r "), nil
+	return strings.TrimSpace(string(data)), nil
 }
 
 // fsyncDir fsyncs a directory to ensure metadata durability (e.g. after rename).
@@ -375,8 +322,7 @@ func copyFileWithSync(src, dst string) error {
 		return err
 	}
 
-	buf := make([]byte, checksumBufSize)
-	if _, err := io.CopyBuffer(df, sf, buf); err != nil {
+	if _, err := io.Copy(df, sf); err != nil {
 		df.Close()
 		os.Remove(tmpPath)
 		return err
@@ -441,13 +387,11 @@ func shouldScrubImmediately(state *FsState) bool {
 
 func nsUntilNextScrub(targetHour, targetMinute int) uint64 {
 	now := time.Now()
-	nowSecs := now.Hour()*3600 + now.Minute()*60 + now.Second()
-	targetSecs := targetHour*3600 + targetMinute*60
-	delta := targetSecs - nowSecs
-	if delta <= 0 {
-		delta += 86400
+	next := time.Date(now.Year(), now.Month(), now.Day(), targetHour, targetMinute, 0, 0, now.Location())
+	if !next.After(now) {
+		next = next.Add(24 * time.Hour)
 	}
-	return uint64(delta) * 1_000_000_000
+	return uint64(next.Sub(now))
 }
 
 func runScrub(state *FsState) {
@@ -547,11 +491,5 @@ func scrubFile(state *FsState, relPath string, corruptions, repairs *int) {
 
 func writeScrubTimestamp(state *FsState, ts int64) {
 	tsPath := filepath.Join(state.backingDir, ".helmetfs", "scrub.timestamp")
-	f, err := os.Create(tsPath)
-	if err != nil {
-		return
-	}
-	defer f.Close()
-	fmt.Fprintf(f, "%d\n", ts)
-	f.Sync()
+	os.WriteFile(tsPath, []byte(fmt.Sprintf("%d\n", ts)), 0644)
 }

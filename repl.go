@@ -136,6 +136,13 @@ const (
 	ReplDelete               // Remove file from replica.
 )
 
+func (op ReplOp) String() string {
+	if op == ReplDelete {
+		return "delete"
+	}
+	return "put"
+}
+
 // ReplEntry is a single entry in the replication log.
 type ReplEntry struct {
 	id        uint64
@@ -233,11 +240,7 @@ func (rl *ReplLog) appendToDisk(entry *ReplEntry) {
 		return
 	}
 	defer f.Close()
-	opStr := "put"
-	if entry.op == ReplDelete {
-		opStr = "delete"
-	}
-	fmt.Fprintf(f, "%s %s\n", opStr, entry.path)
+	fmt.Fprintf(f, "%s %s\n", entry.op, entry.path)
 	f.Sync()
 }
 
@@ -335,11 +338,7 @@ func (rl *ReplLog) rewriteLogAtomic() {
 		return
 	}
 	for _, e := range rl.entries {
-		opStr := "put"
-		if e.op == ReplDelete {
-			opStr = "delete"
-		}
-		fmt.Fprintf(f, "%s %s\n", opStr, e.path)
+		fmt.Fprintf(f, "%s %s\n", e.op, e.path)
 	}
 	f.Sync()
 	f.Close()

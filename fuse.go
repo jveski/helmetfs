@@ -151,7 +151,7 @@ func (n *HelmetNode) Readdir(ctx context.Context) (fs.DirStream, syscall.Errno) 
 			Ino:  stat.Ino,
 		})
 	}
-	return &helmetDirStream{entries: result}, 0
+	return fs.NewListDirStream(result), 0
 }
 
 func (n *HelmetNode) Open(ctx context.Context, flags uint32) (fs.FileHandle, uint32, syscall.Errno) {
@@ -324,17 +324,11 @@ func (n *HelmetNode) Readlink(ctx context.Context) ([]byte, syscall.Errno) {
 	if rel != "" && isHiddenPath(n.RootData.Path, rel) {
 		return nil, syscall.ENOENT
 	}
-	p := n.backingPath()
-	for sz := 256; ; sz *= 2 {
-		buf := make([]byte, sz)
-		nn, err := syscall.Readlink(p, buf)
-		if err != nil {
-			return nil, fs.ToErrno(err)
-		}
-		if nn < sz {
-			return buf[:nn], 0
-		}
+	target, err := os.Readlink(n.backingPath())
+	if err != nil {
+		return nil, fs.ToErrno(err)
 	}
+	return []byte(target), 0
 }
 
 func (n *HelmetNode) Setattr(ctx context.Context, f fs.FileHandle, in *fuse.SetAttrIn, out *fuse.AttrOut) syscall.Errno {
@@ -422,19 +416,6 @@ func (n *HelmetNode) Access(ctx context.Context, mask uint32) syscall.Errno {
 	return 0
 }
 
-// helmetDirStream implements fs.DirStream over a pre-built slice.
-type helmetDirStream struct {
-	entries []fuse.DirEntry
-	pos     int
-}
-
-func (ds *helmetDirStream) HasNext() bool { return ds.pos < len(ds.entries) }
-func (ds *helmetDirStream) Next() (fuse.DirEntry, syscall.Errno) {
-	e := ds.entries[ds.pos]
-	ds.pos++
-	return e, 0
-}
-func (ds *helmetDirStream) Close() {}
 
 // helmetFile is a FUSE file handle that wraps a raw file descriptor.
 type helmetFile struct {
@@ -543,19 +524,15 @@ func (f *helmetFile) Setattr(ctx context.Context, in *fuse.SetAttrIn, out *fuse.
 		}
 	}
 
-	if err := setTimestampsForFile(f.state.backingDir, f.relPath, in); err != 0 {
+	if err := setTimestamps(filepath.Join(f.state.backingDir, f.relPath), in); err != 0 {
 		return err
 	}
 
 	// Enqueue replication for metadata changes.
 	if f.relPath != "" {
-		if _, ok := in.GetMode(); ok {
-			f.state.replLog.Enqueue(ReplPut, f.relPath)
-		}
-		if uok || gok {
-			f.state.replLog.Enqueue(ReplPut, f.relPath)
-		}
-		if mok, aok := hasTimeAttrs(in); mok || aok {
+		_, modeSet := in.GetMode()
+		mok, aok := hasTimeAttrs(in)
+		if modeSet || uok || gok || mok || aok {
 			f.state.replLog.Enqueue(ReplPut, f.relPath)
 		}
 	}
@@ -605,24 +582,3 @@ func setTimestamps(path string, in *fuse.SetAttrIn) syscall.Errno {
 	return 0
 }
 
-// setTimestampsForFile applies atime/mtime changes using the backing path for a file.
-func setTimestampsForFile(backingDir, relPath string, in *fuse.SetAttrIn) syscall.Errno {
-	mtime, mok := in.GetMTime()
-	atime, aok := in.GetATime()
-	if !mok && !aok {
-		return 0
-	}
-	ta := unix.Timespec{Nsec: unix.UTIME_OMIT}
-	tm := unix.Timespec{Nsec: unix.UTIME_OMIT}
-	if aok {
-		ta, _ = unix.TimeToTimespec(atime)
-	}
-	if mok {
-		tm, _ = unix.TimeToTimespec(mtime)
-	}
-	path := filepath.Join(backingDir, relPath)
-	if err := unix.UtimesNanoAt(unix.AT_FDCWD, path, []unix.Timespec{ta, tm}, 0); err != nil {
-		return fs.ToErrno(err)
-	}
-	return 0
-}
