@@ -815,6 +815,15 @@ fn computeBlake3(backing_path: []const u8) ![64]u8 {
 }
 
 fn checksumAndEnqueue(state: *FsState, rel_path: []const u8) !void {
+    // Skip files with open write descriptors — data may still be changing
+    if (state.path_state.hasWriteRef(rel_path)) return;
+
+    try checksumAndEnqueueForced(state, rel_path);
+}
+
+/// Like checksumAndEnqueue but bypasses the write-ref check.
+/// Used by fuse_fsync where data is flushed to disk even though the fd is still open.
+fn checksumAndEnqueueForced(state: *FsState, rel_path: []const u8) !void {
     const backing_path = try std.fs.path.join(state.allocator, &.{ state.backing_dir, rel_path });
     defer state.allocator.free(backing_path);
     const sum_path = try std.fmt.allocPrint(state.allocator, "{s}.sum", .{backing_path});
@@ -1430,9 +1439,11 @@ fn fuse_fsync(path: [*c]const u8, datasync: c_int, fi: ?*c.struct_fuse_file_info
         }
     }
 
-    // If dirty, compute checksum and enqueue replication
+    // If dirty, compute checksum and enqueue replication.
+    // Use checksumAndEnqueueForced to bypass the write-ref check — the fd is
+    // still open but data has been flushed to disk, so it is safe to replicate.
     if (rel.len > 0 and state.path_state.isDirty(rel)) {
-        checksumAndEnqueue(state, rel) catch |err| {
+        checksumAndEnqueueForced(state, rel) catch |err| {
             log.err("fsync checksum failed for {s}: {}", .{ rel, err });
             return fuseErr(.IO);
         };
