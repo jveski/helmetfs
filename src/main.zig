@@ -2095,9 +2095,6 @@ fn doMount(allocator: std.mem.Allocator, args: CliArgs) !void {
     // Start background workers
     try g_state.startWorkers();
 
-    // Setup signal handlers
-    setupSignalHandlers();
-
     // Build FUSE args
     const mount_z = try allocator.dupeZ(u8, mount_abs);
 
@@ -2118,6 +2115,10 @@ fn doMount(allocator: std.mem.Allocator, args: CliArgs) !void {
         std.process.exit(1);
     }
     g_fuse_instance = fuse_instance;
+
+    // Setup signal handlers AFTER g_fuse_instance is set, so that if a
+    // signal arrives the handler can call fuse_exit on the instance.
+    setupSignalHandlers();
 
     if (c.fuse_mount(fuse_instance, mount_z.ptr) != 0) {
         log.err("fuse_mount failed", .{});
