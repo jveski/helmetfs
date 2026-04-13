@@ -1335,6 +1335,10 @@ fn fuse_open(path: [*c]const u8, fi: ?*c.struct_fuse_file_info) callconv(.c) c_i
         if (has_trunc) {
             state.path_state.setDirty(rel);
         }
+    } else {
+        // No file_info to store the fd — close to avoid leak
+        posix.close(fd);
+        return fuseErr(.BADF);
     }
 
     return 0;
@@ -1460,6 +1464,10 @@ fn fuse_create(path: [*c]const u8, mode: c.mode_t, fi: ?*c.struct_fuse_file_info
         f.fh = encodeFh(fd, true);
         // Create opens for writing
         state.path_state.incWriteRef(rel);
+    } else {
+        // No file_info to store the fd — close to avoid leak
+        posix.close(fd);
+        return fuseErr(.BADF);
     }
 
     return 0;
