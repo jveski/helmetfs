@@ -786,31 +786,9 @@ fn computeBlake3(backing_path: []const u8) ![64]u8 {
     defer _ = c.flock(file.handle, c.LOCK_UN);
 
     var hasher = std.crypto.hash.Blake3.init(.{});
-    var buf: [1024 * 1024]u8 = undefined; // 1 MB buffer
+    var buf: [64 * 1024]u8 = undefined; // 64 KB — safe for default thread stacks
     while (true) {
-    const n = try file.readAll(&buf);
-        if (n == 0) break;
-        hasher.update(buf[0..n]);
-    }
-
-    var digest: [32]u8 = undefined;
-    hasher.final(&digest);
-    return std.fmt.bytesToHex(digest, .lower);
-}
-
-fn writeSumFile(sum_path: []const u8, hex_digest: []const u8) !void {
-    const file = try std.fs.createFileAbsolute(sum_path, .{});
-    defer file.close();
-    try file.writeAll(hex_digest);
-    try file.writeAll("\n");
-    try file.sync();
-}
-
-fn readSumFile(allocator: std.mem.Allocator, sum_path: []const u8) ![]const u8 {
-    const file = std.fs.openFileAbsolute(sum_path, .{}) catch |err| return err;
-    defer file.close();
-    var buf: [128]u8 = undefined;
-    const n = try file.read(&buf);
+        const n = try file.read(&buf);
     const content = buf[0..n];
     const trimmed = std.mem.trimRight(u8, content, "\n\r ");
     return try allocator.dupe(u8, trimmed);
@@ -948,7 +926,7 @@ fn copyFileWithSync(src_path: []const u8, dst_path: []const u8) !void {
     const dst = try std.fs.createFileAbsolute(dst_path, .{});
     defer dst.close();
 
-    var buf: [1024 * 1024]u8 = undefined; // 1 MB copy buffer
+    var buf: [64 * 1024]u8 = undefined; // 64 KB — safe for default thread stacks
     while (true) {
         const n = try src.read(&buf);
         if (n == 0) break;
