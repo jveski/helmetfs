@@ -924,6 +924,28 @@ fn computeBlake3(backing_path: []const u8) ![64]u8 {
     var buf: [64 * 1024]u8 = undefined; // 64 KB — safe for default thread stacks
     while (true) {
         const n = try file.read(&buf);
+        if (n == 0) break;
+        hasher.update(buf[0..n]);
+    }
+
+    var digest: [32]u8 = undefined;
+    hasher.final(&digest);
+    return std.fmt.bytesToHex(digest, .lower);
+}
+
+fn writeSumFile(sum_path: []const u8, hex_digest: []const u8) !void {
+    const file = try std.fs.createFileAbsolute(sum_path, .{});
+    defer file.close();
+    try file.writeAll(hex_digest);
+    try file.writeAll("\n");
+    try file.sync();
+}
+
+fn readSumFile(allocator: std.mem.Allocator, sum_path: []const u8) ![]const u8 {
+    const file = std.fs.openFileAbsolute(sum_path, .{}) catch |err| return err;
+    defer file.close();
+    var buf: [128]u8 = undefined;
+    const n = file.readAll(&buf) catch |err| return err;
     const content = buf[0..n];
     const trimmed = std.mem.trimRight(u8, content, "\n\r ");
     return try allocator.dupe(u8, trimmed);
@@ -1030,6 +1052,20 @@ fn replicatePut(state: *FsState, rel_path: []const u8) !void {
     defer state.allocator.free(sum_backing);
     const sum_replica = try std.fmt.allocPrint(state.allocator, "{s}.sum", .{replica_path});
     defer state.allocator.free(sum_replica);
+
+    // Verify backing file integrity before replicating.  If the file was
+    // modified after the log entry was created (e.g. corruption between
+    // enqueue and replication, or a stale entry replayed after remount),
+    // skip replication so we don't overwrite a good replica with bad data.
+    if (readSumFile(state.allocator, sum_backing)) |stored_hex| {
+        defer state.allocator.free(stored_hex);
+        if (computeBlake3(backing_path)) |computed_hex| {
+            if (!std.mem.eql(u8, &computed_hex, stored_hex)) {
+                log.warn("replication: skipping {s} — backing file does not match .sum (possible corruption)", .{rel_path});
+                return;
+            }
+        } else |_| {}
+    } else |_| {}
 
     // Copy file content
     try ensureParentDir(replica_path);
