@@ -1708,6 +1708,10 @@ fn fuse_utimens(path: [*c]const u8, tv: [*c]const c.struct_timespec, fi: ?*c.str
         const ret = posix.system.utimensat(posix.AT.FDCWD, backing.ptr, &ts, 0);
         const signed: c_int = @bitCast(ret);
         if (signed < 0) {
+            if (comptime builtin.os.tag == .macos) {
+                const err_val = std.c._errno().*;
+                return -@as(c_int, @intCast(err_val));
+            }
             return signed;
         }
         // Mark dirty only when times were actually updated
