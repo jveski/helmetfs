@@ -388,6 +388,7 @@ const PathStateMap = struct {
 const ReplOp = enum { put, delete };
 
 const ReplEntry = struct {
+    id: u64 = 0,
     op: ReplOp,
     path: []const u8,
     completed: bool = false,
@@ -401,6 +402,7 @@ const ReplLog = struct {
     entries: std.ArrayList(ReplEntry),
     completed_count: usize = 0,
     last_truncate_time: i64 = 0,
+    next_id: u64 = 0,
 
     fn init(allocator: std.mem.Allocator, backing_dir: []const u8) !ReplLog {
         var self = ReplLog{
@@ -472,7 +474,10 @@ const ReplLog = struct {
         else
             return error.InvalidOp;
 
+        const id = self.next_id;
+        self.next_id += 1;
         try self.entries.append(self.allocator, .{
+            .id = id,
             .op = op,
             .path = try self.allocator.dupe(u8, rel_path),
         });
@@ -483,7 +488,9 @@ const ReplLog = struct {
         defer self.mutex.unlock();
 
         const path_copy = try self.allocator.dupe(u8, rel_path);
-        self.entries.append(self.allocator, .{ .op = op, .path = path_copy }) catch |err| {
+        const id = self.next_id;
+        self.next_id += 1;
+        self.entries.append(self.allocator, .{ .id = id, .op = op, .path = path_copy }) catch |err| {
             self.allocator.free(path_copy);
             return err;
         };
@@ -508,12 +515,16 @@ const ReplLog = struct {
             self.allocator.free(p1);
             return;
         };
-        self.entries.append(self.allocator, .{ .op = op1, .path = p1 }) catch {
+        const id1 = self.next_id;
+        self.next_id += 1;
+        const id2 = self.next_id;
+        self.next_id += 1;
+        self.entries.append(self.allocator, .{ .id = id1, .op = op1, .path = p1 }) catch {
             self.allocator.free(p1);
             self.allocator.free(p2);
             return;
         };
-        self.entries.append(self.allocator, .{ .op = op2, .path = p2 }) catch {
+        self.entries.append(self.allocator, .{ .id = id2, .op = op2, .path = p2 }) catch {
             // Roll back the first append to maintain consistency
             _ = self.entries.pop();
             self.allocator.free(p1);
@@ -561,7 +572,7 @@ const ReplLog = struct {
         try file.sync();
     }
 
-    fn dequeueNext(self: *ReplLog) ?struct { index: usize, op: ReplOp, path: []const u8 } {
+    fn dequeueNext(self: *ReplLog) ?struct { id: u64, op: ReplOp, path: []const u8 } {
         self.mutex.lock();
         defer self.mutex.unlock();
 
@@ -587,7 +598,7 @@ const ReplLog = struct {
                     }
                 }
 
-                return .{ .index = i, .op = entry.op, .path = entry.path };
+                return .{ .id = entry.id, .op = entry.op, .path = entry.path };
             }
 
             // No work available, wait
@@ -596,13 +607,16 @@ const ReplLog = struct {
         return null;
     }
 
-    fn markCompleted(self: *ReplLog, index: usize) void {
+    fn markCompleted(self: *ReplLog, id: u64) void {
         self.mutex.lock();
         defer self.mutex.unlock();
 
-        if (index < self.entries.items.len) {
-            self.entries.items[index].completed = true;
-            self.completed_count += 1;
+        for (self.entries.items) |*entry| {
+            if (entry.id == id) {
+                entry.completed = true;
+                self.completed_count += 1;
+                break;
+            }
         }
 
         g_state.metrics.repl_pending.store(self.pendingCountLocked(), .release);
@@ -885,7 +899,7 @@ fn replWorkerLoop(state: *FsState) void {
             };
 
             if (result) |_| {
-                state.repl_log.markCompleted(work.index);
+                state.repl_log.markCompleted(work.id);
                 _ = state.metrics.repl_completed.fetchAdd(1, .release);
                 break;
             } else |err| {
@@ -2849,9 +2863,10 @@ test "dequeueNext coalesces duplicate puts, returning only the latest" {
     const p1 = try h.allocator.dupe(u8, "dup.txt");
     const p2 = try h.allocator.dupe(u8, "dup.txt");
     const p3 = try h.allocator.dupe(u8, "unique.txt");
-    try h.state.repl_log.entries.append(h.allocator, .{ .op = .put, .path = p1 });
-    try h.state.repl_log.entries.append(h.allocator, .{ .op = .put, .path = p3 });
-    try h.state.repl_log.entries.append(h.allocator, .{ .op = .put, .path = p2 });
+    try h.state.repl_log.entries.append(h.allocator, .{ .id = 0, .op = .put, .path = p1 });
+    try h.state.repl_log.entries.append(h.allocator, .{ .id = 1, .op = .put, .path = p3 });
+    try h.state.repl_log.entries.append(h.allocator, .{ .id = 2, .op = .put, .path = p2 });
+    h.state.repl_log.next_id = 3;
 
     // First dequeue should skip stale dup.txt (index 0) and return unique.txt (index 1)
     const first = h.state.repl_log.dequeueNext();
@@ -2862,13 +2877,13 @@ test "dequeueNext coalesces duplicate puts, returning only the latest" {
     try testing.expect(h.state.repl_log.entries.items[0].completed);
 
     // Mark unique.txt as completed (may trigger truncation, compacting entries)
-    h.state.repl_log.markCompleted(first.?.index);
+    h.state.repl_log.markCompleted(first.?.id);
 
     // Next dequeue should return the latest dup.txt (the only remaining entry)
     const second = h.state.repl_log.dequeueNext();
     try testing.expect(second != null);
     try testing.expectEqualStrings("dup.txt", second.?.path);
-    h.state.repl_log.markCompleted(second.?.index);
+    h.state.repl_log.markCompleted(second.?.id);
 
     // All consumed — set shutdown so dequeueNext returns null instead of blocking
     h.state.shutdown.store(true, .release);
@@ -3144,22 +3159,23 @@ test "dequeueNext does not coalesce delete entries" {
     // Two deletes for the same path should both be processed
     const p1 = try h.allocator.dupe(u8, "del.txt");
     const p2 = try h.allocator.dupe(u8, "del.txt");
-    try h.state.repl_log.entries.append(h.allocator, .{ .op = .delete, .path = p1 });
-    try h.state.repl_log.entries.append(h.allocator, .{ .op = .delete, .path = p2 });
+    try h.state.repl_log.entries.append(h.allocator, .{ .id = 0, .op = .delete, .path = p1 });
+    try h.state.repl_log.entries.append(h.allocator, .{ .id = 1, .op = .delete, .path = p2 });
+    h.state.repl_log.next_id = 2;
 
     const first = h.state.repl_log.dequeueNext();
     try testing.expect(first != null);
-    try testing.expectEqual(@as(usize, 0), first.?.index);
+    try testing.expectEqual(@as(u64, 0), first.?.id);
     try testing.expectEqual(ReplOp.delete, first.?.op);
 
-    h.state.repl_log.markCompleted(first.?.index);
+    h.state.repl_log.markCompleted(first.?.id);
 
     const second = h.state.repl_log.dequeueNext();
     try testing.expect(second != null);
-    try testing.expectEqual(@as(usize, 1), second.?.index);
+    try testing.expectEqual(@as(u64, 1), second.?.id);
     try testing.expectEqual(ReplOp.delete, second.?.op);
 
-    h.state.repl_log.markCompleted(second.?.index);
+    h.state.repl_log.markCompleted(second.?.id);
 
     h.state.shutdown.store(true, .release);
     h.state.repl_log.cond.broadcast();
