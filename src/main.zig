@@ -237,7 +237,7 @@ const FsState = struct {
         self.path_state.rwlock.lockShared();
         // Collect dirty paths — dupe the strings since map pointers can
         // be invalidated by concurrent operations after we release the lock.
-        var dirty_paths: std.ArrayList([]const u8) = .{};
+        var dirty_paths: std.ArrayListUnmanaged([]const u8) = .empty;
         defer dirty_paths.deinit(self.allocator);
         var it = self.path_state.map.iterator();
         while (it.next()) |entry| {
@@ -430,7 +430,7 @@ const ReplLog = struct {
     backing_dir: []const u8,
     mutex: std.Thread.Mutex = .{},
     cond: std.Thread.Condition = .{},
-    entries: std.ArrayList(ReplEntry),
+    entries: std.ArrayListUnmanaged(ReplEntry),
     completed_count: usize = 0,
     last_truncate_time: i64 = 0,
     next_id: u64 = 0,
@@ -715,7 +715,7 @@ const ReplLog = struct {
         // Collect remaining (non-completed) entries first.  Only free
         // completed entries once we know the new list is fully built,
         // so an OOM here does not corrupt the existing entry list.
-        var remaining: std.ArrayList(ReplEntry) = .{};
+        var remaining: std.ArrayListUnmanaged(ReplEntry) = .empty;
         for (self.entries.items) |entry| {
             if (!entry.completed) {
                 remaining.append(self.allocator, entry) catch {
@@ -2087,7 +2087,7 @@ fn signalHandler(_: c_int) callconv(.c) void {
 fn setupSignalHandlers() void {
     const act = posix.Sigaction{
         .handler = .{ .handler = signalHandler },
-        .mask = posix.sigemptyset(),
+        .mask = posix.empty_sigset,
         .flags = 0,
     };
     posix.sigaction(posix.SIG.TERM, &act, null);
