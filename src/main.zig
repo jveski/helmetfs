@@ -2119,7 +2119,7 @@ fn signalHandler(_: c_int) callconv(.c) void {
 fn setupSignalHandlers() void {
     const act = posix.Sigaction{
         .handler = .{ .handler = signalHandler },
-        .mask = posix.empty_sigset,
+        .mask = posix.sigemptyset(),
         .flags = 0,
     };
     posix.sigaction(posix.SIG.TERM, &act, null);
