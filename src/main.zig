@@ -669,12 +669,23 @@ const ReplLog = struct {
 
         if (!should_truncate) return;
 
-        // Collect remaining entries
+        // Collect remaining (non-completed) entries first.  Only free
+        // completed entries once we know the new list is fully built,
+        // so an OOM here does not corrupt the existing entry list.
         var remaining: std.ArrayList(ReplEntry) = .{};
         for (self.entries.items) |entry| {
             if (!entry.completed) {
-                remaining.append(self.allocator, entry) catch continue;
-            } else {
+                remaining.append(self.allocator, entry) catch {
+                    remaining.deinit(self.allocator);
+                    log.err("OOM during replication log truncation, skipping", .{});
+                    return;
+                };
+            }
+        }
+
+        // Success — now free completed entries' paths
+        for (self.entries.items) |entry| {
+            if (entry.completed) {
                 self.allocator.free(entry.path);
             }
         }
