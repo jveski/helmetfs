@@ -219,18 +219,24 @@ const FsState = struct {
     /// Flush dirty files to replication log (for shutdown/destroy)
     fn flushDirtyFiles(self: *FsState) void {
         self.path_state.rwlock.lockShared();
-        // Collect dirty paths
+        // Collect dirty paths — dupe the strings since map pointers can
+        // be invalidated by concurrent operations after we release the lock.
         var dirty_paths: std.ArrayList([]const u8) = .{};
         defer dirty_paths.deinit(self.allocator);
         var it = self.path_state.map.iterator();
         while (it.next()) |entry| {
             if (entry.value_ptr.dirty) {
-                dirty_paths.append(self.allocator, entry.key_ptr.*) catch continue;
+                const duped = self.allocator.dupe(u8, entry.key_ptr.*) catch continue;
+                dirty_paths.append(self.allocator, duped) catch {
+                    self.allocator.free(duped);
+                    continue;
+                };
             }
         }
         self.path_state.rwlock.unlockShared();
 
         for (dirty_paths.items) |rel_path| {
+            defer self.allocator.free(rel_path);
             checksumAndEnqueue(self, rel_path) catch |err| {
                 log.err("failed to flush dirty file {s}: {}", .{ rel_path, err });
             };
