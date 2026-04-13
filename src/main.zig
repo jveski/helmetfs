@@ -130,6 +130,8 @@ const FsState = struct {
     repl_threads: []std.Thread,
     // Metrics server thread
     metrics_thread: ?std.Thread,
+    // Queue monitor thread
+    queue_monitor_thread: ?std.Thread,
 
     fn init(
         allocator: std.mem.Allocator,
@@ -158,6 +160,7 @@ const FsState = struct {
             .scrub_thread = null,
             .repl_threads = &.{},
             .metrics_thread = null,
+            .queue_monitor_thread = null,
         };
         // Create .helmetfs directory
         const helmetfs_dir = try std.fs.path.join(allocator, &.{ backing_dir, ".helmetfs" });
@@ -198,6 +201,8 @@ const FsState = struct {
         if (self.metrics_addr != null) {
             self.metrics_thread = try std.Thread.spawn(.{}, metricsServerLoop, .{self});
         }
+        // Start queue depth monitor
+        self.queue_monitor_thread = try std.Thread.spawn(.{}, queueMonitorLoop, .{self});
     }
 
     fn stopWorkers(self: *FsState) void {
@@ -230,6 +235,10 @@ const FsState = struct {
             }
             t.join();
         }
+        // Join queue monitor thread
+        if (self.queue_monitor_thread) |t| {
+            t.join();
+        }
     }
 
     /// Flush dirty files to replication log (for shutdown/destroy)
@@ -254,7 +263,7 @@ const FsState = struct {
         for (dirty_paths.items) |rel_path| {
             defer self.allocator.free(rel_path);
             checksumAndEnqueue(self, rel_path) catch |err| {
-                log.err("failed to flush dirty file {s}: {}", .{ rel_path, err });
+                log.err("replication: failed to flush dirty file {s}: {}", .{ rel_path, err });
             };
         }
     }
@@ -444,7 +453,7 @@ const ReplLog = struct {
         self.last_truncate_time = std.time.timestamp();
         // Load existing log entries from disk
         self.loadFromDisk() catch |err| {
-            log.warn("failed to load replication log: {}", .{err});
+            log.warn("replication: failed to load log from disk: {}", .{err});
         };
         return self;
     }
@@ -474,7 +483,7 @@ const ReplLog = struct {
 
         const pending = self.entries.items.len;
         if (pending > 0) {
-            log.info("loaded {} pending replication entries from log", .{pending});
+            log.info("replication: loaded {d} pending entries from log", .{pending});
         }
     }
 
@@ -488,7 +497,7 @@ const ReplLog = struct {
         const expected_crc = std.fmt.parseUnsigned(u32, crc_hex, 16) catch return error.InvalidCrc;
         const computed_crc = std.hash.crc.Crc32IsoHdlc.hash(remainder);
         if (expected_crc != computed_crc) {
-            log.warn("discarding log entry with CRC mismatch: {s}", .{line});
+            log.warn("replication: discarding log entry with CRC mismatch: {s}", .{line});
             return error.CrcMismatch;
         }
 
@@ -528,7 +537,7 @@ const ReplLog = struct {
 
         // Write to disk
         self.appendToDisk(op, rel_path) catch |err| {
-            log.err("failed to append to replication log: {}", .{err});
+            log.err("replication: failed to append to log: {}", .{err});
         };
 
         // Update pending metric
@@ -565,7 +574,7 @@ const ReplLog = struct {
 
         // Write both entries to disk with a single fsync
         self.appendPairToDisk(op1, path1, op2, path2) catch |err| {
-            log.err("failed to append pair to replication log: {}", .{err});
+            log.err("replication: failed to append pair to log: {}", .{err});
         };
 
         g_state.metrics.repl_pending.store(self.pendingCountLocked(), .release);
@@ -720,7 +729,7 @@ const ReplLog = struct {
             if (!entry.completed) {
                 remaining.append(self.allocator, entry) catch {
                     remaining.deinit(self.allocator);
-                    log.err("OOM during replication log truncation, skipping", .{});
+                    log.err("replication: OOM during log truncation, skipping", .{});
                     return;
                 };
             }
@@ -740,7 +749,7 @@ const ReplLog = struct {
 
         // Atomic rewrite of log file
         self.rewriteLogAtomic() catch |err| {
-            log.err("failed to truncate replication log: {}", .{err});
+            log.err("replication: failed to truncate log: {}", .{err});
         };
     }
 
@@ -797,32 +806,32 @@ const Metrics = struct {
 fn metricsServerLoop(state: *FsState) void {
     const addr_str = state.metrics_addr orelse return;
     const port = parseMetricsAddr(addr_str) catch |err| {
-        log.err("invalid metrics address '{s}': {}", .{ addr_str, err });
+        log.err("metrics: invalid address '{s}': {}", .{ addr_str, err });
         return;
     };
 
     const addr = std.net.Address.parseIp4("0.0.0.0", port) catch |err| {
-        log.err("failed to parse metrics address: {}", .{err});
+        log.err("metrics: failed to parse address: {}", .{err});
         return;
     };
 
     var server = addr.listen(.{ .reuse_address = true }) catch |err| {
-        log.err("failed to start metrics server: {}", .{err});
+        log.err("metrics: failed to start server: {}", .{err});
         return;
     };
     defer server.deinit();
 
-    log.info("metrics server listening on :{d}", .{port});
+    log.info("metrics: server listening on :{d}", .{port});
 
     while (!state.shutdown.load(.acquire)) {
         const conn = server.accept() catch |err| {
             if (state.shutdown.load(.acquire)) break;
-            log.err("metrics accept error: {}", .{err});
+            log.err("metrics: accept error: {}", .{err});
             continue;
         };
 
         handleMetricsConn(state, conn.stream) catch |err| {
-            log.err("metrics connection error: {}", .{err});
+            log.err("metrics: connection error: {}", .{err});
         };
     }
 }
@@ -1003,7 +1012,7 @@ fn replWorkerLoop(state: *FsState) void {
                 break;
             } else |err| {
                 _ = state.metrics.repl_errors.fetchAdd(1, .release);
-                log.err("replication error for {s}: {}, retrying in {d}s", .{
+                log.err("replication: error for {s}: {}, retrying in {d}s", .{
                     work.path,
                     err,
                     backoff_ns / 1_000_000_000,
@@ -1138,13 +1147,36 @@ fn ensureParentDir(path: []const u8) !void {
 }
 
 // ============================================================================
+// Queue Depth Monitor
+// ============================================================================
+
+fn queueMonitorLoop(state: *FsState) void {
+    const interval_ns: u64 = 10_000_000_000; // 10 seconds
+    while (!state.shutdown.load(.acquire)) {
+        // Sleep in 1-second increments to check for shutdown
+        var remaining = interval_ns;
+        while (remaining > 0 and !state.shutdown.load(.acquire)) {
+            const chunk = @min(remaining, 1_000_000_000);
+            std.Thread.sleep(chunk);
+            remaining -= chunk;
+        }
+        if (state.shutdown.load(.acquire)) break;
+
+        const pending = state.metrics.repl_pending.load(.acquire);
+        if (pending > 0) {
+            log.info("replication: queue depth: {d} pending", .{pending});
+        }
+    }
+}
+
+// ============================================================================
 // Self-Healing Scrub
 // ============================================================================
 
 fn scrubLoop(state: *FsState) void {
     // Check if we need an immediate scrub
     if (shouldScrubImmediately(state)) {
-        log.info("scrub overdue, running immediately", .{});
+        log.info("scrub: overdue, running immediately", .{});
         runScrub(state);
     }
 
@@ -1197,7 +1229,7 @@ fn nsUntilNextScrub(target_hour: u8, target_minute: u8) u64 {
 }
 
 fn runScrub(state: *FsState) void {
-    log.info("starting scrub", .{});
+    log.info("scrub: starting", .{});
     const start_ms = std.time.milliTimestamp();
     var files_checked: u64 = 0;
     var corruptions_found: u64 = 0;
@@ -1254,7 +1286,7 @@ fn runScrub(state: *FsState) void {
     // Write scrub timestamp
     writeScrubTimestamp(state, end);
 
-    log.info("scrub complete: checked={d}, corruptions={d}, repairs={d}, duration={d}ms", .{
+    log.info("scrub: complete: checked={d}, corruptions={d}, repairs={d}, duration={d}ms", .{
         files_checked, corruptions_found, repairs, duration_ms,
     });
 }
@@ -1309,14 +1341,14 @@ fn scrubFile(state: *FsState, rel_path: []const u8, corruptions: *u64, repairs_c
 
     // Read replica checksum
     const replica_hex = readSumFile(state.allocator, replica_sum_path) catch {
-        log.err("scrub: replica unavailable for repair of {s}", .{rel_path});
+        log.warn("scrub: replica unavailable for repair of {s}", .{rel_path});
         return;
     };
     defer state.allocator.free(replica_hex);
 
     // Verify replica file integrity
     const replica_computed = computeBlake3(replica_path) catch {
-        log.err("scrub: cannot read replica file for repair of {s}", .{rel_path});
+        log.warn("scrub: cannot read replica file for repair of {s}", .{rel_path});
         return;
     };
 
@@ -1556,7 +1588,7 @@ fn fuse_read(path: [*c]const u8, buf_ptr: [*c]u8, size: usize, offset: c.off_t, 
     // Verify reads if enabled
     if (state.verify_reads and rel.len > 0 and !state.path_state.hasWriteRef(rel) and state.path_state.shouldVerify(rel)) {
         verifyRead(state, rel) catch |err| {
-            log.err("read verification failed for {s}: {}", .{ rel, err });
+            log.err("read verification: failed to verify {s}: {}", .{ rel, err });
         };
     }
 
@@ -1577,7 +1609,7 @@ fn verifyRead(state: *FsState, rel_path: []const u8) !void {
 
     const current_hex = computeBlake3(backing_path_str) catch return;
     if (!std.mem.eql(u8, &current_hex, stored_hex)) {
-        log.err("READ VERIFICATION FAILED: {s} - checksum mismatch (scrub will attempt repair)", .{rel_path});
+        log.warn("read verification: checksum mismatch for {s} (scrub will attempt repair)", .{rel_path});
     }
 }
 
@@ -1618,7 +1650,7 @@ fn fuse_fsync(path: [*c]const u8, datasync: c_int, fi: ?*c.struct_fuse_file_info
     // still open but data has been flushed to disk, so it is safe to replicate.
     if (rel.len > 0 and state.path_state.isDirty(rel)) {
         checksumAndEnqueueForced(state, rel) catch |err| {
-            log.err("fsync checksum failed for {s}: {}", .{ rel, err });
+            log.err("checksum: fsync failed for {s}: {}", .{ rel, err });
             return fuseErr(.IO);
         };
     }
@@ -1644,7 +1676,7 @@ fn fuse_release(path: [*c]const u8, fi: ?*c.struct_fuse_file_info) callconv(.c) 
     // If dirty, compute checksum and enqueue replication
     if (rel.len > 0 and state.path_state.isDirty(rel)) {
         checksumAndEnqueue(state, rel) catch |err| {
-            log.err("release checksum failed for {s}: {}", .{ rel, err });
+            log.err("checksum: release failed for {s}: {}", .{ rel, err });
         };
     }
 
@@ -1704,7 +1736,7 @@ fn fuse_unlink(path: [*c]const u8) callconv(.c) c_int {
     // Enqueue delete to replica
     if (rel.len > 0) {
         state.repl_log.enqueue(.delete, rel) catch |err| {
-            log.err("failed to enqueue delete for {s}: {}", .{ rel, err });
+            log.err("replication: failed to enqueue delete for {s}: {}", .{ rel, err });
         };
     }
 
@@ -1806,7 +1838,7 @@ fn fuse_symlink(target: [*c]const u8, linkpath: [*c]const u8) callconv(.c) c_int
     // Enqueue for replication (symlinks are replicated)
     if (rel.len > 0) {
         state.repl_log.enqueue(.put, rel) catch |err| {
-            log.err("failed to enqueue symlink replication for {s}: {}", .{ rel, err });
+            log.err("replication: failed to enqueue symlink for {s}: {}", .{ rel, err });
         };
     }
 
@@ -1910,7 +1942,7 @@ fn fuse_truncate(path: [*c]const u8, size: c.off_t, fi: ?*c.struct_fuse_file_inf
     if (rel.len > 0) {
         state.path_state.setDirty(rel);
         checksumAndEnqueue(state, rel) catch |err| {
-            log.err("truncate checksum failed for {s}: {}", .{ rel, err });
+            log.err("checksum: truncate failed for {s}: {}", .{ rel, err });
         };
     }
 
@@ -2024,7 +2056,7 @@ fn fuse_access(path: [*c]const u8, mask: c_int) callconv(.c) c_int {
 }
 
 fn fuse_destroy(_: ?*anyopaque) callconv(.c) void {
-    log.info("FUSE destroy — flushing dirty files and stopping workers", .{});
+    log.info("shutting down: flushing dirty files and stopping workers", .{});
     g_state.flushDirtyFiles();
     g_state.stopWorkers();
 }
@@ -2361,7 +2393,11 @@ fn doMount(allocator: std.mem.Allocator, args: CliArgs) !void {
     };
     const ret = c.fuse_loop_mt(fuse_instance, &loop_cfg);
 
-    log.info("FUSE loop exited with {d}", .{ret});
+    if (ret != 0) {
+        log.warn("FUSE loop exited with error code {d}", .{ret});
+    } else {
+        log.info("FUSE loop exited cleanly", .{});
+    }
 
     // fuse_destroy callback handles flush + stopWorkers; just tear down FUSE.
     c.fuse_unmount(fuse_instance);
