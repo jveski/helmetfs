@@ -478,14 +478,14 @@ const ReplLog = struct {
         });
     }
 
-    fn enqueue(self: *ReplLog, op: ReplOp, rel_path: []const u8) void {
+    fn enqueue(self: *ReplLog, op: ReplOp, rel_path: []const u8) !void {
         self.mutex.lock();
         defer self.mutex.unlock();
 
-        const path_copy = self.allocator.dupe(u8, rel_path) catch return;
-        self.entries.append(self.allocator, .{ .op = op, .path = path_copy }) catch {
+        const path_copy = try self.allocator.dupe(u8, rel_path);
+        self.entries.append(self.allocator, .{ .op = op, .path = path_copy }) catch |err| {
             self.allocator.free(path_copy);
-            return;
+            return err;
         };
 
         // Write to disk
@@ -863,7 +863,7 @@ fn checksumAndEnqueueForced(state: *FsState, rel_path: []const u8) !void {
 
     try writeSumFile(sum_path, &hex_digest);
 
-    state.repl_log.enqueue(.put, rel_path);
+    try state.repl_log.enqueue(.put, rel_path);
     state.path_state.clearDirtyIfGen(rel_path, gen);
 }
 
@@ -1153,7 +1153,9 @@ fn scrubFile(state: *FsState, rel_path: []const u8, corruptions: *u64, repairs_c
                 log.err("scrub: failed to write .sum for {s}: {}", .{ rel_path, we });
                 return we;
             };
-            state.repl_log.enqueue(.put, rel_path);
+            state.repl_log.enqueue(.put, rel_path) catch |enq_err| {
+                log.err("scrub: failed to enqueue replication for {s}: {}", .{ rel_path, enq_err });
+            };
             return;
         },
         else => return err,
@@ -1559,7 +1561,9 @@ fn fuse_unlink(path: [*c]const u8) callconv(.c) c_int {
 
     // Enqueue delete to replica
     if (rel.len > 0) {
-        state.repl_log.enqueue(.delete, rel);
+        state.repl_log.enqueue(.delete, rel) catch |err| {
+            log.err("failed to enqueue delete for {s}: {}", .{ rel, err });
+        };
     }
 
     return 0;
@@ -1652,7 +1656,9 @@ fn fuse_symlink(target: [*c]const u8, linkpath: [*c]const u8) callconv(.c) c_int
 
     // Enqueue for replication (symlinks are replicated)
     if (rel.len > 0) {
-        state.repl_log.enqueue(.put, rel);
+        state.repl_log.enqueue(.put, rel) catch |err| {
+            log.err("failed to enqueue symlink replication for {s}: {}", .{ rel, err });
+        };
     }
 
     return 0;
@@ -2618,8 +2624,8 @@ test "ReplLog.enqueue adds entries" {
     defer h.deinit();
 
     const before = h.state.repl_log.entries.items.len;
-    h.state.repl_log.enqueue(.put, "file1.txt");
-    h.state.repl_log.enqueue(.delete, "file2.txt");
+    try h.state.repl_log.enqueue(.put, "file1.txt");
+    try h.state.repl_log.enqueue(.delete, "file2.txt");
     try testing.expectEqual(before + 2, h.state.repl_log.entries.items.len);
 }
 
@@ -2637,7 +2643,7 @@ test "ReplLog.hasPendingPut detects pending puts" {
     defer h.deinit();
 
     try testing.expect(!h.state.repl_log.hasPendingPut("x.txt"));
-    h.state.repl_log.enqueue(.put, "x.txt");
+    try h.state.repl_log.enqueue(.put, "x.txt");
     try testing.expect(h.state.repl_log.hasPendingPut("x.txt"));
 }
 
@@ -2799,8 +2805,8 @@ test "ReplLog persists to disk and reloads" {
     defer h.deinit();
 
     // Enqueue some entries
-    h.state.repl_log.enqueue(.put, "persist1.txt");
-    h.state.repl_log.enqueue(.delete, "persist2.txt");
+    try h.state.repl_log.enqueue(.put, "persist1.txt");
+    try h.state.repl_log.enqueue(.delete, "persist2.txt");
 
     // Create a fresh ReplLog from the same backing dir — it should load entries
     var log2 = try ReplLog.init(h.allocator, h.backing_dir);
@@ -2878,10 +2884,10 @@ test "markCompleted triggers truncation and removes completed entries" {
     defer h.deinit();
 
     // Add 4 entries
-    h.state.repl_log.enqueue(.put, "a.txt");
-    h.state.repl_log.enqueue(.put, "b.txt");
-    h.state.repl_log.enqueue(.delete, "c.txt");
-    h.state.repl_log.enqueue(.put, "d.txt");
+    try h.state.repl_log.enqueue(.put, "a.txt");
+    try h.state.repl_log.enqueue(.put, "b.txt");
+    try h.state.repl_log.enqueue(.delete, "c.txt");
+    try h.state.repl_log.enqueue(.put, "d.txt");
 
     try testing.expectEqual(@as(usize, 4), h.state.repl_log.entries.items.len);
 
@@ -3166,9 +3172,9 @@ test "ReplLog atomic rewrite preserves only pending entries on disk" {
     var h = try TestHarness.init();
     defer h.deinit();
 
-    h.state.repl_log.enqueue(.put, "keep.txt");
-    h.state.repl_log.enqueue(.delete, "remove.txt");
-    h.state.repl_log.enqueue(.put, "also-keep.txt");
+    try h.state.repl_log.enqueue(.put, "keep.txt");
+    try h.state.repl_log.enqueue(.delete, "remove.txt");
+    try h.state.repl_log.enqueue(.put, "also-keep.txt");
 
     // Mark the middle entry as completed and force truncation
     h.state.repl_log.last_truncate_time = 0;
