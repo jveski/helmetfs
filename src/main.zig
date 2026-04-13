@@ -276,8 +276,10 @@ const PathStateMap = struct {
         };
         if (gop.found_existing) {
             self.allocator.free(key_copy);
+            gop.value_ptr.dirty = true;
+        } else {
+            gop.value_ptr.* = .{ .dirty = true };
         }
-        gop.value_ptr.dirty = true;
     }
 
     fn incWriteRef(self: *PathStateMap, rel_path: []const u8) void {
