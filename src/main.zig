@@ -1756,11 +1756,12 @@ fn fuse_fallocate(path: [*c]const u8, mode: c_int, offset: c.off_t, length: c.of
     };
 
     const ret = c.fallocate(fd, mode, offset, length);
+    // Capture errno immediately, before close() can clobber it.
+    const err_val = std.c._errno().*;
     // If we opened the file ourselves (no fi), close it.
     if (castFi(fi) == null) posix.close(fd);
 
     if (ret != 0) {
-        const err_val = std.c._errno().*;
         return -@as(c_int, @intCast(err_val));
     }
 
