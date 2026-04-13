@@ -472,13 +472,19 @@ const ReplLog = struct {
         defer self.mutex.unlock();
 
         const p1 = self.allocator.dupe(u8, path1) catch return;
-        const p2 = self.allocator.dupe(u8, path2) catch return;
+        const p2 = self.allocator.dupe(u8, path2) catch {
+            self.allocator.free(p1);
+            return;
+        };
         self.entries.append(self.allocator, .{ .op = op1, .path = p1 }) catch {
             self.allocator.free(p1);
             self.allocator.free(p2);
             return;
         };
         self.entries.append(self.allocator, .{ .op = op2, .path = p2 }) catch {
+            // Roll back the first append to maintain consistency
+            _ = self.entries.pop();
+            self.allocator.free(p1);
             self.allocator.free(p2);
             return;
         };
