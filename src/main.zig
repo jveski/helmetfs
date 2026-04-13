@@ -1294,6 +1294,16 @@ fn scrubFile(state: *FsState, rel_path: []const u8, corruptions: *u64, repairs_c
         log.warn("scrub: skipping repair of {s} — pending replication means replica is stale", .{rel_path});
         return;
     }
+
+    // Re-check write ref before overwriting.  A writer may have opened the
+    // file between the initial hasWriteRef check in runScrub and now; if
+    // so the "corruption" is really an in-progress write and we must not
+    // clobber the file.
+    if (state.path_state.hasWriteRef(rel_path)) {
+        log.info("scrub: skipping repair of {s} — file now has open writer", .{rel_path});
+        return;
+    }
+
     log.info("scrub: repairing {s} from replica", .{rel_path});
 
     copyFileWithSync(replica_path, backing_path) catch |err| {
