@@ -101,7 +101,6 @@ const FsState = struct {
     allocator: std.mem.Allocator,
     backing_dir: []const u8,
     replica_dir: []const u8,
-    verify_reads: bool,
     scrub_hour: u8,
     scrub_minute: u8,
     metrics_addr: ?[]const u8,
@@ -132,7 +131,6 @@ const FsState = struct {
         allocator: std.mem.Allocator,
         backing_dir: []const u8,
         replica_dir: []const u8,
-        verify_reads: bool,
         scrub_hour: u8,
         scrub_minute: u8,
         metrics_addr: ?[]const u8,
@@ -143,7 +141,6 @@ const FsState = struct {
             .allocator = allocator,
             .backing_dir = backing_dir,
             .replica_dir = replica_dir,
-            .verify_reads = verify_reads,
             .scrub_hour = scrub_hour,
             .scrub_minute = scrub_minute,
             .metrics_addr = metrics_addr,
@@ -270,7 +267,6 @@ const PathInfo = struct {
     dirty_gen: u64 = 0,
     clean_gen: u64 = 0,
     write_refcount: u32 = 0,
-    last_verify_time: i64 = 0,
 };
 
 const PathStateMap = struct {
@@ -337,16 +333,6 @@ const PathStateMap = struct {
         defer self.rwlock.unlockShared();
         if (self.map.get(rel_path)) |info| return info.write_refcount > 0;
         return false;
-    }
-
-    fn shouldVerify(self: *PathStateMap, rel_path: []const u8) bool {
-        const now = std.time.timestamp();
-        self.rwlock.lock();
-        defer self.rwlock.unlock();
-        const info = self.getOrCreate(rel_path) orelse return true;
-        if (now - info.last_verify_time < 60) return false;
-        info.last_verify_time = now;
-        return true;
     }
 
     fn clearDirty(self: *PathStateMap, rel_path: []const u8) void {
@@ -1524,37 +1510,13 @@ fn fuse_open(path: [*c]const u8, fi: ?*c.struct_fuse_file_info) callconv(.c) c_i
 }
 
 fn fuse_read(path: [*c]const u8, buf_ptr: [*c]u8, size: usize, offset: c.off_t, fi: ?*c.struct_fuse_file_info) callconv(.c) c_int {
-    const state = g_state;
-    const rel = fuseRelPath(path);
-
+    _ = path;
     const fd: posix.fd_t = if (castFi(fi)) |f| decodeFh(f.fh).fd else return fuseErr(.BADF);
-
-    // Verify reads if enabled
-    if (state.verify_reads and rel.len > 0 and !state.path_state.hasWriteRef(rel) and state.path_state.shouldVerify(rel)) {
-        verifyRead(state, rel) catch |err| {
-            log.err("read verification: failed to verify {s}: {}", .{ rel, err });
-        };
-    }
 
     const n = posix.pread(fd, buf_ptr[0..size], @intCast(offset)) catch {
         return fuseErr(.IO);
     };
     return @intCast(n);
-}
-
-fn verifyRead(state: *FsState, rel_path: []const u8) !void {
-    const backing_path_str = try std.fs.path.join(state.allocator, &.{ state.backing_dir, rel_path });
-    defer state.allocator.free(backing_path_str);
-    const sum_path = try sumPath(state.allocator, backing_path_str);
-    defer state.allocator.free(sum_path);
-
-    const stored_hex = readSumFile(state.allocator, sum_path) catch return; // No .sum = no verification
-    defer state.allocator.free(stored_hex);
-
-    const current_hex = computeBlake3(backing_path_str) catch return;
-    if (!std.mem.eql(u8, &current_hex, stored_hex)) {
-        log.warn("read verification: checksum mismatch for {s} (scrub will attempt repair)", .{rel_path});
-    }
 }
 
 fn fuse_write(path: [*c]const u8, data: [*c]const u8, size: usize, offset: c.off_t, fi: ?*c.struct_fuse_file_info) callconv(.c) c_int {
@@ -2073,7 +2035,6 @@ const CliArgs = struct {
     mountpoint: []const u8,
     replica: ?[]const u8 = null,
     repl_workers: u32 = 4,
-    verify_reads: bool = false,
     scrub_time: []const u8 = "01:00",
     metrics_addr: ?[]const u8 = null,
 };
@@ -2141,8 +2102,6 @@ fn parseArgs(allocator: std.mem.Allocator) !CliArgs {
                 std.debug.print("Invalid replication workers count: {s}\n", .{val});
                 std.process.exit(1);
             };
-        } else if (std.mem.eql(u8, arg, "--verify-reads")) {
-            result.verify_reads = true;
         } else if (std.mem.eql(u8, arg, "--scrub-time")) {
             result.scrub_time = args_iter.next() orelse {
                 std.debug.print("--scrub-time requires a value (HH:MM)\n", .{});
@@ -2186,7 +2145,6 @@ fn printUsage() void {
         \\Options:
         \\  --replica <path>           Replica directory (required)
         \\  --replication-workers <n>  Number of replication workers (default: 4)
-        \\  --verify-reads             Enable read-time checksum verification
         \\  --scrub-time HH:MM        Scrub schedule in 24h format (default: 01:00)
         \\  --metrics-addr :PORT      Prometheus metrics endpoint (disabled by default)
         \\
@@ -2270,7 +2228,6 @@ fn doMount(allocator: std.mem.Allocator, args: CliArgs) !void {
     log.info("  mountpoint:  {s}", .{mount_abs});
     log.info("  replica dir: {s}", .{replica_abs});
     log.info("  workers:     {d}", .{args.repl_workers});
-    log.info("  verify reads: {}", .{args.verify_reads});
     log.info("  scrub time:  {s}", .{args.scrub_time});
 
     // Initialize global state
@@ -2278,7 +2235,6 @@ fn doMount(allocator: std.mem.Allocator, args: CliArgs) !void {
         allocator,
         source_abs,
         replica_abs,
-        args.verify_reads,
         scrub.hour,
         scrub.minute,
         args.metrics_addr,
@@ -2373,7 +2329,7 @@ const TestHarness = struct {
         defer allocator.free(replica_files);
         try std.fs.makeDirAbsolute(replica_files);
 
-        const state = try FsState.init(allocator, backing, replica, false, 1, 0, null, 1);
+        const state = try FsState.init(allocator, backing, replica, 1, 0, null, 1);
         g_state = state;
 
         return .{
@@ -3009,22 +2965,6 @@ test "markCompleted triggers truncation and removes completed entries" {
     try testing.expectEqual(@as(usize, 1), h.state.repl_log.entries.items.len);
     try testing.expectEqualStrings("d.txt", h.state.repl_log.entries.items[0].path);
     try testing.expectEqual(@as(usize, 0), h.state.repl_log.completed_count);
-}
-
-// ---------- PathStateMap.shouldVerify ----------
-
-test "PathStateMap.shouldVerify throttles within 60s window" {
-    var psm = PathStateMap.init(testing.allocator);
-    defer deinitPathStateMap(&psm);
-
-    // First call should return true (no prior verification)
-    try testing.expect(psm.shouldVerify("throttle.txt"));
-
-    // Immediately calling again should return false (within 60s)
-    try testing.expect(!psm.shouldVerify("throttle.txt"));
-
-    // Different path should still allow verification
-    try testing.expect(psm.shouldVerify("other.txt"));
 }
 
 // ---------- scrubFile: replica also corrupt ----------

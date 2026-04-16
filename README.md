@@ -22,7 +22,6 @@ helmetfs unmount <mountpoint>
 |---|---|---|
 | `--replica <path>` | Replica directory (required) | -- |
 | `--replication-workers <n>` | Number of background worker threads | `4` |
-| `--verify-reads` | Enable read-time checksum verification | off |
 | `--scrub-time HH:MM` | Daily scrub schedule (24-hour format) | `01:00` |
 | `--metrics-addr :PORT` | Enable Prometheus metrics endpoint | off |
 
@@ -31,7 +30,7 @@ helmetfs unmount <mountpoint>
 ```bash
 mkdir -p /data/backing /data/replica /mnt/protected
 
-helmetfs mount /data/backing /mnt/protected --replica /data/replica --verify-reads --scrub-time 03:00 --metrics-addr :9090
+helmetfs mount /data/backing /mnt/protected --replica /data/replica --scrub-time 03:00 --metrics-addr :9090
 ```
 
 Use `/mnt/protected` as a normal filesystem. Data lives in `/data/backing` and is asynchronously replicated to `/data/replica`.
