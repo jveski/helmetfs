@@ -15,13 +15,13 @@
 #
 set -euo pipefail
 
-# ── Paths ────────────────────────────────────────────────────────────────────
+# Paths
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 PROJECT_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
 HELMETFS="$PROJECT_DIR/zig-out/bin/helmetfs"
 
-# ── Color output ─────────────────────────────────────────────────────────────
+# Color output
 
 RED='\033[0;31m'
 GREEN='\033[0;32m'
@@ -46,7 +46,7 @@ info() {
     echo -e "${YELLOW}INFO${NC}: $1"
 }
 
-# ── Build ────────────────────────────────────────────────────────────────────
+# Build
 
 info "Building helmetfs..."
 (cd "$PROJECT_DIR" && zig build) || { echo "Build failed"; exit 1; }
@@ -56,7 +56,7 @@ if [[ ! -x "$HELMETFS" ]]; then
     exit 1
 fi
 
-# ── Test infrastructure ──────────────────────────────────────────────────────
+# Test infrastructure
 
 # Each test gets its own temp directory with backing/, replica/, mount/ subdirs.
 # helmetfs runs in the background; cleanup tears it down.
@@ -140,12 +140,11 @@ teardown_mount() {
     HELMETFS_PID=""
 }
 
-# Wait for a file to appear in the replica (replication is async).
-wait_for_replica() {
-    local rel_path="$1"
-    local max_wait="${2:-10}"
+# Poll until a condition is met. Usage: wait_for_condition <max_secs> <test_cmd...>
+wait_for_condition() {
+    local max_wait="$1"; shift
     local attempts=0
-    while [[ ! -f "$REPLICA/files/$rel_path" ]]; do
+    while ! "$@" 2>/dev/null; do
         sleep 0.3
         attempts=$((attempts + 1))
         if [[ $attempts -ge $((max_wait * 3)) ]]; then
@@ -153,41 +152,24 @@ wait_for_replica() {
         fi
     done
     return 0
+}
+
+# Wait for a file to appear in the replica (replication is async).
+wait_for_replica() {
+    wait_for_condition "${2:-10}" test -f "$REPLICA/files/$1"
 }
 
 # Wait for a file to disappear from the replica.
 wait_for_replica_gone() {
-    local rel_path="$1"
-    local max_wait="${2:-10}"
-    local attempts=0
-    while [[ -f "$REPLICA/files/$rel_path" ]]; do
-        sleep 0.3
-        attempts=$((attempts + 1))
-        if [[ $attempts -ge $((max_wait * 3)) ]]; then
-            return 1
-        fi
-    done
-    return 0
+    wait_for_condition "${2:-10}" test ! -f "$REPLICA/files/$1"
 }
 
 # Wait for a .sum sidecar to appear in the backing dir.
 wait_for_sum() {
-    local rel_path="$1"
-    local max_wait="${2:-10}"
-    local attempts=0
-    while [[ ! -f "$BACKING/${rel_path}.sum" ]]; do
-        sleep 0.3
-        attempts=$((attempts + 1))
-        if [[ $attempts -ge $((max_wait * 3)) ]]; then
-            return 1
-        fi
-    done
-    return 0
+    wait_for_condition "${2:-10}" test -f "$BACKING/${1}.sum"
 }
 
-# ─────────────────────────────────────────────────────────────────────────────
 # TEST 1: Basic file write and read through FUSE mount
-# ─────────────────────────────────────────────────────────────────────────────
 
 test_basic_crud() {
     local T="basic_crud"
@@ -256,9 +238,7 @@ test_basic_crud() {
     teardown_mount
 }
 
-# ─────────────────────────────────────────────────────────────────────────────
 # TEST 2: Replication - files are copied to replica after sync
-# ─────────────────────────────────────────────────────────────────────────────
 
 test_replication() {
     local T="replication"
@@ -315,9 +295,7 @@ test_replication() {
     teardown_mount
 }
 
-# ─────────────────────────────────────────────────────────────────────────────
 # TEST 3: Checksum sidecar hiding - .sum files hidden from FUSE mount
-# ─────────────────────────────────────────────────────────────────────────────
 
 test_sum_hiding() {
     local T="sum_hiding"
@@ -370,9 +348,7 @@ test_sum_hiding() {
     teardown_mount
 }
 
-# ─────────────────────────────────────────────────────────────────────────────
 # TEST 4: Corruption detection and self-healing
-# ─────────────────────────────────────────────────────────────────────────────
 
 test_self_healing() {
     local T="self_healing"
@@ -452,9 +428,7 @@ test_self_healing() {
     teardown_mount
 }
 
-# ─────────────────────────────────────────────────────────────────────────────
 # TEST 5: Unlink removes file and enqueues delete to replica
-# ─────────────────────────────────────────────────────────────────────────────
 
 test_unlink() {
     local T="unlink"
@@ -511,9 +485,7 @@ test_unlink() {
     teardown_mount
 }
 
-# ─────────────────────────────────────────────────────────────────────────────
 # TEST 6: Rename moves file and .sum, enqueues delete+put
-# ─────────────────────────────────────────────────────────────────────────────
 
 test_rename() {
     local T="rename"
@@ -578,9 +550,7 @@ test_rename() {
     teardown_mount
 }
 
-# ─────────────────────────────────────────────────────────────────────────────
 # TEST 7: Symlink replication
-# ─────────────────────────────────────────────────────────────────────────────
 
 test_symlink() {
     local T="symlink"
@@ -637,9 +607,7 @@ test_symlink() {
     teardown_mount
 }
 
-# ─────────────────────────────────────────────────────────────────────────────
 # TEST 8: Scrub adopts untracked pre-existing files
-# ─────────────────────────────────────────────────────────────────────────────
 
 test_scrub_adopt() {
     local T="scrub_adopt"
@@ -729,9 +697,7 @@ test_scrub_adopt() {
     teardown_mount
 }
 
-# ─────────────────────────────────────────────────────────────────────────────
 # TEST 9: Graceful shutdown preserves replication log
-# ─────────────────────────────────────────────────────────────────────────────
 
 test_graceful_shutdown() {
     local T="graceful_shutdown"
@@ -831,9 +797,7 @@ test_graceful_shutdown() {
     teardown_mount
 }
 
-# ─────────────────────────────────────────────────────────────────────────────
 # TEST 10: Metrics endpoint
-# ─────────────────────────────────────────────────────────────────────────────
 
 test_metrics() {
     local T="metrics"
@@ -903,9 +867,7 @@ test_metrics() {
     teardown_mount
 }
 
-# ─────────────────────────────────────────────────────────────────────────────
 # TEST 11: Large file replication
-# ─────────────────────────────────────────────────────────────────────────────
 
 test_large_file() {
     local T="large_file"
@@ -949,9 +911,7 @@ test_large_file() {
     teardown_mount
 }
 
-# ─────────────────────────────────────────────────────────────────────────────
 # TEST 12: File permissions preserved through replication
-# ─────────────────────────────────────────────────────────────────────────────
 
 test_permissions() {
     local T="permissions"
@@ -995,9 +955,7 @@ test_permissions() {
     teardown_mount
 }
 
-# ─────────────────────────────────────────────────────────────────────────────
 # TEST 13: Hardlinks return ENOTSUP
-# ─────────────────────────────────────────────────────────────────────────────
 
 test_hardlink_rejected() {
     local T="hardlink_rejected"
@@ -1016,9 +974,7 @@ test_hardlink_rejected() {
     teardown_mount
 }
 
-# ─────────────────────────────────────────────────────────────────────────────
 # TEST 14: Multiple rapid writes coalesce replication
-# ─────────────────────────────────────────────────────────────────────────────
 
 test_coalescing() {
     local T="coalescing"
@@ -1054,9 +1010,7 @@ test_coalescing() {
     teardown_mount
 }
 
-# ─────────────────────────────────────────────────────────────────────────────
 # Run all tests
-# ─────────────────────────────────────────────────────────────────────────────
 
 echo "============================================"
 echo "  helmetfs E2E Tests"

@@ -26,14 +26,11 @@ const c = @cImport({
 
 const log = std.log.scoped(.helmetfs);
 
-// ============================================================================
 // FUSE Compatibility Layer
-// ============================================================================
 //
 // macFUSE's fuse_file_info and fuse_conn_info use C bitfields which Zig's
 // cImport translates as opaque types. We define ABI-compatible Zig structs
 // and @ptrCast when accessing fields from FUSE callbacks.
-//
 
 const FuseFileInfo = extern struct {
     flags: i32,
@@ -96,9 +93,7 @@ fn fuseNew(args: [*c]c.struct_fuse_args, ops: [*c]const c.struct_fuse_operations
     }
 }
 
-// ============================================================================
 // Global State
-// ============================================================================
 
 var g_state: *FsState = undefined;
 
@@ -269,9 +264,7 @@ const FsState = struct {
     }
 };
 
-// ============================================================================
 // Path State Tracking
-// ============================================================================
 
 const PathInfo = struct {
     dirty_gen: u64 = 0,
@@ -292,36 +285,34 @@ const PathStateMap = struct {
         };
     }
 
-    fn setDirty(self: *PathStateMap, rel_path: []const u8) void {
-        self.rwlock.lock();
-        defer self.rwlock.unlock();
-        const key_copy = self.allocator.dupe(u8, rel_path) catch return;
+    /// Get or create a PathInfo entry for the given path.
+    /// Caller must hold the write lock.
+    fn getOrCreate(self: *PathStateMap, rel_path: []const u8) ?*PathInfo {
+        const key_copy = self.allocator.dupe(u8, rel_path) catch return null;
         const gop = self.map.getOrPut(key_copy) catch {
             self.allocator.free(key_copy);
-            return;
+            return null;
         };
         if (gop.found_existing) {
             self.allocator.free(key_copy);
-            gop.value_ptr.dirty_gen += 1;
         } else {
-            gop.value_ptr.* = .{ .dirty_gen = 1 };
+            gop.value_ptr.* = .{};
         }
+        return gop.value_ptr;
+    }
+
+    fn setDirty(self: *PathStateMap, rel_path: []const u8) void {
+        self.rwlock.lock();
+        defer self.rwlock.unlock();
+        const info = self.getOrCreate(rel_path) orelse return;
+        info.dirty_gen += 1;
     }
 
     fn incWriteRef(self: *PathStateMap, rel_path: []const u8) void {
         self.rwlock.lock();
         defer self.rwlock.unlock();
-        const key_copy = self.allocator.dupe(u8, rel_path) catch return;
-        const gop = self.map.getOrPut(key_copy) catch {
-            self.allocator.free(key_copy);
-            return;
-        };
-        if (!gop.found_existing) {
-            gop.value_ptr.* = .{ .write_refcount = 1 };
-        } else {
-            self.allocator.free(key_copy);
-            gop.value_ptr.write_refcount += 1;
-        }
+        const info = self.getOrCreate(rel_path) orelse return;
+        info.write_refcount += 1;
     }
 
     fn decWriteRef(self: *PathStateMap, rel_path: []const u8) void {
@@ -352,25 +343,9 @@ const PathStateMap = struct {
         const now = std.time.timestamp();
         self.rwlock.lock();
         defer self.rwlock.unlock();
-        if (self.map.getPtr(rel_path)) |info| {
-            if (now - info.last_verify_time < 60) return false;
-            info.last_verify_time = now;
-            return true;
-        }
-        // Path not in map — no state, allow verification
-        // (but we need to create an entry to track it)
-        const key_copy = self.allocator.dupe(u8, rel_path) catch return true;
-        const gop = self.map.getOrPut(key_copy) catch {
-            self.allocator.free(key_copy);
-            return true;
-        };
-        if (gop.found_existing) {
-            self.allocator.free(key_copy);
-            if (now - gop.value_ptr.last_verify_time < 60) return false;
-            gop.value_ptr.last_verify_time = now;
-        } else {
-            gop.value_ptr.* = .{ .last_verify_time = now };
-        }
+        const info = self.getOrCreate(rel_path) orelse return true;
+        if (now - info.last_verify_time < 60) return false;
+        info.last_verify_time = now;
         return true;
     }
 
@@ -416,9 +391,7 @@ const PathStateMap = struct {
     }
 };
 
-// ============================================================================
 // Replication Log
-// ============================================================================
 
 const ReplOp = enum { put, delete };
 
@@ -536,7 +509,7 @@ const ReplLog = struct {
         };
 
         // Write to disk
-        self.appendToDisk(op, rel_path) catch |err| {
+        self.appendEntriesToDisk(&.{.{ .op = op, .path = rel_path }}) catch |err| {
             log.err("replication: failed to append to log: {}", .{err});
         };
 
@@ -573,7 +546,7 @@ const ReplLog = struct {
         };
 
         // Write both entries to disk with a single fsync
-        self.appendPairToDisk(op1, path1, op2, path2) catch |err| {
+        self.appendEntriesToDisk(&.{ .{ .op = op1, .path = path1 }, .{ .op = op2, .path = path2 } }) catch |err| {
             log.err("replication: failed to append pair to log: {}", .{err});
         };
 
@@ -581,7 +554,7 @@ const ReplLog = struct {
         self.cond.broadcast();
     }
 
-    fn appendToDisk(self: *ReplLog, op: ReplOp, rel_path: []const u8) !void {
+    fn appendEntriesToDisk(self: *ReplLog, entries: []const struct { op: ReplOp, path: []const u8 }) !void {
         const path = try self.logPath();
         defer self.allocator.free(path);
 
@@ -589,26 +562,11 @@ const ReplLog = struct {
         defer file.close();
         try file.seekFromEnd(0);
 
-        const line = try formatLogEntry(self.allocator, op, rel_path);
-        defer self.allocator.free(line);
-        try file.writeAll(line);
-        try file.sync();
-    }
-
-    fn appendPairToDisk(self: *ReplLog, op1: ReplOp, path1: []const u8, op2: ReplOp, path2: []const u8) !void {
-        const path = try self.logPath();
-        defer self.allocator.free(path);
-
-        const file = try std.fs.createFileAbsolute(path, .{ .truncate = false });
-        defer file.close();
-        try file.seekFromEnd(0);
-
-        const line1 = try formatLogEntry(self.allocator, op1, path1);
-        defer self.allocator.free(line1);
-        const line2 = try formatLogEntry(self.allocator, op2, path2);
-        defer self.allocator.free(line2);
-        try file.writeAll(line1);
-        try file.writeAll(line2);
+        for (entries) |entry| {
+            const line = try formatLogEntry(self.allocator, entry.op, entry.path);
+            defer self.allocator.free(line);
+            try file.writeAll(line);
+        }
         try file.sync();
     }
 
@@ -788,9 +746,7 @@ fn formatLogEntry(allocator: std.mem.Allocator, op: ReplOp, rel_path: []const u8
     return try std.fmt.allocPrint(allocator, "{x:0>8}{s}\n", .{ crc_val, remainder });
 }
 
-// ============================================================================
 // Metrics
-// ============================================================================
 
 const Metrics = struct {
     repl_pending: std.atomic.Value(u64) = std.atomic.Value(u64).init(0),
@@ -917,9 +873,18 @@ fn parseMetricsAddr(addr_str: []const u8) !u16 {
     return std.fmt.parseUnsigned(u16, port_str, 10);
 }
 
-// ============================================================================
 // Checksum Computation
-// ============================================================================
+
+fn sumPath(allocator: std.mem.Allocator, path: []const u8) ![]const u8 {
+    return std.fmt.allocPrint(allocator, "{s}.sum", .{path});
+}
+
+fn deleteIfExists(path: []const u8) !void {
+    std.fs.deleteFileAbsolute(path) catch |err| switch (err) {
+        error.FileNotFound => {},
+        else => return err,
+    };
+}
 
 fn computeBlake3(backing_path: []const u8) ![64]u8 {
     const file = try std.fs.openFileAbsolute(backing_path, .{});
@@ -978,7 +943,7 @@ fn checksumAndEnqueueForced(state: *FsState, rel_path: []const u8) !void {
 
     const backing_path = try std.fs.path.join(state.allocator, &.{ state.backing_dir, rel_path });
     defer state.allocator.free(backing_path);
-    const sum_path = try std.fmt.allocPrint(state.allocator, "{s}.sum", .{backing_path});
+    const sum_path = try sumPath(state.allocator, backing_path);
     defer state.allocator.free(sum_path);
 
     const hex_digest = try computeBlake3(backing_path);
@@ -989,9 +954,7 @@ fn checksumAndEnqueueForced(state: *FsState, rel_path: []const u8) !void {
     state.path_state.clearDirtyIfGen(rel_path, gen);
 }
 
-// ============================================================================
 // Replication Workers
-// ============================================================================
 
 fn replWorkerLoop(state: *FsState) void {
     while (!state.shutdown.load(.acquire)) {
@@ -1040,10 +1003,7 @@ fn replicatePut(state: *FsState, rel_path: []const u8) !void {
         // Replicate symlink
         try ensureParentDir(replica_path);
         // Remove existing if any
-        std.fs.deleteFileAbsolute(replica_path) catch |err| switch (err) {
-            error.FileNotFound => {},
-            else => return err,
-        };
+        try deleteIfExists(replica_path);
         // Read symlink target
         const backing_z = try state.allocator.dupeZ(u8, backing_path);
         defer state.allocator.free(backing_z);
@@ -1057,9 +1017,9 @@ fn replicatePut(state: *FsState, rel_path: []const u8) !void {
     }
 
     // Regular file replication
-    const sum_backing = try std.fmt.allocPrint(state.allocator, "{s}.sum", .{backing_path});
+    const sum_backing = try sumPath(state.allocator, backing_path);
     defer state.allocator.free(sum_backing);
-    const sum_replica = try std.fmt.allocPrint(state.allocator, "{s}.sum", .{replica_path});
+    const sum_replica = try sumPath(state.allocator, replica_path);
     defer state.allocator.free(sum_replica);
 
     // Verify backing file integrity before replicating.  If the file was
@@ -1100,18 +1060,12 @@ fn replicatePut(state: *FsState, rel_path: []const u8) !void {
 fn replicateDelete(state: *FsState, rel_path: []const u8) !void {
     const replica_path = try std.fs.path.join(state.allocator, &.{ state.replica_dir, "files", rel_path });
     defer state.allocator.free(replica_path);
-    const sum_replica = try std.fmt.allocPrint(state.allocator, "{s}.sum", .{replica_path});
+    const sum_replica = try sumPath(state.allocator, replica_path);
     defer state.allocator.free(sum_replica);
 
     // Idempotent delete
-    std.fs.deleteFileAbsolute(replica_path) catch |err| switch (err) {
-        error.FileNotFound => {},
-        else => return err,
-    };
-    std.fs.deleteFileAbsolute(sum_replica) catch |err| switch (err) {
-        error.FileNotFound => {},
-        else => return err,
-    };
+    try deleteIfExists(replica_path);
+    try deleteIfExists(sum_replica);
 }
 
 fn copyFileWithSync(src_path: []const u8, dst_path: []const u8) !void {
@@ -1146,20 +1100,22 @@ fn ensureParentDir(path: []const u8) !void {
     };
 }
 
-// ============================================================================
 // Queue Depth Monitor
-// ============================================================================
+
+/// Sleep for `ns` nanoseconds in 1-second increments, returning early if shutdown.
+fn interruptibleSleep(state: *FsState, ns: u64) void {
+    var remaining = ns;
+    while (remaining > 0 and !state.shutdown.load(.acquire)) {
+        const chunk = @min(remaining, 1_000_000_000);
+        std.Thread.sleep(chunk);
+        remaining -= chunk;
+    }
+}
 
 fn queueMonitorLoop(state: *FsState) void {
     const interval_ns: u64 = 10_000_000_000; // 10 seconds
     while (!state.shutdown.load(.acquire)) {
-        // Sleep in 1-second increments to check for shutdown
-        var remaining = interval_ns;
-        while (remaining > 0 and !state.shutdown.load(.acquire)) {
-            const chunk = @min(remaining, 1_000_000_000);
-            std.Thread.sleep(chunk);
-            remaining -= chunk;
-        }
+        interruptibleSleep(state, interval_ns);
         if (state.shutdown.load(.acquire)) break;
 
         const pending = state.metrics.repl_pending.load(.acquire);
@@ -1169,9 +1125,7 @@ fn queueMonitorLoop(state: *FsState) void {
     }
 }
 
-// ============================================================================
 // Self-Healing Scrub
-// ============================================================================
 
 fn scrubLoop(state: *FsState) void {
     // Check if we need an immediate scrub
@@ -1183,13 +1137,7 @@ fn scrubLoop(state: *FsState) void {
     while (!state.shutdown.load(.acquire)) {
         // Sleep until next scrub time
         const sleep_ns = nsUntilNextScrub(state.scrub_hour, state.scrub_minute);
-        // Sleep in small increments to check for shutdown
-        var remaining = sleep_ns;
-        while (remaining > 0 and !state.shutdown.load(.acquire)) {
-            const chunk = @min(remaining, 1_000_000_000); // 1 second
-            std.Thread.sleep(chunk);
-            remaining -= chunk;
-        }
+        interruptibleSleep(state, sleep_ns);
         if (state.shutdown.load(.acquire)) break;
         runScrub(state);
     }
@@ -1294,7 +1242,7 @@ fn runScrub(state: *FsState) void {
 fn scrubFile(state: *FsState, rel_path: []const u8, corruptions: *u64, repairs_count: *u64) !void {
     const backing_path = try std.fs.path.join(state.allocator, &.{ state.backing_dir, rel_path });
     defer state.allocator.free(backing_path);
-    const sum_path = try std.fmt.allocPrint(state.allocator, "{s}.sum", .{backing_path});
+    const sum_path = try sumPath(state.allocator, backing_path);
     defer state.allocator.free(sum_path);
 
     // Compute current checksum
@@ -1336,7 +1284,7 @@ fn scrubFile(state: *FsState, rel_path: []const u8, corruptions: *u64, repairs_c
     // Attempt repair from replica
     const replica_path = try std.fs.path.join(state.allocator, &.{ state.replica_dir, "files", rel_path });
     defer state.allocator.free(replica_path);
-    const replica_sum_path = try std.fmt.allocPrint(state.allocator, "{s}.sum", .{replica_path});
+    const replica_sum_path = try sumPath(state.allocator, replica_path);
     defer state.allocator.free(replica_sum_path);
 
     // Read replica checksum
@@ -1405,9 +1353,7 @@ fn writeScrubTimestamp(state: *FsState, ts: i64) void {
     file.sync() catch return;
 }
 
-// ============================================================================
 // Hidden Paths
-// ============================================================================
 
 fn isHiddenPath(state: *FsState, rel_path: []const u8) bool {
     // .helmetfs/ directory
@@ -1427,9 +1373,7 @@ fn isHiddenPath(state: *FsState, rel_path: []const u8) bool {
     return false;
 }
 
-// ============================================================================
 // FUSE Operations
-// ============================================================================
 
 fn fuseRelPath(path: [*c]const u8) []const u8 {
     const s = std.mem.span(@as([*:0]const u8, @ptrCast(path)));
@@ -1601,7 +1545,7 @@ fn fuse_read(path: [*c]const u8, buf_ptr: [*c]u8, size: usize, offset: c.off_t, 
 fn verifyRead(state: *FsState, rel_path: []const u8) !void {
     const backing_path_str = try std.fs.path.join(state.allocator, &.{ state.backing_dir, rel_path });
     defer state.allocator.free(backing_path_str);
-    const sum_path = try std.fmt.allocPrint(state.allocator, "{s}.sum", .{backing_path_str});
+    const sum_path = try sumPath(state.allocator, backing_path_str);
     defer state.allocator.free(sum_path);
 
     const stored_hex = readSumFile(state.allocator, sum_path) catch return; // No .sum = no verification
@@ -1729,7 +1673,7 @@ fn fuse_unlink(path: [*c]const u8) callconv(.c) c_int {
     };
 
     // Remove .sum sidecar
-    const sum_path = std.fmt.allocPrint(state.allocator, "{s}.sum", .{backing}) catch return 0;
+    const sum_path = sumPath(state.allocator, backing) catch return 0;
     defer state.allocator.free(sum_path);
     std.fs.deleteFileAbsolute(sum_path) catch {};
 
@@ -1771,9 +1715,9 @@ fn fuse_rename(from: [*c]const u8, to: [*c]const u8, flags: c_uint) callconv(.c)
     };
 
     // Move .sum sidecar alongside
-    const sum_from = std.fmt.allocPrint(state.allocator, "{s}.sum", .{backing_from}) catch return 0;
+    const sum_from = sumPath(state.allocator, backing_from) catch return 0;
     defer state.allocator.free(sum_from);
-    const sum_to = std.fmt.allocPrint(state.allocator, "{s}.sum", .{backing_to}) catch return 0;
+    const sum_to = sumPath(state.allocator, backing_to) catch return 0;
     defer state.allocator.free(sum_to);
     std.fs.renameAbsolute(sum_from, sum_to) catch {};
 
@@ -2065,16 +2009,13 @@ fn fuse_init(_: ?*c.struct_fuse_conn_info, _: [*c]c.struct_fuse_config) callconv
     return null;
 }
 
-// ============================================================================
 // FUSE Operations Table
-// ============================================================================
 //
 // Note on mmap (issue #2): The FUSE high-level API does not expose a separate
 // mmap callback, so helmetfs cannot explicitly return ENOTSUP for mmap requests.
 // Under the default (non-direct_io) configuration, mmap'd writes go through the
 // kernel page cache and may bypass FUSE write() tracking. This is an accepted
 // limitation of the high-level API. See DESIGN.md for details.
-//
 
 const fuse_ops = std.mem.zeroInit(c.struct_fuse_operations, .{
     .getattr = fuse_getattr,
@@ -2103,9 +2044,7 @@ const fuse_ops = std.mem.zeroInit(c.struct_fuse_operations, .{
     .fallocate = fuse_fallocate,
 });
 
-// ============================================================================
 // Signal Handling
-// ============================================================================
 
 var g_fuse_instance: ?*c.struct_fuse = null;
 
@@ -2126,9 +2065,7 @@ fn setupSignalHandlers() void {
     posix.sigaction(posix.SIG.INT, &act, null);
 }
 
-// ============================================================================
 // CLI
-// ============================================================================
 
 const CliArgs = struct {
     command: enum { mount, unmount },
@@ -2256,9 +2193,7 @@ fn printUsage() void {
     , .{});
 }
 
-// ============================================================================
 // Main
-// ============================================================================
 
 pub fn main() !void {
     var gpa = std.heap.GeneralPurposeAllocator(.{}){};
@@ -2406,9 +2341,7 @@ fn doMount(allocator: std.mem.Allocator, args: CliArgs) !void {
     log.info("helmetfs shutdown complete", .{});
 }
 
-// ============================================================================
 // Tests
-// ============================================================================
 
 const testing = std.testing;
 
@@ -2863,7 +2796,7 @@ test "replicatePut copies file and .sum to replica" {
     try testing.expectEqualStrings("replicate this", contents);
 
     // Verify replica .sum exists
-    const replica_sum = try std.fmt.allocPrint(h.allocator, "{s}.sum", .{replica_path});
+    const replica_sum = try sumPath(h.allocator, replica_path);
     defer h.allocator.free(replica_sum);
     std.fs.accessAbsolute(replica_sum, .{}) catch {
         return error.ReplicaSumMissing;
@@ -3410,9 +3343,9 @@ test "end-to-end: rename enqueues delete+put pair and replication works" {
     defer h.allocator.free(new_backing);
     try std.fs.renameAbsolute(old_backing, new_backing);
 
-    const old_sum = try std.fmt.allocPrint(h.allocator, "{s}.sum", .{old_backing});
+    const old_sum = try sumPath(h.allocator, old_backing);
     defer h.allocator.free(old_sum);
-    const new_sum = try std.fmt.allocPrint(h.allocator, "{s}.sum", .{new_backing});
+    const new_sum = try sumPath(h.allocator, new_backing);
     defer h.allocator.free(new_sum);
     std.fs.renameAbsolute(old_sum, new_sum) catch {};
 
