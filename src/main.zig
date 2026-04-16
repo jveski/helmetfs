@@ -2447,52 +2447,36 @@ const TestHarness = struct {
 
 // ---------- formatLogEntry / parseLine round-trip ----------
 
-test "formatLogEntry produces valid CRC-protected line" {
-    const allocator = testing.allocator;
-    const line = try formatLogEntry(allocator, .put, "foo/bar.txt");
-    defer allocator.free(line);
-
-    // Should end with newline
-    try testing.expect(line[line.len - 1] == '\n');
-
-    // Should contain " put foo/bar.txt"
-    try testing.expect(std.mem.indexOf(u8, line, " put foo/bar.txt") != null);
-}
-
-test "formatLogEntry/parseLine round-trip for put" {
+test "formatLogEntry/parseLine round-trip for put and delete" {
     var h = try TestHarness.init();
     defer h.deinit();
 
-    const line = try formatLogEntry(h.allocator, .put, "hello/world.txt");
-    defer h.allocator.free(line);
+    // Put round-trip with format validation
+    const put_line = try formatLogEntry(h.allocator, .put, "hello/world.txt");
+    defer h.allocator.free(put_line);
 
-    // Strip trailing newline for parseLine
-    const trimmed = std.mem.trimRight(u8, line, "\n");
+    try testing.expect(put_line[put_line.len - 1] == '\n');
+    try testing.expect(std.mem.indexOf(u8, put_line, " put hello/world.txt") != null);
 
-    // parseLine should succeed without error
+    const put_trimmed = std.mem.trimRight(u8, put_line, "\n");
     const count_before = h.state.repl_log.entries.items.len;
-    try h.state.repl_log.parseLine(trimmed);
-    const count_after = h.state.repl_log.entries.items.len;
-    try testing.expectEqual(count_before + 1, count_after);
+    try h.state.repl_log.parseLine(put_trimmed);
+    try testing.expectEqual(count_before + 1, h.state.repl_log.entries.items.len);
 
-    const entry = h.state.repl_log.entries.items[count_after - 1];
-    try testing.expectEqual(ReplOp.put, entry.op);
-    try testing.expectEqualStrings("hello/world.txt", entry.path);
-}
+    const put_entry = h.state.repl_log.entries.getLast();
+    try testing.expectEqual(ReplOp.put, put_entry.op);
+    try testing.expectEqualStrings("hello/world.txt", put_entry.path);
 
-test "formatLogEntry/parseLine round-trip for delete" {
-    var h = try TestHarness.init();
-    defer h.deinit();
+    // Delete round-trip
+    const del_line = try formatLogEntry(h.allocator, .delete, "gone.txt");
+    defer h.allocator.free(del_line);
 
-    const line = try formatLogEntry(h.allocator, .delete, "gone.txt");
-    defer h.allocator.free(line);
+    const del_trimmed = std.mem.trimRight(u8, del_line, "\n");
+    try h.state.repl_log.parseLine(del_trimmed);
 
-    const trimmed = std.mem.trimRight(u8, line, "\n");
-    try h.state.repl_log.parseLine(trimmed);
-
-    const entry = h.state.repl_log.entries.getLast();
-    try testing.expectEqual(ReplOp.delete, entry.op);
-    try testing.expectEqualStrings("gone.txt", entry.path);
+    const del_entry = h.state.repl_log.entries.getLast();
+    try testing.expectEqual(ReplOp.delete, del_entry.op);
+    try testing.expectEqualStrings("gone.txt", del_entry.path);
 }
 
 test "parseLine rejects corrupted CRC" {
@@ -2522,26 +2506,18 @@ fn deinitPathStateMap(psm: *PathStateMap) void {
     psm.map.deinit();
 }
 
-test "PathStateMap: setDirty and isDirty" {
+test "PathStateMap: setDirty, isDirty, and clearDirty" {
     var psm = PathStateMap.init(testing.allocator);
     defer deinitPathStateMap(&psm);
 
     try testing.expect(!psm.isDirty("foo.txt"));
     psm.setDirty("foo.txt");
     try testing.expect(psm.isDirty("foo.txt"));
+    psm.clearDirty("foo.txt");
+    try testing.expect(!psm.isDirty("foo.txt"));
 }
 
-test "PathStateMap: clearDirty" {
-    var psm = PathStateMap.init(testing.allocator);
-    defer deinitPathStateMap(&psm);
-
-    psm.setDirty("bar.txt");
-    try testing.expect(psm.isDirty("bar.txt"));
-    psm.clearDirty("bar.txt");
-    try testing.expect(!psm.isDirty("bar.txt"));
-}
-
-test "PathStateMap: incWriteRef and hasWriteRef" {
+test "PathStateMap: incWriteRef, hasWriteRef, and decWriteRef" {
     var psm = PathStateMap.init(testing.allocator);
     defer deinitPathStateMap(&psm);
 
@@ -2550,18 +2526,10 @@ test "PathStateMap: incWriteRef and hasWriteRef" {
     try testing.expect(psm.hasWriteRef("a.txt"));
     psm.incWriteRef("a.txt");
     try testing.expect(psm.hasWriteRef("a.txt"));
-}
-
-test "PathStateMap: decWriteRef" {
-    var psm = PathStateMap.init(testing.allocator);
-    defer deinitPathStateMap(&psm);
-
-    psm.incWriteRef("b.txt");
-    psm.incWriteRef("b.txt");
-    psm.decWriteRef("b.txt");
-    try testing.expect(psm.hasWriteRef("b.txt")); // refcount=1
-    psm.decWriteRef("b.txt");
-    try testing.expect(!psm.hasWriteRef("b.txt")); // refcount=0
+    psm.decWriteRef("a.txt");
+    try testing.expect(psm.hasWriteRef("a.txt")); // refcount=1
+    psm.decWriteRef("a.txt");
+    try testing.expect(!psm.hasWriteRef("a.txt")); // refcount=0
 }
 
 test "PathStateMap: dirty and writeRef are independent" {
@@ -2909,15 +2877,7 @@ test "scrubFile passes clean file" {
 
 // ---------- nsUntilNextScrub ----------
 
-test "nsUntilNextScrub returns positive value" {
-    const ns = nsUntilNextScrub(3, 0);
-    try testing.expect(ns > 0);
-    // Should be at most ~24 hours in nanoseconds
-    try testing.expect(ns <= 86400 * 1_000_000_000);
-}
-
-test "nsUntilNextScrub returns at most 24 hours" {
-    // Test several different target times
+test "nsUntilNextScrub returns positive value at most 24 hours" {
     for ([_]u8{ 0, 6, 12, 18, 23 }) |hour| {
         const ns = nsUntilNextScrub(hour, 0);
         try testing.expect(ns > 0);
@@ -2953,17 +2913,32 @@ test "ReplLog persists to disk and reloads" {
 
 // ---------- formatMetrics ----------
 
-test "formatMetrics produces Prometheus-format output" {
+test "formatMetrics produces Prometheus-format output with correct values" {
     var h = try TestHarness.init();
     defer h.deinit();
+
+    // Set specific metric values
+    h.state.metrics.repl_completed.store(42, .release);
+    h.state.metrics.repl_errors.store(3, .release);
+    h.state.metrics.scrub_corruptions.store(7, .release);
+    h.state.metrics.scrub_repairs.store(5, .release);
 
     const body = try formatMetrics(h.state);
     defer h.allocator.free(body);
 
-    try testing.expect(std.mem.indexOf(u8, body, "helmetfs_replication_pending") != null);
-    try testing.expect(std.mem.indexOf(u8, body, "helmetfs_scrub_files_checked_total") != null);
+    // Verify Prometheus format (HELP/TYPE lines)
     try testing.expect(std.mem.indexOf(u8, body, "# HELP") != null);
     try testing.expect(std.mem.indexOf(u8, body, "# TYPE") != null);
+
+    // Verify expected metric keys
+    try testing.expect(std.mem.indexOf(u8, body, "helmetfs_replication_pending") != null);
+    try testing.expect(std.mem.indexOf(u8, body, "helmetfs_scrub_files_checked_total") != null);
+
+    // Verify the specific values appear in the output
+    try testing.expect(std.mem.indexOf(u8, body, "helmetfs_replication_completed_total 42") != null);
+    try testing.expect(std.mem.indexOf(u8, body, "helmetfs_replication_errors_total 3") != null);
+    try testing.expect(std.mem.indexOf(u8, body, "helmetfs_scrub_corruptions_found_total 7") != null);
+    try testing.expect(std.mem.indexOf(u8, body, "helmetfs_scrub_repairs_total 5") != null);
 }
 
 // ---------- ReplLog put coalescing ----------
@@ -3240,28 +3215,6 @@ test "flushDirtyFiles processes all dirty paths" {
     // Dirty flags should be cleared
     try testing.expect(!h.state.path_state.isDirty("flush1.txt"));
     try testing.expect(!h.state.path_state.isDirty("flush2.txt"));
-}
-
-// ---------- formatMetrics reflects actual values ----------
-
-test "formatMetrics reflects actual metric values" {
-    var h = try TestHarness.init();
-    defer h.deinit();
-
-    // Set specific metric values
-    h.state.metrics.repl_completed.store(42, .release);
-    h.state.metrics.repl_errors.store(3, .release);
-    h.state.metrics.scrub_corruptions.store(7, .release);
-    h.state.metrics.scrub_repairs.store(5, .release);
-
-    const body = try formatMetrics(h.state);
-    defer h.allocator.free(body);
-
-    // Verify the specific values appear in the output
-    try testing.expect(std.mem.indexOf(u8, body, "helmetfs_replication_completed_total 42") != null);
-    try testing.expect(std.mem.indexOf(u8, body, "helmetfs_replication_errors_total 3") != null);
-    try testing.expect(std.mem.indexOf(u8, body, "helmetfs_scrub_corruptions_found_total 7") != null);
-    try testing.expect(std.mem.indexOf(u8, body, "helmetfs_scrub_repairs_total 5") != null);
 }
 
 // ---------- ReplLog: delete entries are not coalesced ----------
